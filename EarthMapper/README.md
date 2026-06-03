@@ -1,7 +1,7 @@
-from sqlmodel import create_engine 
-import os
-from dotenv import load_dotenv
+# EarthMapper
 
-load_dotenv()
+Software that queries using FastAPI from different datasets in Lakebase DB:
+- GADM
+- Natural Earth
 
-engine = create_engine(os.getenv("DATABASE_URL"), echo=True)
+And plots the requested information in a leaflet map.
