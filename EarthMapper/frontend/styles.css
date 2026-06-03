@@ -1,0 +1,123 @@
+:root {
+  --bg-top: #f4f7eb;
+  --bg-bottom: #dde8f8;
+  --panel-bg: rgba(255, 255, 255, 0.85);
+  --panel-border: rgba(14, 46, 78, 0.13);
+  --text: #12263a;
+  --muted: #4d6074;
+  --accent: #007f5f;
+  --accent-strong: #0e5f4a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Manrope, sans-serif;
+  color: var(--text);
+  min-height: 100vh;
+  background: radial-gradient(circle at 20% 5%, #f8f9e2 0%, transparent 40%),
+    linear-gradient(145deg, var(--bg-top), var(--bg-bottom));
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 16px;
+  padding: 16px;
+}
+
+.panel {
+  border: 1px solid var(--panel-border);
+  border-radius: 20px;
+  background: var(--panel-bg);
+  backdrop-filter: blur(4px);
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 16px 32px rgba(13, 41, 67, 0.12);
+}
+
+h1 {
+  margin: 0;
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 1.6rem;
+}
+
+.subtitle {
+  margin: 8px 0 18px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.filters {
+  display: grid;
+  gap: 10px;
+}
+
+label {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: #22384d;
+}
+
+input,
+button {
+  border-radius: 12px;
+  border: 1px solid rgba(22, 64, 96, 0.2);
+  padding: 10px;
+  font: inherit;
+}
+
+input:focus {
+  outline: 2px solid rgba(0, 127, 95, 0.28);
+  border-color: var(--accent);
+}
+
+button {
+  background: linear-gradient(160deg, var(--accent), var(--accent-strong));
+  color: #fff;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button:hover {
+  filter: brightness(1.03);
+}
+
+.stats {
+  margin-top: 18px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.4;
+  border: 1px dashed rgba(17, 62, 96, 0.2);
+}
+
+main {
+  min-height: 0;
+}
+
+#map {
+  height: calc(100vh - 32px);
+  width: 100%;
+  border-radius: 20px;
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 16px 32px rgba(13, 41, 67, 0.14);
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  #map {
+    height: 65vh;
+  }
+}
