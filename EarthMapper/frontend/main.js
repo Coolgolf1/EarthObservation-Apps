@@ -22,10 +22,11 @@ if (typeof Worker !== "undefined") {
   parseWorker = new Worker("parse-worker.js");
 }
 
-// Cluster group for potential future use (canvas-rendered layers have limitations with clustering)
+// Cluster group for low zoom clustering
 const clusterGroup = L.markerClusterGroup({
   maxClusterRadius: 80,
-  disableClusteringAtZoom: 7,  // Would cluster at zoom 0-6, disable at 7+
+  disableClusteringAtZoom: false,
+  maxZoom: 6,
 });
 
 let geoJsonLayer = L.geoJSON([], {
