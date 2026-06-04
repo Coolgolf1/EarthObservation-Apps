@@ -28,28 +28,37 @@ def _infer_geometry_type(coords: Any) -> str | None:
     if not isinstance(coords, list):
         return None
 
-    if len(coords) == 2 and all(isinstance(v, (int, float)) for v in coords):
+    def _is_position(value: Any) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) == 2
+            and all(isinstance(v, (int, float)) for v in value)
+        )
+
+    def _is_line(value: Any) -> bool:
+        return isinstance(value, list) and len(value) >= 2 and all(_is_position(p) for p in value)
+
+    def _is_linear_ring(value: Any) -> bool:
+        if not _is_line(value) or len(value) < 4:
+            return False
+        return value[0] == value[-1]
+
+    if _is_position(coords):
         return "Point"
 
-    if not coords or not isinstance(coords[0], list):
-        return None
-
-    first = coords[0]
-    if first and isinstance(first[0], (int, float)) and len(first) == 2:
+    if _is_line(coords):
         return "LineString"
 
-    if not first or not isinstance(first[0], list):
-        return None
+    if isinstance(coords, list) and coords and all(_is_line(part) for part in coords):
+        # Distinguish polygon rings from multiline paths to avoid rivers becoming filled lakes.
+        if all(_is_linear_ring(ring) for ring in coords):
+            return "Polygon"
+        return "MultiLineString"
 
-    second = first[0]
-    if second and isinstance(second[0], (int, float)) and len(second) == 2:
-        return "Polygon"
-
-    if not second or not isinstance(second[0], list):
-        return None
-
-    third = second[0]
-    if third and isinstance(third[0], (int, float)) and len(third) == 2:
+    if isinstance(coords, list) and coords and all(
+        isinstance(polygon, list) and polygon and all(_is_linear_ring(ring) for ring in polygon)
+        for polygon in coords
+    ):
         return "MultiPolygon"
 
     return None
