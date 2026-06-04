@@ -7,7 +7,7 @@ const map = L.map("map", {
 const canvasRenderer = L.canvas({ padding: 0.5 });
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
+  maxZoom: 15,
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
 }).addTo(map);
 
@@ -25,8 +25,6 @@ if (typeof Worker !== "undefined") {
 // Cluster group for low zoom clustering
 const clusterGroup = L.markerClusterGroup({
   maxClusterRadius: 80,
-  disableClusteringAtZoom: false,
-  maxZoom: 6,
 });
 
 let geoJsonLayer = L.geoJSON([], {
