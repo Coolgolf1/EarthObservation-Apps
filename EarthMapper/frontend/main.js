@@ -22,9 +22,10 @@ if (typeof Worker !== "undefined") {
   parseWorker = new Worker("parse-worker.js");
 }
 
+// Cluster group for potential future use (canvas-rendered layers have limitations with clustering)
 const clusterGroup = L.markerClusterGroup({
   maxClusterRadius: 80,
-  disableClusteringAtZoom: 10,
+  disableClusteringAtZoom: 7,  // Would cluster at zoom 0-6, disable at 7+
 });
 
 let geoJsonLayer = L.geoJSON([], {
@@ -61,7 +62,7 @@ let geoJsonLayer = L.geoJSON([], {
   },
 });
 
-// Add geoJsonLayer directly to map (not through clusterGroup which doesn't render canvas layers properly)
+// Render canvas layer directly to map (clustering incompatible with canvas rendering)
 geoJsonLayer.addTo(map);
 
 let debounceTimer = null;
@@ -116,6 +117,7 @@ async function loadFeatures() {
     }
 
     const features = await response.json();
+    const useClustering = zoom <= 6;
 
     // Use WebWorker for parsing if available, otherwise process on main thread
     if (parseWorker) {
@@ -130,8 +132,35 @@ async function loadFeatures() {
           features: viewportFeatures,
         };
 
-        geoJsonLayer.clearLayers();
-        geoJsonLayer.addData(featureCollection);
+        if (useClustering) {
+          // Use clustering with markers
+          clusterGroup.clearLayers();
+          geoJsonLayer.clearLayers();
+          
+          viewportFeatures.forEach((feature) => {
+            const geometry = feature.geometry || {};
+            if (geometry.type === "Point") {
+              const coords = geometry.coordinates || [];
+              const marker = L.circleMarker(L.latLng(coords[1], coords[0]), {
+                radius: 6,
+                color: "#0f5132",
+                fillColor: "#52b788",
+                fillOpacity: 0.9,
+                weight: 2,
+              });
+              
+              const props = feature.properties || {};
+              const title = props.name || props.label || props.category || "Feature";
+              marker.bindPopup(`<strong>${title}</strong>`);
+              clusterGroup.addLayer(marker);
+            }
+          });
+        } else {
+          // Use canvas rendering
+          clusterGroup.clearLayers();
+          geoJsonLayer.clearLayers();
+          geoJsonLayer.addData(featureCollection);
+        }
 
         const elapsedMs = Math.round(performance.now() - startedAt);
         statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
@@ -156,8 +185,35 @@ async function loadFeatures() {
         features: viewportFeatures,
       };
 
-      geoJsonLayer.clearLayers();
-      geoJsonLayer.addData(featureCollection);
+      if (useClustering) {
+        // Use clustering with markers
+        clusterGroup.clearLayers();
+        geoJsonLayer.clearLayers();
+        
+        viewportFeatures.forEach((feature) => {
+          const geometry = feature.geometry || {};
+          if (geometry.type === "Point") {
+            const coords = geometry.coordinates || [];
+            const marker = L.circleMarker(L.latLng(coords[1], coords[0]), {
+              radius: 6,
+              color: "#0f5132",
+              fillColor: "#52b788",
+              fillOpacity: 0.9,
+              weight: 2,
+            });
+            
+            const props = feature.properties || {};
+            const title = props.name || props.label || props.category || "Feature";
+            marker.bindPopup(`<strong>${title}</strong>`);
+            clusterGroup.addLayer(marker);
+          }
+        });
+      } else {
+        // Use canvas rendering
+        clusterGroup.clearLayers();
+        geoJsonLayer.clearLayers();
+        geoJsonLayer.addData(featureCollection);
+      }
 
       const elapsedMs = Math.round(performance.now() - startedAt);
       statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
