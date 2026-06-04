@@ -18,7 +18,7 @@ const formEl = document.getElementById("filters-form");
 
 // Initialize WebWorker for background parsing
 let parseWorker = null;
-if (typeof Worker !== "undefined") {
+if (false && typeof Worker !== "undefined") {  // DISABLED FOR DEBUGGING
   parseWorker = new Worker("parse-worker.js");
 }
 
@@ -116,6 +116,8 @@ async function loadFeatures() {
     }
 
     const features = await response.json();
+    console.log("API response:", features);
+    console.log("Number of features from API:", features.length);
 
     // Use WebWorker for parsing if available, otherwise process on main thread
     if (parseWorker) {
