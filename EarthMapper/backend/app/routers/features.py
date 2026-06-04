@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 from fastapi import APIRouter, Query
 from app.core.db import get_db_connection
@@ -7,94 +8,168 @@ from psycopg.rows import dict_row
 
 router = APIRouter(prefix="/features", tags=["features"])
 
+
+def _parse_json_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    parsed = value
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            break
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            break
+    return parsed
+
+
+def _infer_geometry_type(coords: Any) -> str | None:
+    if not isinstance(coords, list):
+        return None
+
+    if len(coords) == 2 and all(isinstance(v, (int, float)) for v in coords):
+        return "Point"
+
+    if not coords or not isinstance(coords[0], list):
+        return None
+
+    first = coords[0]
+    if first and isinstance(first[0], (int, float)) and len(first) == 2:
+        return "LineString"
+
+    if not first or not isinstance(first[0], list):
+        return None
+
+    second = first[0]
+    if second and isinstance(second[0], (int, float)) and len(second) == 2:
+        return "Polygon"
+
+    if not second or not isinstance(second[0], list):
+        return None
+
+    third = second[0]
+    if third and isinstance(third[0], (int, float)) and len(third) == 2:
+        return "MultiPolygon"
+
+    return None
+
+
+def _build_geometry_from_coords(coords_value: Any) -> dict[str, Any] | None:
+    # Geometry rendering must be based on coords only.
+    if isinstance(coords_value, dict):
+        if coords_value.get("type") == "Feature":
+            maybe_geom = coords_value.get("geometry")
+            if isinstance(maybe_geom, dict) and "type" in maybe_geom and "coordinates" in maybe_geom:
+                return maybe_geom
+
+        if "type" in coords_value and "coordinates" in coords_value:
+            return coords_value
+
+    geometry_type = _infer_geometry_type(coords_value)
+    if geometry_type is None:
+        return None
+
+    return {
+        "type": geometry_type,
+        "coordinates": coords_value,
+    }
+
 @router.get("", response_model=list[Feature])
 async def get_features(
     min_lon: float = Query(...),
     min_lat: float = Query(...),
     max_lon: float = Query(...),
     max_lat: float = Query(...),
-    category: str | None = Query(default=None),
+    category: str = Query(default="places"),
+    use_postgis: bool = Query(default=False),
     limit: int = Query(default=1000, ge=1, le=10000),
 ):
-    # bbox_output = BBox(min_lon=min_lon, min_lat=min_lat, max_lon=max_lon, max_lat=max_lat)
-
     query = """
-    SELECT
-        n.id,
-        n.name,
-        n.category,
-        n.subcategory,
-        n.source,
-        n.geometry
-    FROM public.natural_earth n
-    WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
-      AND (
-          (
-              n.longitude IS NOT NULL
-              AND n.latitude IS NOT NULL
-              AND n.longitude BETWEEN %s AND %s
-              AND n.latitude BETWEEN %s AND %s
-          )
-          OR (
-              n.min_bbxmin IS NOT NULL
-              AND n.max_bbxmax IS NOT NULL
-              AND n.min_bbymin IS NOT NULL
-              AND n.max_bbymax IS NOT NULL
-              AND n.max_bbxmax >= %s
-              AND n.min_bbxmin <= %s
-              AND n.max_bbymax >= %s
-              AND n.min_bbymin <= %s
-          )
-          OR (
-              n.longitude IS NULL
-              AND n.latitude IS NULL
-              AND (
-                  n.min_bbxmin IS NULL
-                  OR n.max_bbxmax IS NULL
-                  OR n.min_bbymin IS NULL
-                  OR n.max_bbymax IS NULL
-              )
-              AND EXISTS (
-                  SELECT 1
-                  FROM jsonb_path_query(
-                      CASE
-                          WHEN jsonb_typeof(n.geometry) = 'string' THEN
-                              CASE
-                                  WHEN ((n.geometry #>> '{}')::jsonb->>'type') = 'Feature'
-                                      THEN (n.geometry #>> '{}')::jsonb->'geometry'
-                                  ELSE (n.geometry #>> '{}')::jsonb
-                              END
-                          ELSE
-                              CASE
-                                  WHEN n.geometry->>'type' = 'Feature' THEN n.geometry->'geometry'
-                                  ELSE n.geometry
-                              END
-                      END,
-                      '$.coordinates.** ? (@.type() == "array" && @.size() == 2 && @[0].type() == "number" && @[1].type() == "number")'
-                  ) AS pt
-                  WHERE (pt->>0)::double precision BETWEEN %s AND %s
-                    AND (pt->>1)::double precision BETWEEN %s AND %s
-              )
-          )
-      )
-        LIMIT %s;
+    WITH bounds AS (
+        SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
+    ),
+    merged AS (
+        SELECT
+            n.id,
+            n.name,
+            n.category,
+            n.subcategory,
+            n.min_lon,
+            n.max_lon,
+            n.min_lat,
+            n.max_lat,
+            n.coords,
+            'natural_earth'::text AS source
+        FROM public.natural_earth_silver n
+                CROSS JOIN bounds b
+        WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
+          AND n.min_lon IS NOT NULL
+          AND n.max_lon IS NOT NULL
+          AND n.min_lat IS NOT NULL
+          AND n.max_lat IS NOT NULL
+          AND n.max_lon >= %s
+          AND n.min_lon <= %s
+          AND n.max_lat >= %s
+          AND n.min_lat <= %s
+                    AND (
+                            NOT %s::boolean
+                            OR ST_MakeEnvelope(n.min_lon, n.min_lat, n.max_lon, n.max_lat, 4326) && b.query_envelope
+                    )
+
+        UNION ALL
+
+        SELECT
+            g.id,
+            g.name,
+            g.category,
+            g.subcategory,
+            g.min_lon,
+            g.max_lon,
+            g.min_lat,
+            g.max_lat,
+            g.coords,
+            'gadm'::text AS source
+        FROM public.gadm_silver g
+                CROSS JOIN bounds b
+        WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
+          AND g.min_lon IS NOT NULL
+          AND g.max_lon IS NOT NULL
+          AND g.min_lat IS NOT NULL
+          AND g.max_lat IS NOT NULL
+          AND g.max_lon >= %s
+          AND g.min_lon <= %s
+          AND g.max_lat >= %s
+          AND g.min_lat <= %s
+                    AND (
+                            NOT %s::boolean
+                            OR ST_MakeEnvelope(g.min_lon, g.min_lat, g.max_lon, g.max_lat, 4326) && b.query_envelope
+                    )
+    )
+    SELECT *
+    FROM merged
+    LIMIT %s;
     """
 
     params = (
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
         category,
         category,
         min_lon,
         max_lon,
         min_lat,
         max_lat,
+                use_postgis,
+        category,
+        category,
         min_lon,
         max_lon,
         min_lat,
         max_lat,
-        min_lon,
-        max_lon,
-        min_lat,
-        max_lat,
+                use_postgis,
         limit,
     )
     
@@ -105,27 +180,19 @@ async def get_features(
 
     features: list[Feature] = []
     for row in rows:
-        geometry_value = row.get("geometry")
-
-        if isinstance(geometry_value, str):
-            geometry_value = json.loads(geometry_value)
-            if isinstance(geometry_value, str):
-                geometry_value = json.loads(geometry_value)
-
-        if not isinstance(geometry_value, dict):
+        coords_value = _parse_json_value(row.get("coords"))
+        geom = _build_geometry_from_coords(coords_value)
+        if geom is None:
             continue
 
-        if geometry_value.get("type") == "Feature":
-            geom = geometry_value.get("geometry")
-            props = geometry_value.get("properties") or {}
-        else:
-            geom = geometry_value
-            props = {}
+        props: dict[str, Any] = {}
+        if isinstance(coords_value, dict) and coords_value.get("type") == "Feature":
+            props = coords_value.get("properties") or {}
 
         row_properties = {
             key: value
             for key, value in row.items()
-            if key != "geometry" and value is not None
+            if key not in {"coords", "min_lon", "max_lon", "min_lat", "max_lat"} and value is not None
         }
         props = {**row_properties, **props}
 
