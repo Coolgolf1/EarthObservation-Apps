@@ -244,13 +244,10 @@ async def get_features(
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
-    
-    print(f"DEBUG: Query returned {len(rows)} rows")
 
     features: list[Feature] = []
     for row in rows:
         coords_value = _parse_json_value(row.get("coords"))
-        print(f"DEBUG: Processing row {row.get('id')}: coords_value type = {type(coords_value)}, first 50 chars = {str(coords_value)[:50]}")
         
         # Apply coordinate simplification based on zoom level
         # TEMPORARILY DISABLED FOR DEBUGGING
@@ -259,7 +256,6 @@ async def get_features(
         
         geom = _build_geometry_from_coords(coords_value)
         if geom is None:
-            print(f"DEBUG: Skipping row {row.get('id')} - failed to build geometry")
             continue
 
         props: dict[str, Any] = {}
@@ -274,12 +270,10 @@ async def get_features(
         props = {**row_properties, **props}
 
         if not isinstance(geom, dict) or "type" not in geom or "coordinates" not in geom:
-            print(f"DEBUG: Skipping row {row.get('id')} - invalid geometry structure")
             continue
 
         features.append(Feature(geometry=Geometry(**geom), properties=props))
 
-    print(f"DEBUG: Returning {len(features)} features")
     return features
 
 
