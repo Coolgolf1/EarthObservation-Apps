@@ -10,4 +10,5 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "sqlmodel>=0.0.38",
     "uvicorn>=0.48.0",
+    "shapely>=2.0.0",
 ]

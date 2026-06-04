@@ -6,6 +6,13 @@ from app.core.db import get_db_connection
 from app.models.features import Feature, Geometry
 from psycopg.rows import dict_row
 
+try:
+    from shapely.geometry import shape
+    from shapely.wkt import dumps as to_wkt
+    SHAPELY_AVAILABLE = True
+except ImportError:
+    SHAPELY_AVAILABLE = False
+
 router = APIRouter(prefix="/features", tags=["features"])
 
 
@@ -84,6 +91,38 @@ def _build_geometry_from_coords(coords_value: Any) -> dict[str, Any] | None:
         "coordinates": coords_value,
     }
 
+
+def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
+    """Simplify coordinates using Douglas-Peucker algorithm if tolerance > 0."""
+    if tolerance <= 0 or not SHAPELY_AVAILABLE:
+        return coords
+    
+    try:
+        geometry_type = _infer_geometry_type(coords)
+        if not geometry_type:
+            return coords
+        
+        # Build a full GeoJSON geometry
+        geom_dict = {
+            "type": geometry_type,
+            "coordinates": coords,
+        }
+        
+        # Use Shapely to simplify
+        geom = shape(geom_dict)
+        simplified = geom.simplify(tolerance, preserve_topology=True)
+        
+        # Extract simplified coordinates
+        if hasattr(simplified, '__geo_interface__'):
+            simplified_dict = simplified.__geo_interface__
+            return simplified_dict.get("coordinates", coords)
+        
+        return coords
+    except Exception:
+        # If simplification fails, return original
+        return coords
+
+
 @router.get("", response_model=list[Feature])
 async def get_features(
     min_lon: float = Query(...),
@@ -98,97 +137,84 @@ async def get_features(
     query = """
     WITH bounds AS (
         SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
-    ),
-    simplify_tolerance AS (
-        SELECT CASE
-            WHEN %s::int <= 3 THEN 0.05
-            WHEN %s::int <= 6 THEN 0.01
-            WHEN %s::int <= 9 THEN 0.001
-            ELSE 0
-        END AS tolerance
-    ),
-    merged AS (
-        SELECT
-            n.id,
-            n.name,
-            n.category,
-            n.subcategory,
-            n.min_lon,
-            n.max_lon,
-            n.min_lat,
-            n.max_lat,
-            CASE
-                WHEN st.tolerance > 0 THEN ST_AsGeoJSON(ST_SimplifyPreserveTopology(
-                    ST_GeomFromGeoJSON(n.coords::text), st.tolerance
-                ))::jsonb
-                ELSE n.coords
-            END AS coords,
-            'natural_earth'::text AS source
-        FROM public.natural_earth_silver n
-                CROSS JOIN bounds b
-                CROSS JOIN simplify_tolerance st
-        WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
-          AND n.min_lon IS NOT NULL
-          AND n.max_lon IS NOT NULL
-          AND n.min_lat IS NOT NULL
-          AND n.max_lat IS NOT NULL
-          AND n.max_lon >= %s
-          AND n.min_lon <= %s
-          AND n.max_lat >= %s
-          AND n.min_lat <= %s
-                    AND (
-                            NOT %s::boolean
-                            OR ST_MakeEnvelope(n.min_lon, n.min_lat, n.max_lon, n.max_lat, 4326) && b.query_envelope
-                    )
-
-        UNION ALL
-
-        SELECT
-            g.id,
-            g.name,
-            g.category,
-            g.subcategory,
-            g.min_lon,
-            g.max_lon,
-            g.min_lat,
-            g.max_lat,
-            CASE
-                WHEN st.tolerance > 0 THEN ST_AsGeoJSON(ST_SimplifyPreserveTopology(
-                    ST_GeomFromGeoJSON(g.coords::text), st.tolerance
-                ))::jsonb
-                ELSE g.coords
-            END AS coords,
-            'gadm'::text AS source
-        FROM public.gadm_silver g
-                CROSS JOIN bounds b
-                CROSS JOIN simplify_tolerance st
-        WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
-          AND g.min_lon IS NOT NULL
-          AND g.max_lon IS NOT NULL
-          AND g.min_lat IS NOT NULL
-          AND g.max_lat IS NOT NULL
-          AND g.max_lon >= %s
-          AND g.min_lon <= %s
-          AND g.max_lat >= %s
-          AND g.min_lat <= %s
-                    AND (
-                            NOT %s::boolean
-                            OR ST_MakeEnvelope(g.min_lon, g.min_lat, g.max_lon, g.max_lat, 4326) && b.query_envelope
-                    )
     )
-    SELECT *
-    FROM merged
+    SELECT
+        n.id,
+        n.name,
+        n.category,
+        n.subcategory,
+        n.min_lon,
+        n.max_lon,
+        n.min_lat,
+        n.max_lat,
+        n.coords,
+        'natural_earth'::text AS source
+    FROM public.natural_earth_silver n
+    WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
+      AND n.min_lon IS NOT NULL
+      AND n.max_lon IS NOT NULL
+      AND n.min_lat IS NOT NULL
+      AND n.max_lat IS NOT NULL
+      AND n.max_lon >= %s
+      AND n.min_lon <= %s
+      AND n.max_lat >= %s
+      AND n.min_lat <= %s
+      AND (
+          NOT %s::boolean
+          OR EXISTS (
+              SELECT 1 FROM bounds b
+              WHERE ST_MakeEnvelope(n.min_lon, n.min_lat, n.max_lon, n.max_lat, 4326) && b.query_envelope
+          )
+      )
+
+    UNION ALL
+
+    SELECT
+        g.id,
+        g.name,
+        g.category,
+        g.subcategory,
+        g.min_lon,
+        g.max_lon,
+        g.min_lat,
+        g.max_lat,
+        g.coords,
+        'gadm'::text AS source
+    FROM public.gadm_silver g
+    WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
+      AND g.min_lon IS NOT NULL
+      AND g.max_lon IS NOT NULL
+      AND g.min_lat IS NOT NULL
+      AND g.max_lat IS NOT NULL
+      AND g.max_lon >= %s
+      AND g.min_lon <= %s
+      AND g.max_lat >= %s
+      AND g.min_lat <= %s
+      AND (
+          NOT %s::boolean
+          OR EXISTS (
+              SELECT 1 FROM bounds b
+              WHERE ST_MakeEnvelope(g.min_lon, g.min_lat, g.max_lon, g.max_lat, 4326) && b.query_envelope
+          )
+      )
     LIMIT %s;
     """
+
+    # Calculate tolerance based on zoom level
+    if zoom <= 3:
+        tolerance = 0.05
+    elif zoom <= 6:
+        tolerance = 0.01
+    elif zoom <= 9:
+        tolerance = 0.001
+    else:
+        tolerance = 0
 
     params = (
         min_lon,
         min_lat,
         max_lon,
         max_lat,
-        zoom,
-        zoom,
-        zoom,
         category,
         category,
         min_lon,
@@ -214,6 +240,11 @@ async def get_features(
     features: list[Feature] = []
     for row in rows:
         coords_value = _parse_json_value(row.get("coords"))
+        
+        # Apply coordinate simplification based on zoom level
+        if tolerance > 0:
+            coords_value = _simplify_coordinates(coords_value, tolerance)
+        
         geom = _build_geometry_from_coords(coords_value)
         if geom is None:
             continue
