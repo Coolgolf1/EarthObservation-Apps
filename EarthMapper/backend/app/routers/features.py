@@ -98,13 +98,13 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         return coords
     
     try:
-        geometry_type = _infer_geometry_type(coords)
-        if not geometry_type:
+        original_type = _infer_geometry_type(coords)
+        if not original_type:
             return coords
         
         # Build a full GeoJSON geometry
         geom_dict = {
-            "type": geometry_type,
+            "type": original_type,
             "coordinates": coords,
         }
         
@@ -112,17 +112,21 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         geom = shape(geom_dict)
         simplified = geom.simplify(tolerance, preserve_topology=True)
         
-        # Check if simplified geometry is empty or too degenerate
-        if simplified.is_empty or simplified.area == 0:
+        # Check if simplified geometry is empty
+        if simplified.is_empty:
             return coords
         
         # Extract simplified coordinates
         if hasattr(simplified, '__geo_interface__'):
             simplified_dict = simplified.__geo_interface__
+            simplified_type = simplified_dict.get("type")
             simplified_coords = simplified_dict.get("coordinates")
             
-            # Validate that we got reasonable coordinates back
+            # Preserve geometry type - don't let a Polygon become a Point
             if simplified_coords is not None and len(str(simplified_coords)) > 0:
+                # If geometry type changed (e.g., Polygon became Point), return original
+                if simplified_type != original_type:
+                    return coords
                 return simplified_coords
         
         return coords
