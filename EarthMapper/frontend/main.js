@@ -16,6 +16,12 @@ const categoryEl = document.getElementById("category");
 const limitEl = document.getElementById("limit");
 const formEl = document.getElementById("filters-form");
 
+// Initialize WebWorker for background parsing
+let parseWorker = null;
+if (typeof Worker !== "undefined") {
+  parseWorker = new Worker("parse-worker.js");
+}
+
 const clusterGroup = L.markerClusterGroup({
   maxClusterRadius: 80,
   disableClusteringAtZoom: 10,
@@ -111,28 +117,51 @@ async function loadFeatures() {
 
     const features = await response.json();
 
-    // Viewport-only rendering: filter features to only those visible in current viewport
-    const mapBounds = map.getBounds();
-    const viewportFeatures = features.filter((feature) => {
-      const geometry = feature.geometry || {};
-      if (geometry.type === "Point") {
-        const coords = geometry.coordinates || [];
-        const point = L.latLng(coords[1], coords[0]);
-        return mapBounds.contains(point);
-      }
-      return true; // For non-point features, include by default
-    });
+    // Use WebWorker for parsing if available, otherwise process on main thread
+    if (parseWorker) {
+      parseWorker.onmessage = (event) => {
+        if (!event.data.success) {
+          throw new Error(event.data.error);
+        }
 
-    const featureCollection = {
-      type: "FeatureCollection",
-      features: viewportFeatures,
-    };
+        const viewportFeatures = event.data.features;
+        const featureCollection = {
+          type: "FeatureCollection",
+          features: viewportFeatures,
+        };
 
-    geoJsonLayer.clearLayers();
-    geoJsonLayer.addData(featureCollection);
+        geoJsonLayer.clearLayers();
+        geoJsonLayer.addData(featureCollection);
 
-    const elapsedMs = Math.round(performance.now() - startedAt);
-    statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+      };
+
+      parseWorker.postMessage({ features, mapBounds: bbox });
+    } else {
+      // Fallback: process on main thread
+      const mapBounds = map.getBounds();
+      const viewportFeatures = features.filter((feature) => {
+        const geometry = feature.geometry || {};
+        if (geometry.type === "Point") {
+          const coords = geometry.coordinates || [];
+          const point = L.latLng(coords[1], coords[0]);
+          return mapBounds.contains(point);
+        }
+        return true;
+      });
+
+      const featureCollection = {
+        type: "FeatureCollection",
+        features: viewportFeatures,
+      };
+
+      geoJsonLayer.clearLayers();
+      geoJsonLayer.addData(featureCollection);
+
+      const elapsedMs = Math.round(performance.now() - startedAt);
+      statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+    }
   } catch (error) {
     statsEl.textContent = `Request failed: ${error.message}`;
     console.error(error);
