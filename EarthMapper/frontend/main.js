@@ -61,8 +61,8 @@ let geoJsonLayer = L.geoJSON([], {
   },
 });
 
-clusterGroup.addLayer(geoJsonLayer);
-clusterGroup.addTo(map);
+// Add geoJsonLayer directly to map (not through clusterGroup which doesn't render canvas layers properly)
+geoJsonLayer.addTo(map);
 
 let debounceTimer = null;
 let inFlight = false;
