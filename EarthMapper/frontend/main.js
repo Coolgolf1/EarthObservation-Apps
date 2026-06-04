@@ -65,6 +65,9 @@ let geoJsonLayer = L.geoJSON([], {
 // Render canvas layer directly to map (clustering incompatible with canvas rendering)
 geoJsonLayer.addTo(map);
 
+// Add cluster group to map (will be used for zoom <= 6)
+clusterGroup.addTo(map);
+
 let debounceTimer = null;
 let inFlight = false;
 let pendingLoad = false;
