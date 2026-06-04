@@ -98,13 +98,17 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         return coords
     
     try:
-        original_type = _infer_geometry_type(coords)
-        if not original_type:
+        geometry_type = _infer_geometry_type(coords)
+        if not geometry_type:
+            return coords
+        
+        # Skip simplification for Point geometries - they can't be simplified
+        if geometry_type == "Point":
             return coords
         
         # Build a full GeoJSON geometry
         geom_dict = {
-            "type": original_type,
+            "type": geometry_type,
             "coordinates": coords,
         }
         
@@ -119,14 +123,10 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         # Extract simplified coordinates
         if hasattr(simplified, '__geo_interface__'):
             simplified_dict = simplified.__geo_interface__
-            simplified_type = simplified_dict.get("type")
             simplified_coords = simplified_dict.get("coordinates")
             
-            # Preserve geometry type - don't let a Polygon become a Point
+            # Return simplified if we got valid coordinates
             if simplified_coords is not None and len(str(simplified_coords)) > 0:
-                # If geometry type changed (e.g., Polygon became Point), return original
-                if simplified_type != original_type:
-                    return coords
                 return simplified_coords
         
         return coords
@@ -213,12 +213,13 @@ async def get_features(
     """
 
     # Calculate tolerance based on zoom level
+    # Lower tolerance = less simplification = more detail preserved
     if zoom <= 3:
-        tolerance = 0.05
-    elif zoom <= 6:
         tolerance = 0.01
-    elif zoom <= 9:
+    elif zoom <= 6:
         tolerance = 0.001
+    elif zoom <= 9:
+        tolerance = 0.0001
     else:
         tolerance = 0
 
@@ -253,9 +254,8 @@ async def get_features(
     for row in rows:
         coords_value = _parse_json_value(row.get("coords"))
         
-        # Apply coordinate simplification based on zoom level
-        if tolerance > 0:
-            coords_value = _simplify_coordinates(coords_value, tolerance)
+        # Skip simplification for now - focus on getting all geometries to render
+        # TODO: Re-enable with better type checking to prevent geometry collapse
         
         geom = _build_geometry_from_coords(coords_value)
         if geom is None:
