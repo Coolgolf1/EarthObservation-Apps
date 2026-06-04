@@ -22,11 +22,6 @@ if (typeof Worker !== "undefined") {
   parseWorker = new Worker("parse-worker.js");
 }
 
-// Cluster group for low zoom clustering
-const clusterGroup = L.markerClusterGroup({
-  maxClusterRadius: 80,
-});
-
 let geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
   style: {
@@ -61,11 +56,8 @@ let geoJsonLayer = L.geoJSON([], {
   },
 });
 
-// Render canvas layer directly to map (clustering incompatible with canvas rendering)
+// Render canvas layer directly to map
 geoJsonLayer.addTo(map);
-
-// Add cluster group to map (will be used for zoom <= 6)
-clusterGroup.addTo(map);
 
 let debounceTimer = null;
 let inFlight = false;
@@ -119,7 +111,6 @@ async function loadFeatures() {
     }
 
     const features = await response.json();
-    const useClustering = zoom <= 6;
 
     // Use WebWorker for parsing if available, otherwise process on main thread
     if (parseWorker) {
@@ -134,43 +125,12 @@ async function loadFeatures() {
           features: viewportFeatures,
         };
 
-        if (useClustering) {
-          // Use clustering with markers at zoom <= 6
-          if (!map.hasLayer(clusterGroup)) {
-            map.addLayer(clusterGroup);
-          }
-          clusterGroup.clearLayers();
-          geoJsonLayer.clearLayers();
-          
-          viewportFeatures.forEach((feature) => {
-            const geometry = feature.geometry || {};
-            if (geometry.type === "Point") {
-              const coords = geometry.coordinates || [];
-              const marker = L.circleMarker(L.latLng(coords[1], coords[0]), {
-                radius: 6,
-                color: "#0f5132",
-                fillColor: "#52b788",
-                fillOpacity: 0.9,
-                weight: 2,
-              });
-              
-              const props = feature.properties || {};
-              const title = props.name || props.label || props.category || "Feature";
-              marker.bindPopup(`<strong>${title}</strong>`);
-              clusterGroup.addLayer(marker);
-            }
-          });
-        } else {
-          // Use canvas rendering at zoom 7+
-          clusterGroup.clearLayers();
-          geoJsonLayer.clearLayers();
-          geoJsonLayer.addData(featureCollection);
-          // Ensure clusterGroup is hidden and empty
-          map.removeLayer(clusterGroup);
-        }
+        // Use canvas rendering
+        geoJsonLayer.clearLayers();
+        geoJsonLayer.addData(featureCollection);
 
         const elapsedMs = Math.round(performance.now() - startedAt);
-        statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+        statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms`;
       };
 
       parseWorker.postMessage({ features, mapBounds: bbox });
@@ -192,45 +152,12 @@ async function loadFeatures() {
         features: viewportFeatures,
       };
 
-      if (useClustering) {
-        // Use clustering with markers
-        if (!map.hasLayer(clusterGroup)) {
-          map.addLayer(clusterGroup);
-        }
-        clusterGroup.clearLayers();
-        geoJsonLayer.clearLayers();
-        
-        viewportFeatures.forEach((feature) => {
-          const geometry = feature.geometry || {};
-          if (geometry.type === "Point") {
-            const coords = geometry.coordinates || [];
-            const marker = L.circleMarker(L.latLng(coords[1], coords[0]), {
-              radius: 6,
-              color: "#0f5132",
-              fillColor: "#52b788",
-              fillOpacity: 0.9,
-              weight: 2,
-            });
-            
-            const props = feature.properties || {};
-            const title = props.name || props.label || props.category || "Feature";
-            marker.bindPopup(`<strong>${title}</strong>`);
-            clusterGroup.addLayer(marker);
-          }
-        });
-      } else {
-        // Use canvas rendering at zoom 7+
-        clusterGroup.clearLayers();
-        geoJsonLayer.clearLayers();
-        geoJsonLayer.addData(featureCollection);
-        // Ensure clusterGroup is hidden
-        if (map.hasLayer(clusterGroup)) {
-          map.removeLayer(clusterGroup);
-        }
-      }
+      // Use canvas rendering
+      geoJsonLayer.clearLayers();
+      geoJsonLayer.addData(featureCollection);
 
       const elapsedMs = Math.round(performance.now() - startedAt);
-      statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+      statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms`;
     }
   } catch (error) {
     statsEl.textContent = `Request failed: ${error.message}`;
