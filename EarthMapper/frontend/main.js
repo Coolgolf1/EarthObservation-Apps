@@ -44,8 +44,16 @@ let layer = L.geoJSON([], {
   },
 }).addTo(map);
 
-let activeAbortController = null;
 let debounceTimer = null;
+let inFlight = false;
+let pendingLoad = false;
+
+function clearQueuedRequests() {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+}
 
 function getBboxFromMap() {
   const bounds = map.getBounds();
@@ -58,10 +66,7 @@ function getBboxFromMap() {
 }
 
 async function loadFeatures() {
-  if (activeAbortController) {
-    activeAbortController.abort();
-  }
-  activeAbortController = new AbortController();
+  inFlight = true;
 
   const bbox = getBboxFromMap();
   const params = new URLSearchParams({
@@ -82,13 +87,14 @@ async function loadFeatures() {
 
   try {
     statsEl.textContent = "Loading features...";
-    const response = await fetch(url, { signal: activeAbortController.signal });
+    const response = await fetch(url);
 
     if (!response.ok) {
       throw new Error(`API error ${response.status}`);
     }
 
     const features = await response.json();
+
     const featureCollection = {
       type: "FeatureCollection",
       features,
@@ -100,25 +106,44 @@ async function loadFeatures() {
     const elapsedMs = Math.round(performance.now() - startedAt);
     statsEl.textContent = `Loaded ${features.length} features in ${elapsedMs} ms`;
   } catch (error) {
-    if (error.name === "AbortError") {
-      return;
-    }
     statsEl.textContent = `Request failed: ${error.message}`;
     console.error(error);
+  } finally {
+    inFlight = false;
+    if (pendingLoad) {
+      pendingLoad = false;
+      runLoadCycle();
+    }
   }
 }
 
+function runLoadCycle() {
+  if (inFlight) {
+    pendingLoad = true;
+    return;
+  }
+
+  loadFeatures();
+}
+
 function scheduleLoad() {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(loadFeatures, 350);
+  clearQueuedRequests();
+  debounceTimer = setTimeout(runLoadCycle, 350);
 }
 
 map.on("moveend", scheduleLoad);
-categoryEl.addEventListener("change", loadFeatures);
-limitEl.addEventListener("change", loadFeatures);
+categoryEl.addEventListener("change", () => {
+  clearQueuedRequests();
+  runLoadCycle();
+});
+limitEl.addEventListener("change", () => {
+  clearQueuedRequests();
+  runLoadCycle();
+});
 formEl.addEventListener("submit", (event) => {
   event.preventDefault();
-  loadFeatures();
+  clearQueuedRequests();
+  runLoadCycle();
 });
 
-loadFeatures();
+runLoadCycle();
