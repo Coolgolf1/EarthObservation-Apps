@@ -24,11 +24,17 @@ if (typeof Worker !== "undefined") {
 
 let geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
-  style: {
-    color: "#1d3557",
-    weight: 1,
-    fillColor: "#2a9d8f",
-    fillOpacity: 0.35,
+  style: (feature) => {
+    const zoom = map.getZoom();
+    // Make polygons more visible at lower zoom levels
+    const fillOpacity = zoom <= 6 ? 0.5 : 0.35;
+    const weight = zoom <= 6 ? 2 : 1;
+    return {
+      color: "#1d3557",
+      weight: weight,
+      fillColor: "#2a9d8f",
+      fillOpacity: fillOpacity,
+    };
   },
   pointToLayer: (feature, latlng) =>
     L.circleMarker(latlng, {
