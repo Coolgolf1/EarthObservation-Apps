@@ -112,10 +112,18 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         geom = shape(geom_dict)
         simplified = geom.simplify(tolerance, preserve_topology=True)
         
+        # Check if simplified geometry is empty or too degenerate
+        if simplified.is_empty or simplified.area == 0:
+            return coords
+        
         # Extract simplified coordinates
         if hasattr(simplified, '__geo_interface__'):
             simplified_dict = simplified.__geo_interface__
-            return simplified_dict.get("coordinates", coords)
+            simplified_coords = simplified_dict.get("coordinates")
+            
+            # Validate that we got reasonable coordinates back
+            if simplified_coords is not None and len(str(simplified_coords)) > 0:
+                return simplified_coords
         
         return coords
     except Exception:
@@ -242,8 +250,9 @@ async def get_features(
         coords_value = _parse_json_value(row.get("coords"))
         
         # Apply coordinate simplification based on zoom level
-        if tolerance > 0:
-            coords_value = _simplify_coordinates(coords_value, tolerance)
+        # TEMPORARILY DISABLED FOR DEBUGGING
+        # if tolerance > 0:
+        #     coords_value = _simplify_coordinates(coords_value, tolerance)
         
         geom = _build_geometry_from_coords(coords_value)
         if geom is None:
