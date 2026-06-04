@@ -92,7 +92,7 @@ async def get_features(
     max_lat: float = Query(...),
     category: str = Query(default="places"),
     use_postgis: bool = Query(default=False),
-    limit: int = Query(default=1000, ge=1, le=10000),
+    limit: int = Query(default=1000, ge=1),
 ):
     query = """
     WITH bounds AS (
