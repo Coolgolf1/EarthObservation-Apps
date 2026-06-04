@@ -26,10 +26,18 @@
 
         <form id="filters-form" class="filters" autocomplete="off">
           <label for="category">Category</label>
-          <input id="category" name="category" placeholder="places" />
+          <select id="category" name="category">
+            <option value="places" selected>places</option>
+            <option value="hydrography">hydrography</option>
+            <option value="administrative">administrative</option>
+            <option value="terrain">terrain</option>
+            <option value="transport">transport</option>
+            <option value="regions">regions</option>
+            <option value="landmarks">landmarks</option>
+          </select>
 
           <label for="limit">Limit</label>
-          <input id="limit" name="limit" type="number" min="1" max="10000" value="400" />
+          <input id="limit" name="limit" type="number" min="1" max="100000" value="10000" />
 
           <button type="submit">Reload</button>
         </form>
