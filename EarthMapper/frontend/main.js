@@ -2,7 +2,7 @@ const API_BASE = "http://127.0.0.1:8000";
 
 const map = L.map("map", {
   zoomControl: true,
-}).setView([20, 0], 2);
+}).setView([45, 10], 5);
 
 const canvasRenderer = L.canvas({ padding: 0.5 });
 
