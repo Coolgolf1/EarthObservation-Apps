@@ -135,7 +135,10 @@ async function loadFeatures() {
         };
 
         if (useClustering) {
-          // Use clustering with markers
+          // Use clustering with markers at zoom <= 6
+          if (!map.hasLayer(clusterGroup)) {
+            map.addLayer(clusterGroup);
+          }
           clusterGroup.clearLayers();
           geoJsonLayer.clearLayers();
           
@@ -158,10 +161,12 @@ async function loadFeatures() {
             }
           });
         } else {
-          // Use canvas rendering
+          // Use canvas rendering at zoom 7+
           clusterGroup.clearLayers();
           geoJsonLayer.clearLayers();
           geoJsonLayer.addData(featureCollection);
+          // Ensure clusterGroup is hidden and empty
+          map.removeLayer(clusterGroup);
         }
 
         const elapsedMs = Math.round(performance.now() - startedAt);
@@ -189,6 +194,9 @@ async function loadFeatures() {
 
       if (useClustering) {
         // Use clustering with markers
+        if (!map.hasLayer(clusterGroup)) {
+          map.addLayer(clusterGroup);
+        }
         clusterGroup.clearLayers();
         geoJsonLayer.clearLayers();
         
@@ -211,10 +219,14 @@ async function loadFeatures() {
           }
         });
       } else {
-        // Use canvas rendering
+        // Use canvas rendering at zoom 7+
         clusterGroup.clearLayers();
         geoJsonLayer.clearLayers();
         geoJsonLayer.addData(featureCollection);
+        // Ensure clusterGroup is hidden
+        if (map.hasLayer(clusterGroup)) {
+          map.removeLayer(clusterGroup);
+        }
       }
 
       const elapsedMs = Math.round(performance.now() - startedAt);
