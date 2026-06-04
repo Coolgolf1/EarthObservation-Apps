@@ -27,46 +27,42 @@ const clusterGroup = L.markerClusterGroup({
   disableClusteringAtZoom: 10,
 });
 
-let geoJsonLayer = null;
-
-function createGeoJsonLayer() {
-  return L.geoJSON([], {
-    renderer: canvasRenderer,
-    style: {
-      color: "#1d3557",
+let geoJsonLayer = L.geoJSON([], {
+  renderer: canvasRenderer,
+  style: {
+    color: "#1d3557",
+    weight: 1,
+    fillColor: "#2a9d8f",
+    fillOpacity: 0.35,
+  },
+  pointToLayer: (feature, latlng) =>
+    L.circleMarker(latlng, {
+      renderer: canvasRenderer,
+      radius: 5,
+      color: "#0f5132",
+      fillColor: "#52b788",
+      fillOpacity: 0.9,
       weight: 1,
-      fillColor: "#2a9d8f",
-      fillOpacity: 0.35,
-    },
-    pointToLayer: (feature, latlng) =>
-      L.circleMarker(latlng, {
-        renderer: canvasRenderer,
-        radius: 5,
-        color: "#0f5132",
-        fillColor: "#52b788",
-        fillOpacity: 0.9,
-        weight: 1,
-      }),
-    onEachFeature: (feature, featureLayer) => {
-      featureLayer.on("click", () => {
-        if (featureLayer.getPopup()) {
-          return;
-        }
+    }),
+  onEachFeature: (feature, featureLayer) => {
+    featureLayer.on("click", () => {
+      if (featureLayer.getPopup()) {
+        return;
+      }
 
-        const props = feature.properties || {};
-        const title = props.name || props.label || props.category || "Feature";
-        const details = Object.entries(props)
-          .slice(0, 6)
-          .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
-          .join("<br>");
-        featureLayer.bindPopup(`<div><h4>${title}</h4><div>${details}</div></div>`);
-      });
-    },
-  });
-}
+      const props = feature.properties || {};
+      const title = props.name || props.label || props.category || "Feature";
+      const details = Object.entries(props)
+        .slice(0, 6)
+        .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
+        .join("<br>");
+      featureLayer.bindPopup(`<div><h4>${title}</h4><div>${details}</div></div>`);
+    });
+  },
+});
 
-geoJsonLayer = createGeoJsonLayer();
-geoJsonLayer.addTo(map);  // Add directly to map, not to clusterGroup
+clusterGroup.addLayer(geoJsonLayer);
+clusterGroup.addTo(map);
 
 let debounceTimer = null;
 let inFlight = false;
@@ -122,7 +118,7 @@ async function loadFeatures() {
     const features = await response.json();
 
     // Use WebWorker for parsing if available, otherwise process on main thread
-    if (false && parseWorker) {  // DISABLED for debugging
+    if (parseWorker) {
       parseWorker.onmessage = (event) => {
         if (!event.data.success) {
           throw new Error(event.data.error);
