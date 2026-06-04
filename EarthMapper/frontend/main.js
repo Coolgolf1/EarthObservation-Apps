@@ -16,7 +16,18 @@ const categoryEl = document.getElementById("category");
 const limitEl = document.getElementById("limit");
 const formEl = document.getElementById("filters-form");
 
-let layer = L.geoJSON([], {
+// Initialize WebWorker for background parsing
+let parseWorker = null;
+if (typeof Worker !== "undefined") {
+  parseWorker = new Worker("parse-worker.js");
+}
+
+const clusterGroup = L.markerClusterGroup({
+  maxClusterRadius: 80,
+  disableClusteringAtZoom: 10,
+});
+
+let geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
   style: {
     color: "#1d3557",
@@ -34,15 +45,24 @@ let layer = L.geoJSON([], {
       weight: 1,
     }),
   onEachFeature: (feature, featureLayer) => {
-    const props = feature.properties || {};
-    const title = props.name || props.label || props.category || "Feature";
-    const details = Object.entries(props)
-      .slice(0, 6)
-      .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
-      .join("<br>");
-    featureLayer.bindPopup(`<div><h4>${title}</h4><div>${details}</div></div>`);
+    featureLayer.on("click", () => {
+      if (featureLayer.getPopup()) {
+        return;
+      }
+
+      const props = feature.properties || {};
+      const title = props.name || props.label || props.category || "Feature";
+      const details = Object.entries(props)
+        .slice(0, 6)
+        .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
+        .join("<br>");
+      featureLayer.bindPopup(`<div><h4>${title}</h4><div>${details}</div></div>`);
+    });
   },
-}).addTo(map);
+});
+
+clusterGroup.addLayer(geoJsonLayer);
+clusterGroup.addTo(map);
 
 let debounceTimer = null;
 let inFlight = false;
@@ -69,11 +89,13 @@ async function loadFeatures() {
   inFlight = true;
 
   const bbox = getBboxFromMap();
+  const zoom = map.getZoom();
   const params = new URLSearchParams({
     min_lon: String(bbox.min_lon),
     min_lat: String(bbox.min_lat),
     max_lon: String(bbox.max_lon),
     max_lat: String(bbox.max_lat),
+    zoom: String(zoom),
     limit: String(Math.max(1, Number(limitEl.value) || 400)),
   });
 
@@ -95,16 +117,51 @@ async function loadFeatures() {
 
     const features = await response.json();
 
-    const featureCollection = {
-      type: "FeatureCollection",
-      features,
-    };
+    // Use WebWorker for parsing if available, otherwise process on main thread
+    if (parseWorker) {
+      parseWorker.onmessage = (event) => {
+        if (!event.data.success) {
+          throw new Error(event.data.error);
+        }
 
-    layer.clearLayers();
-    layer.addData(featureCollection);
+        const viewportFeatures = event.data.features;
+        const featureCollection = {
+          type: "FeatureCollection",
+          features: viewportFeatures,
+        };
 
-    const elapsedMs = Math.round(performance.now() - startedAt);
-    statsEl.textContent = `Loaded ${features.length} features in ${elapsedMs} ms`;
+        geoJsonLayer.clearLayers();
+        geoJsonLayer.addData(featureCollection);
+
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+      };
+
+      parseWorker.postMessage({ features, mapBounds: bbox });
+    } else {
+      // Fallback: process on main thread
+      const mapBounds = map.getBounds();
+      const viewportFeatures = features.filter((feature) => {
+        const geometry = feature.geometry || {};
+        if (geometry.type === "Point") {
+          const coords = geometry.coordinates || [];
+          const point = L.latLng(coords[1], coords[0]);
+          return mapBounds.contains(point);
+        }
+        return true;
+      });
+
+      const featureCollection = {
+        type: "FeatureCollection",
+        features: viewportFeatures,
+      };
+
+      geoJsonLayer.clearLayers();
+      geoJsonLayer.addData(featureCollection);
+
+      const elapsedMs = Math.round(performance.now() - startedAt);
+      statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms (zoom ${zoom})`;
+    }
   } catch (error) {
     statsEl.textContent = `Request failed: ${error.message}`;
     console.error(error);
