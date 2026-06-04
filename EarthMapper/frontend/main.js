@@ -18,7 +18,7 @@ const formEl = document.getElementById("filters-form");
 
 // Initialize WebWorker for background parsing
 let parseWorker = null;
-if (false && typeof Worker !== "undefined") {  // DISABLED FOR DEBUGGING
+if (typeof Worker !== "undefined") {
   parseWorker = new Worker("parse-worker.js");
 }
 
@@ -116,11 +116,6 @@ async function loadFeatures() {
     }
 
     const features = await response.json();
-    console.log("API response length:", features.length);
-    if (features.length > 0) {
-      console.log("First feature:", features[0]);
-      console.log("Geometry types:", features.map(f => f.geometry?.type).slice(0, 10));
-    }
 
     // Use WebWorker for parsing if available, otherwise process on main thread
     if (parseWorker) {
@@ -146,10 +141,15 @@ async function loadFeatures() {
     } else {
       // Fallback: process on main thread
       const mapBounds = map.getBounds();
-      // TEMPORARILY DISABLE VIEWPORT FILTERING FOR DEBUGGING
-      const viewportFeatures = features; // Removed: .filter((feature) => { ... })
-      
-      console.log("After viewport filter:", viewportFeatures.length, "features");
+      const viewportFeatures = features.filter((feature) => {
+        const geometry = feature.geometry || {};
+        if (geometry.type === "Point") {
+          const coords = geometry.coordinates || [];
+          const point = L.latLng(coords[1], coords[0]);
+          return mapBounds.contains(point);
+        }
+        return true;
+      });
 
       const featureCollection = {
         type: "FeatureCollection",

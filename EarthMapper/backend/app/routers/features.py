@@ -250,9 +250,8 @@ async def get_features(
         coords_value = _parse_json_value(row.get("coords"))
         
         # Apply coordinate simplification based on zoom level
-        # TEMPORARILY DISABLED FOR DEBUGGING
-        # if tolerance > 0:
-        #     coords_value = _simplify_coordinates(coords_value, tolerance)
+        if tolerance > 0:
+            coords_value = _simplify_coordinates(coords_value, tolerance)
         
         geom = _build_geometry_from_coords(coords_value)
         if geom is None:
