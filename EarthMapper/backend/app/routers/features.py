@@ -92,11 +92,20 @@ async def get_features(
     max_lat: float = Query(...),
     category: str = Query(default="places"),
     use_postgis: bool = Query(default=False),
+    zoom: int = Query(default=2, ge=0, le=19),
     limit: int = Query(default=1000, ge=1),
 ):
     query = """
     WITH bounds AS (
         SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
+    ),
+    simplify_tolerance AS (
+        SELECT CASE
+            WHEN %s::int <= 3 THEN 0.05
+            WHEN %s::int <= 6 THEN 0.01
+            WHEN %s::int <= 9 THEN 0.001
+            ELSE 0
+        END AS tolerance
     ),
     merged AS (
         SELECT
@@ -108,10 +117,16 @@ async def get_features(
             n.max_lon,
             n.min_lat,
             n.max_lat,
-            n.coords,
+            CASE
+                WHEN st.tolerance > 0 THEN ST_AsGeoJSON(ST_SimplifyPreserveTopology(
+                    ST_GeomFromGeoJSON(n.coords::text), st.tolerance
+                ))::jsonb
+                ELSE n.coords
+            END AS coords,
             'natural_earth'::text AS source
         FROM public.natural_earth_silver n
                 CROSS JOIN bounds b
+                CROSS JOIN simplify_tolerance st
         WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
           AND n.min_lon IS NOT NULL
           AND n.max_lon IS NOT NULL
@@ -137,10 +152,16 @@ async def get_features(
             g.max_lon,
             g.min_lat,
             g.max_lat,
-            g.coords,
+            CASE
+                WHEN st.tolerance > 0 THEN ST_AsGeoJSON(ST_SimplifyPreserveTopology(
+                    ST_GeomFromGeoJSON(g.coords::text), st.tolerance
+                ))::jsonb
+                ELSE g.coords
+            END AS coords,
             'gadm'::text AS source
         FROM public.gadm_silver g
                 CROSS JOIN bounds b
+                CROSS JOIN simplify_tolerance st
         WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
           AND g.min_lon IS NOT NULL
           AND g.max_lon IS NOT NULL
@@ -161,24 +182,27 @@ async def get_features(
     """
 
     params = (
-                min_lon,
-                min_lat,
-                max_lon,
-                max_lat,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        zoom,
+        zoom,
+        zoom,
         category,
         category,
         min_lon,
         max_lon,
         min_lat,
         max_lat,
-                use_postgis,
+        use_postgis,
         category,
         category,
         min_lon,
         max_lon,
         min_lat,
         max_lat,
-                use_postgis,
+        use_postgis,
         limit,
     )
     
