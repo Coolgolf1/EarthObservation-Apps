@@ -102,7 +102,7 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         if not geometry_type:
             return coords
         
-        # Skip simplification for Point geometries - they can't be simplified
+        # Skip simplification for Point geometries
         if geometry_type == "Point":
             return coords
         
@@ -116,21 +116,24 @@ def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
         geom = shape(geom_dict)
         simplified = geom.simplify(tolerance, preserve_topology=True)
         
-        # Check if simplified geometry is empty
-        if simplified.is_empty:
+        # Check if simplified geometry is empty or became invalid
+        if simplified.is_empty or simplified.area == 0:
             return coords
         
         # Extract simplified coordinates
         if hasattr(simplified, '__geo_interface__'):
             simplified_dict = simplified.__geo_interface__
+            simplified_type = simplified_dict.get("type")
             simplified_coords = simplified_dict.get("coordinates")
             
-            # Return simplified if we got valid coordinates
-            if simplified_coords is not None and len(str(simplified_coords)) > 0:
-                return simplified_coords
+            # Validate coordinates exist and are non-empty
+            if simplified_coords is not None and len(str(simplified_coords)) > 2:
+                # Only return if geometry type is preserved
+                if simplified_type == geometry_type:
+                    return simplified_coords
         
         return coords
-    except Exception:
+    except Exception as e:
         # If simplification fails, return original
         return coords
 
@@ -212,16 +215,18 @@ async def get_features(
     LIMIT %s;
     """
 
-    # Calculate tolerance based on zoom level
-    # Lower tolerance = less simplification = more detail preserved
-    if zoom <= 3:
-        tolerance = 0.01
+    # Calculate tolerance for Level-of-Detail (LOD) system
+    # Lower tolerance = less simplification = more detail
+    if zoom <= 2:
+        tolerance = 0.05      # Very zoomed out: aggressive simplification
+    elif zoom <= 4:
+        tolerance = 0.01      # Zoomed out: moderate simplification
     elif zoom <= 6:
-        tolerance = 0.001
-    elif zoom <= 9:
-        tolerance = 0.0001
+        tolerance = 0.005     # Medium zoom: light simplification
+    elif zoom <= 8:
+        tolerance = 0.001     # Zoomed in: minimal simplification
     else:
-        tolerance = 0
+        tolerance = 0         # Fully zoomed in: no simplification
 
     params = (
         min_lon,
@@ -254,8 +259,9 @@ async def get_features(
     for row in rows:
         coords_value = _parse_json_value(row.get("coords"))
         
-        # Skip simplification for now - focus on getting all geometries to render
-        # TODO: Re-enable with better type checking to prevent geometry collapse
+        # Apply coordinate simplification based on zoom level (LOD system)
+        if tolerance > 0:
+            coords_value = _simplify_coordinates(coords_value, tolerance)
         
         geom = _build_geometry_from_coords(coords_value)
         if geom is None:
