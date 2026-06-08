@@ -1,16 +1,14 @@
-from typing import Any
-
 from pydantic import BaseModel, Field
 
 class Geometry(BaseModel):
     type: str
-    coordinates: Any
+    coordinates: list | float
 
 
 class Feature(BaseModel):
     type: str = Field(default="Feature")
     geometry: Geometry
-    properties: dict[str, Any] = Field(default_factory=dict)
+    properties: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
 class FeatureCollection(BaseModel):

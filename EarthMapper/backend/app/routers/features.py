@@ -1,154 +1,66 @@
 import json
-from typing import Any
+from typing import TypedDict, cast
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from app.core.db import get_db_connection
+from app.models.bbox import BBox
 from app.models.features import Feature, Geometry
 from psycopg.rows import dict_row
 
-try:
-    from shapely.geometry import shape
-    from shapely.wkt import dumps as to_wkt
-    SHAPELY_AVAILABLE = True
-except ImportError:
-    SHAPELY_AVAILABLE = False
+
+class GeometryDict(TypedDict):
+    type: str
+    coordinates: list | float
+
 
 router = APIRouter(prefix="/features", tags=["features"])
 
 
-def _parse_json_value(value: Any) -> Any:
+def _parse_json(value: object) -> object:
     if not isinstance(value, str):
         return value
-
-    parsed = value
-    for _ in range(2):
-        if not isinstance(parsed, str):
-            break
-        try:
-            parsed = json.loads(parsed)
-        except json.JSONDecodeError:
-            break
-    return parsed
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
-def _infer_geometry_type(coords: Any) -> str | None:
-    if not isinstance(coords, list):
-        return None
+def _extract_geometry(coords_value: object) -> GeometryDict | None:
+    if isinstance(coords_value, dict):
+        if coords_value.get("type") == "Feature":
+            geometry = coords_value.get("geometry")
+            if isinstance(geometry, dict) and "type" in geometry and "coordinates" in geometry:
+                return cast(GeometryDict, geometry)
 
-    def _is_position(value: Any) -> bool:
-        return (
-            isinstance(value, list)
-            and len(value) == 2
-            and all(isinstance(v, (int, float)) for v in value)
-        )
-
-    def _is_line(value: Any) -> bool:
-        return isinstance(value, list) and len(value) >= 2 and all(_is_position(p) for p in value)
-
-    def _is_linear_ring(value: Any) -> bool:
-        if not _is_line(value) or len(value) < 4:
-            return False
-        return value[0] == value[-1]
-
-    if _is_position(coords):
-        return "Point"
-
-    if _is_line(coords):
-        return "LineString"
-
-    if isinstance(coords, list) and coords and all(_is_line(part) for part in coords):
-        # Distinguish polygon rings from multiline paths to avoid rivers becoming filled lakes.
-        if all(_is_linear_ring(ring) for ring in coords):
-            return "Polygon"
-        return "MultiLineString"
-
-    if isinstance(coords, list) and coords and all(
-        isinstance(polygon, list) and polygon and all(_is_linear_ring(ring) for ring in polygon)
-        for polygon in coords
-    ):
-        return "MultiPolygon"
-
+        if "type" in coords_value and "coordinates" in coords_value:
+            return cast(GeometryDict, coords_value)
     return None
 
 
-def _build_geometry_from_coords(coords_value: Any) -> dict[str, Any] | None:
-    # Geometry rendering must be based on coords only.
-    if isinstance(coords_value, dict):
-        if coords_value.get("type") == "Feature":
-            maybe_geom = coords_value.get("geometry")
-            if isinstance(maybe_geom, dict) and "type" in maybe_geom and "coordinates" in maybe_geom:
-                return maybe_geom
+def _parse_bbox_param(value: str) -> BBox:
+    raw = value.strip().strip('"').strip("'")
+    parts = [part.strip().strip('"').strip("'") for part in raw.split(",")]
+    if len(parts) != 4:
+        raise HTTPException(
+            status_code=422,
+            detail="bbox must have 4 comma-separated values: min_lon,min_lat,max_lon,max_lat",
+        )
 
-        if "type" in coords_value and "coordinates" in coords_value:
-            return coords_value
-
-    geometry_type = _infer_geometry_type(coords_value)
-    if geometry_type is None:
-        return None
-
-    return {
-        "type": geometry_type,
-        "coordinates": coords_value,
-    }
-
-
-def _simplify_coordinates(coords: Any, tolerance: float) -> Any:
-    """Simplify coordinates using Douglas-Peucker algorithm if tolerance > 0."""
-    if tolerance <= 0 or not SHAPELY_AVAILABLE:
-        return coords
-    
     try:
-        geometry_type = _infer_geometry_type(coords)
-        if not geometry_type:
-            return coords
-        
-        # Skip simplification for Point geometries
-        if geometry_type == "Point":
-            return coords
-        
-        # Build a full GeoJSON geometry
-        geom_dict = {
-            "type": geometry_type,
-            "coordinates": coords,
-        }
-        
-        # Use Shapely to simplify
-        geom = shape(geom_dict)
-        simplified = geom.simplify(tolerance, preserve_topology=True)
-        
-        # Check if simplified geometry is empty or became invalid
-        if simplified.is_empty or simplified.area == 0:
-            return coords
-        
-        # Extract simplified coordinates
-        if hasattr(simplified, '__geo_interface__'):
-            simplified_dict = simplified.__geo_interface__
-            simplified_type = simplified_dict.get("type")
-            simplified_coords = simplified_dict.get("coordinates")
-            
-            # Validate coordinates exist and are non-empty
-            if simplified_coords is not None and len(str(simplified_coords)) > 2:
-                # Only return if geometry type is preserved
-                if simplified_type == geometry_type:
-                    return simplified_coords
-        
-        return coords
-    except Exception as e:
-        # If simplification fails, return original
-        return coords
+        min_lon, min_lat, max_lon, max_lat = (float(part) for part in parts)
+        return BBox(min_lon=min_lon, min_lat=min_lat, max_lon=max_lon, max_lat=max_lat)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid bbox value: {exc}") from exc
 
 
 @router.get("", response_model=list[Feature])
 async def get_features(
-    min_lon: float = Query(...),
-    min_lat: float = Query(...),
-    max_lon: float = Query(...),
-    max_lat: float = Query(...),
+    bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     category: str = Query(default="places"),
-    use_postgis: bool = Query(default=False),
-    zoom: int = Query(default=2, ge=0, le=19),
     limit: int = Query(default=1000, ge=1),
 ):
+    bbox_obj = _parse_bbox_param(bbox)
+
     query = """
     WITH bounds AS (
         SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
@@ -158,29 +70,13 @@ async def get_features(
         n.name,
         n.category,
         n.subcategory,
-        n.min_lon,
-        n.max_lon,
-        n.min_lat,
-        n.max_lat,
-        n.coords,
+                ST_AsGeoJSON(ST_GeomFromWKB(n.geom, 4326)) AS geom,
         'natural_earth'::text AS source
     FROM public.natural_earth_silver n
+    CROSS JOIN bounds b
     WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
-      AND n.min_lon IS NOT NULL
-      AND n.max_lon IS NOT NULL
-      AND n.min_lat IS NOT NULL
-      AND n.max_lat IS NOT NULL
-      AND n.max_lon >= %s
-      AND n.min_lon <= %s
-      AND n.max_lat >= %s
-      AND n.min_lat <= %s
-      AND (
-          NOT %s::boolean
-          OR EXISTS (
-              SELECT 1 FROM bounds b
-              WHERE ST_MakeEnvelope(n.min_lon, n.min_lat, n.max_lon, n.max_lat, 4326) && b.query_envelope
-          )
-      )
+      AND n.geom IS NOT NULL
+            AND ST_GeomFromWKB(n.geom, 4326) && b.query_envelope
 
     UNION ALL
 
@@ -189,64 +85,25 @@ async def get_features(
         g.name,
         g.category,
         g.subcategory,
-        g.min_lon,
-        g.max_lon,
-        g.min_lat,
-        g.max_lat,
-        g.coords,
+                ST_AsGeoJSON(ST_GeomFromWKB(g.geom, 4326)) AS geom,
         'gadm'::text AS source
     FROM public.gadm_silver g
+    CROSS JOIN bounds b
     WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
-      AND g.min_lon IS NOT NULL
-      AND g.max_lon IS NOT NULL
-      AND g.min_lat IS NOT NULL
-      AND g.max_lat IS NOT NULL
-      AND g.max_lon >= %s
-      AND g.min_lon <= %s
-      AND g.max_lat >= %s
-      AND g.min_lat <= %s
-      AND (
-          NOT %s::boolean
-          OR EXISTS (
-              SELECT 1 FROM bounds b
-              WHERE ST_MakeEnvelope(g.min_lon, g.min_lat, g.max_lon, g.max_lat, 4326) && b.query_envelope
-          )
-      )
+      AND g.geom IS NOT NULL
+            AND ST_GeomFromWKB(g.geom, 4326) && b.query_envelope
     LIMIT %s;
     """
 
-    # Calculate tolerance for Level-of-Detail (LOD) system
-    # Lower tolerance = less simplification = more detail
-    if zoom <= 2:
-        tolerance = 0.05      # Very zoomed out: aggressive simplification
-    elif zoom <= 4:
-        tolerance = 0.01      # Zoomed out: moderate simplification
-    elif zoom <= 6:
-        tolerance = 0.005     # Medium zoom: light simplification
-    elif zoom <= 8:
-        tolerance = 0.001     # Zoomed in: minimal simplification
-    else:
-        tolerance = 0         # Fully zoomed in: no simplification
-
     params = (
-        min_lon,
-        min_lat,
-        max_lon,
-        max_lat,
+        bbox_obj.min_lon,
+        bbox_obj.min_lat,
+        bbox_obj.max_lon,
+        bbox_obj.max_lat,
         category,
         category,
-        min_lon,
-        max_lon,
-        min_lat,
-        max_lat,
-        use_postgis,
         category,
         category,
-        min_lon,
-        max_lon,
-        min_lat,
-        max_lat,
-        use_postgis,
         limit,
     )
     
@@ -257,31 +114,17 @@ async def get_features(
 
     features: list[Feature] = []
     for row in rows:
-        coords_value = _parse_json_value(row.get("coords"))
-        
-        # Apply coordinate simplification based on zoom level (LOD system)
-        if tolerance > 0:
-            coords_value = _simplify_coordinates(coords_value, tolerance)
-        
-        geom = _build_geometry_from_coords(coords_value)
-        if geom is None:
+        geometry_value = _extract_geometry(_parse_json(row.get("geom")))
+        if geometry_value is None:
             continue
 
-        props: dict[str, Any] = {}
-        if isinstance(coords_value, dict) and coords_value.get("type") == "Feature":
-            props = coords_value.get("properties") or {}
-
-        row_properties = {
+        properties: dict[str, str | int | float | bool | None] = {
             key: value
             for key, value in row.items()
-            if key not in {"coords", "min_lon", "max_lon", "min_lat", "max_lat"} and value is not None
+            if key not in {"geom"} and value is not None
         }
-        props = {**row_properties, **props}
 
-        if not isinstance(geom, dict) or "type" not in geom or "coordinates" not in geom:
-            continue
-
-        features.append(Feature(geometry=Geometry(**geom), properties=props))
+        features.append(Feature(geometry=Geometry(**geometry_value), properties=properties))
 
     return features
 
