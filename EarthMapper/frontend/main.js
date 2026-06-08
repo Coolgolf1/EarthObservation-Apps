@@ -79,10 +79,10 @@ function clearQueuedRequests() {
 function getBboxFromMap() {
   const bounds = map.getBounds();
   return {
-    min_lon: bounds.getWest(),
-    min_lat: bounds.getSouth(),
-    max_lon: bounds.getEast(),
-    max_lat: bounds.getNorth(),
+    west: bounds.getWest(),
+    south: bounds.getSouth(),
+    east: bounds.getEast(),
+    north: bounds.getNorth(),
   };
 }
 
@@ -90,14 +90,9 @@ async function loadFeatures() {
   inFlight = true;
 
   const bbox = getBboxFromMap();
-  const zoom = map.getZoom();
   const params = new URLSearchParams({
-    min_lon: String(bbox.min_lon),
-    min_lat: String(bbox.min_lat),
-    max_lon: String(bbox.max_lon),
-    max_lat: String(bbox.max_lat),
-    zoom: String(zoom),
-    limit: String(Math.max(1, Number(limitEl.value) || 400)),
+    bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
+    limit: String(Math.max(1, Number(limitEl.value) || 1000)),
   });
 
   const category = categoryEl.value.trim();
@@ -131,7 +126,6 @@ async function loadFeatures() {
           features: viewportFeatures,
         };
 
-        // Use canvas rendering
         geoJsonLayer.clearLayers();
         geoJsonLayer.addData(featureCollection);
 
@@ -141,7 +135,6 @@ async function loadFeatures() {
 
       parseWorker.postMessage({ features, mapBounds: bbox });
     } else {
-      // Fallback: process on main thread
       const mapBounds = map.getBounds();
       const viewportFeatures = features.filter((feature) => {
         const geometry = feature.geometry || {};
@@ -158,7 +151,6 @@ async function loadFeatures() {
         features: viewportFeatures,
       };
 
-      // Use canvas rendering
       geoJsonLayer.clearLayers();
       geoJsonLayer.addData(featureCollection);
 
