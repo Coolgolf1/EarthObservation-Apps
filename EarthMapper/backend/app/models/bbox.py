@@ -1,11 +1,11 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 
 class BBox(BaseModel):
-    min_lon: float = Field(ge=-180, le=180)
-    min_lat: float = Field(ge=-90, le=90)
-    max_lon: float = Field(ge=-180, le=180)
-    max_lat: float = Field(ge=-90, le=90)
+    min_lon: float
+    min_lat: float
+    max_lon: float
+    max_lat: float
 
     @model_validator(mode="after")
     def validate_bounds(self):
