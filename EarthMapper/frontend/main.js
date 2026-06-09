@@ -16,12 +16,6 @@ const categoryEl = document.getElementById("category");
 const limitEl = document.getElementById("limit");
 const formEl = document.getElementById("filters-form");
 
-// Initialize WebWorker for background parsing
-let parseWorker = null;
-if (typeof Worker !== "undefined") {
-  parseWorker = new Worker("parse-worker.js");
-}
-
 let geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
   style: (feature) => {
@@ -113,50 +107,27 @@ async function loadFeatures() {
 
     const features = await response.json();
 
-    // Use WebWorker for parsing if available, otherwise process on main thread
-    if (parseWorker) {
-      parseWorker.onmessage = (event) => {
-        if (!event.data.success) {
-          throw new Error(event.data.error);
-        }
+    const mapBounds = map.getBounds();
+    const viewportFeatures = features.filter((feature) => {
+      const geometry = feature.geometry || {};
+      if (geometry.type === "Point") {
+        const coords = geometry.coordinates || [];
+        const point = L.latLng(coords[1], coords[0]);
+        return mapBounds.contains(point);
+      }
+      return true;
+    });
 
-        const viewportFeatures = event.data.features;
-        const featureCollection = {
-          type: "FeatureCollection",
-          features: viewportFeatures,
-        };
+    const featureCollection = {
+      type: "FeatureCollection",
+      features: viewportFeatures,
+    };
 
-        geoJsonLayer.clearLayers();
-        geoJsonLayer.addData(featureCollection);
+    geoJsonLayer.clearLayers();
+    geoJsonLayer.addData(featureCollection);
 
-        const elapsedMs = Math.round(performance.now() - startedAt);
-        statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms`;
-      };
-
-      parseWorker.postMessage({ features, mapBounds: bbox });
-    } else {
-      const mapBounds = map.getBounds();
-      const viewportFeatures = features.filter((feature) => {
-        const geometry = feature.geometry || {};
-        if (geometry.type === "Point") {
-          const coords = geometry.coordinates || [];
-          const point = L.latLng(coords[1], coords[0]);
-          return mapBounds.contains(point);
-        }
-        return true;
-      });
-
-      const featureCollection = {
-        type: "FeatureCollection",
-        features: viewportFeatures,
-      };
-
-      geoJsonLayer.clearLayers();
-      geoJsonLayer.addData(featureCollection);
-
-      const elapsedMs = Math.round(performance.now() - startedAt);
-      statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms`;
-    }
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    statsEl.textContent = `Loaded ${viewportFeatures.length} features in ${elapsedMs} ms`;
   } catch (error) {
     statsEl.textContent = `Request failed: ${error.message}`;
     console.error(error);
