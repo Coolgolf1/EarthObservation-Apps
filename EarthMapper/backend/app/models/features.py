@@ -1,8 +1,10 @@
 from pydantic import BaseModel, Field
 
+type Coords = float | list["Coords"]
+
 class Geometry(BaseModel):
     type: str
-    coordinates: list | float
+    coordinates: Coords
 
 
 class Feature(BaseModel):
