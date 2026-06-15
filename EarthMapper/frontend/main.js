@@ -13,31 +13,76 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
 const statsEl = document.getElementById("stats");
 const categoryEl = document.getElementById("category");
-const limitEl = document.getElementById("limit");
 const formEl = document.getElementById("filters-form");
+
+const FRONTEND_LIMIT = 50000;
+
+const CATEGORY_STYLE = {
+  hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
+  administrative: { stroke: "#2ca25f", fill: "transparent", point: "#2ca25f", fillOpacity: 0.0 },
+  transport: { stroke: "#6b7280", fill: "#9ca3af", point: "#6b7280", fillOpacity: 0.45 },
+  places: { stroke: "#f59e0b", fill: "#f59e0b", point: "#f59e0b", fillOpacity: 0.35 },
+  terrain: { stroke: "#8b5a2b", fill: "#a67c52", point: "#8b5a2b", fillOpacity: 0.4 },
+  regions: { stroke: "#0f766e", fill: "#14b8a6", point: "#0f766e", fillOpacity: 0.3 },
+  landmarks: { stroke: "#d62728", fill: "#ef4444", point: "#d62728", fillOpacity: 0.5 },
+  default: { stroke: "#1d3557", fill: "#2a9d8f", point: "#0f5132", fillOpacity: 0.35 },
+};
+
+function currentCategoryPalette(feature = null) {
+  const cat = String(feature?.properties?.category || categoryEl.value || "").trim().toLowerCase();
+  return CATEGORY_STYLE[cat] || CATEGORY_STYLE.default;
+}
 
 const geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
-  style: () => {
+  style: (feature) => {
+    const palette = currentCategoryPalette(feature);
+    const geometryType = feature?.geometry?.type || "";
+    const featureCategory = String(feature?.properties?.category || "").trim().toLowerCase();
     const zoom = map.getZoom();
-    const fillOpacity = zoom <= 6 ? 0.5 : 0.35;
-    const weight = zoom <= 6 ? 2 : 1;
+
+    if (geometryType.includes("LineString")) {
+      let lineWeight = zoom <= 6 ? 2.2 : 1.5;
+      if (featureCategory === "transport") {
+        lineWeight = zoom <= 6 ? 3.2 : 2.6;
+      }
+      if (featureCategory === "hydrography") {
+        lineWeight = zoom <= 6 ? 3.0 : 2.4;
+      }
+      return {
+        color: palette.stroke,
+        weight: lineWeight,
+        fillOpacity: 0,
+      };
+    }
+
+    if (featureCategory === "administrative") {
+      return {
+        color: palette.stroke,
+        weight: zoom <= 6 ? 1.8 : 1.2,
+        fillColor: "transparent",
+        fillOpacity: 0,
+      };
+    }
+
     return {
-      color: "#1d3557",
-      weight,
-      fillColor: "#2a9d8f",
-      fillOpacity,
+      color: palette.stroke,
+      weight: zoom <= 6 ? 2 : 1,
+      fillColor: palette.fill,
+      fillOpacity: Math.min(zoom <= 6 ? 0.5 : 0.35, palette.fillOpacity),
     };
   },
-  pointToLayer: (_, latlng) =>
-    L.circleMarker(latlng, {
+  pointToLayer: (feature, latlng) => {
+    const palette = currentCategoryPalette(feature);
+    return L.circleMarker(latlng, {
       renderer: canvasRenderer,
       radius: 5,
-      color: "#0f5132",
-      fillColor: "#52b788",
+      color: palette.stroke,
+      fillColor: palette.point,
       fillOpacity: 0.9,
       weight: 1,
-    }),
+    });
+  },
   onEachFeature: (feature, featureLayer) => {
     featureLayer.on("click", () => {
       if (featureLayer.getPopup()) {
@@ -287,7 +332,7 @@ async function streamCurrentViewport(requestBbox = null) {
 
   const params = new URLSearchParams({
     bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
-    limit: String(Math.max(1, Number(limitEl.value) || 1000)),
+    limit: String(FRONTEND_LIMIT),
   });
 
   const category = categoryEl.value.trim();
@@ -413,7 +458,7 @@ function scheduleLoad() {
   debounceTimer = setTimeout(runLoadCycle, 250);
 }
 
-function resetCachesAndLayer() {
+function resetCachesAndLayer(showMessage = true) {
   if (activeController) {
     activeController.abort();
     activeController = null;
@@ -425,18 +470,14 @@ function resetCachesAndLayer() {
   featureCache.clear();
   renderedFeatureIds.clear();
   geoJsonLayer.clearLayers();
-  updateStats("Cache reset");
+  if (showMessage) {
+    updateStats("Cache reset");
+  }
 }
 
 map.on("moveend", scheduleLoad);
 
 categoryEl.addEventListener("change", () => {
-  clearQueuedRequests();
-  resetCachesAndLayer();
-  runLoadCycle();
-});
-
-limitEl.addEventListener("change", () => {
   clearQueuedRequests();
   resetCachesAndLayer();
   runLoadCycle();
