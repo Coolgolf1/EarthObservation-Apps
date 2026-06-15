@@ -1,4 +1,4 @@
-from app.core.db import get_db_connection
+from .db import get_db_connection
 
 def check_db_connection() -> bool:
     with get_db_connection() as conn:

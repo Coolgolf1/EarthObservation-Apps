@@ -1,9 +1,12 @@
 import os
+from pathlib import Path
 
 import psycopg
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from project root
+env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+load_dotenv(env_path)
 
 
 def get_db_connection() -> psycopg.Connection:
