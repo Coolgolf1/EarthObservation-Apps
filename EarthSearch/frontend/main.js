@@ -27,16 +27,41 @@ function isHydroFeatureAllowed(feature) {
   return false;
 }
 
-const SEARCH_STREAM_SPECS = [
-  { category: "transport", label: "transport", limit: 10 },
+function formatFeatureHoverText(feature) {
+  const props = feature?.properties || {};
+  const name = String(props.name || "Unnamed feature");
+  const category = String(props.category || "unknown");
+  const subcategory = String(props.subcategory || "");
+  const source = String(props.source || "");
+
+  const lines = [name, `Category: ${category}`];
+  if (subcategory) {
+    lines.push(`Subcategory: ${subcategory}`);
+  }
+  if (source) {
+    lines.push(`Source: ${source}`);
+  }
+
+  return lines.join("<br>");
+}
+
+const SEARCH_CATEGORIES = [
+  {
+    category: "transport",
+    label: "transport",
+    limit: 120,
+  },
   {
     category: "hydrography",
     label: "rivers/ocean",
-    limit: 10,
     featureFilter: isHydroFeatureAllowed,
+    limit: 120,
   },
-  { category: "places", label: "places", limit: 10 },
-  { category: "administrative", label: "administrative", limit: 100 },
+  {
+    category: "places",
+    label: "places",
+    limit: 120,
+  },
 ];
 
 const CATEGORY_STYLE = {
@@ -51,7 +76,33 @@ const map = L.map("map", {
   zoomControl: true,
 }).setView([45, 10], 5);
 
+map.createPane("placesPane");
+map.getPane("placesPane").style.zIndex = "350";
+map.createPane("transportPane");
+map.getPane("transportPane").style.zIndex = "410";
+map.createPane("hydroPane");
+map.getPane("hydroPane").style.zIndex = "420";
+map.createPane("adminPane");
+map.getPane("adminPane").style.zIndex = "430";
+
 const canvasRenderer = L.canvas({ padding: 0.5 });
+
+function getCategoryPane(category) {
+  const cat = String(category || "").trim().toLowerCase();
+  if (cat === "places") {
+    return "placesPane";
+  }
+  if (cat === "transport") {
+    return "transportPane";
+  }
+  if (cat === "hydrography") {
+    return "hydroPane";
+  }
+  if (cat === "administrative") {
+    return "adminPane";
+  }
+  return "overlayPane";
+}
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 15,
@@ -60,10 +111,16 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 
 const statsEl = document.getElementById("stats");
 const formEl = document.getElementById("search-form");
-const placeQueryEl = document.getElementById("place-query");
-const minutesEl = document.getElementById("minutes");
+const promptEl = document.getElementById("agent-prompt");
 const vehicleEl = document.getElementById("vehicle");
-const searchBboxEl = document.getElementById("search-bbox");
+const areaValueLabelEl = document.getElementById("area-value-label");
+const areaModeToggleEl = document.getElementById("area-mode-toggle");
+const areaValueEl = document.getElementById("area-value");
+const areaControlsEl = document.querySelector(".area-controls");
+const bboxDrawToggleEl = document.getElementById("bbox-draw-toggle");
+const bboxClearEl = document.getElementById("bbox-clear");
+const confirmPointWrapEl = document.getElementById("confirm-point-wrap");
+const confirmPointBtnEl = document.getElementById("confirm-point-btn");
 
 const geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
@@ -82,6 +139,7 @@ const geoJsonLayer = L.geoJSON([], {
         lineWeight = zoom <= 6 ? 3.0 : 2.4;
       }
       return {
+        pane: getCategoryPane(cat),
         color: palette.stroke,
         weight: lineWeight,
         fillOpacity: 0,
@@ -90,6 +148,7 @@ const geoJsonLayer = L.geoJSON([], {
 
     if (cat === "administrative") {
       return {
+        pane: getCategoryPane(cat),
         color: palette.stroke,
         weight: zoom <= 6 ? 1.8 : 1.2,
         fillColor: "transparent",
@@ -98,6 +157,7 @@ const geoJsonLayer = L.geoJSON([], {
     }
 
     return {
+      pane: getCategoryPane(cat),
       color: palette.stroke,
       weight: zoom <= 6 ? 2 : 1,
       fillColor: palette.fill,
@@ -108,6 +168,7 @@ const geoJsonLayer = L.geoJSON([], {
     const cat = String(feature?.properties?.category || "").trim().toLowerCase();
     const palette = CATEGORY_STYLE[cat] || CATEGORY_STYLE.default;
     return L.circleMarker(latlng, {
+      pane: getCategoryPane(cat),
       renderer: canvasRenderer,
       radius: 5,
       color: palette.stroke,
@@ -116,11 +177,31 @@ const geoJsonLayer = L.geoJSON([], {
       weight: 1,
     });
   },
+  onEachFeature: (feature, layer) => {
+    layer.bindTooltip(formatFeatureHoverText(feature), {
+      sticky: true,
+      opacity: 0.95,
+      direction: "top",
+      className: "feature-hover-tooltip",
+    });
+
+    layer.on("mouseover", () => {
+      if (typeof layer.openTooltip === "function") {
+        layer.openTooltip();
+      }
+    });
+    layer.on("mouseout", () => {
+      if (typeof layer.closeTooltip === "function") {
+        layer.closeTooltip();
+      }
+    });
+  },
 });
 geoJsonLayer.addTo(map);
 
 const reachAreaLayer = L.geoJSON([], {
   renderer: canvasRenderer,
+  interactive: false,
   style: {
     color: "#111827",
     weight: 2,
@@ -132,14 +213,260 @@ const reachAreaLayer = L.geoJSON([], {
 reachAreaLayer.addTo(map);
 
 const centerMarkerLayer = L.layerGroup().addTo(map);
+const bboxSelectionLayer = L.layerGroup().addTo(map);
+const pendingPointLayer = L.layerGroup().addTo(map);
 
 let activeController = null;
 let runVersion = 0;
 let pendingSearchTimeout = null;
 let pendingSearchMoveendHandler = null;
+let promptChangeDebounce = null;
+let areaMode = "time";
+let bboxDrawMode = false;
+let bboxDrawPoints = [];
+let pendingPoint = null;
+const clientSessionId = (() => {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `client-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+})();
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function fetchWith429Retry(url, options, { retries = 1, retryDelayMs = 1000 } = {}) {
+  let attempt = 0;
+  while (true) {
+    const response = await fetch(url, options);
+    if (response.status !== 429 || attempt >= retries) {
+      return response;
+    }
+    attempt += 1;
+    await sleep(retryDelayMs);
+  }
+}
 
 function updateStats(text) {
   statsEl.textContent = text;
+}
+
+function applyAreaModeUI() {
+  if (areaMode === "radius") {
+    areaValueLabelEl.textContent = "Radius (km)";
+    areaModeToggleEl.textContent = "Switch to Time";
+    areaModeToggleEl.setAttribute("aria-pressed", "true");
+    areaValueEl.min = "0.5";
+    areaValueEl.max = "500";
+    const numeric = Math.max(0.5, Number(areaValueEl.value) || 10);
+    areaValueEl.value = String(Number(numeric.toFixed(1)));
+    return;
+  }
+
+  areaValueLabelEl.textContent = "Time (minutes)";
+  areaModeToggleEl.textContent = "Switch to Km";
+  areaModeToggleEl.setAttribute("aria-pressed", "false");
+  areaValueEl.min = "1";
+  areaValueEl.max = "240";
+  const numeric = Math.max(1, Math.round(Number(areaValueEl.value) || 30));
+  areaValueEl.value = String(numeric);
+}
+
+function updateBBoxDrawUI() {
+  bboxDrawToggleEl.textContent = bboxDrawMode ? "Stop Polygon Select" : "Start Polygon Select";
+  bboxDrawToggleEl.setAttribute("aria-pressed", bboxDrawMode ? "true" : "false");
+
+  const hideAreaInputs = bboxDrawMode;
+  areaValueLabelEl.style.display = hideAreaInputs ? "none" : "";
+  if (areaControlsEl) {
+    areaControlsEl.style.display = hideAreaInputs ? "none" : "grid";
+  }
+
+  refreshConfirmButtonVisibility();
+}
+
+function clearBBoxSelection() {
+  bboxDrawPoints = [];
+  bboxSelectionLayer.clearLayers();
+  refreshConfirmButtonVisibility();
+}
+
+function showConfirmPointButton() {
+  confirmPointWrapEl.classList.remove("hidden");
+}
+
+function hideConfirmPointButton() {
+  confirmPointWrapEl.classList.add("hidden");
+}
+
+function refreshConfirmButtonVisibility() {
+  const hasPendingPoint = pendingPoint != null;
+  const hasPolygonReady = bboxDrawMode && getPolygonFromPoints() != null;
+  if (hasPendingPoint || hasPolygonReady) {
+    showConfirmPointButton();
+  } else {
+    hideConfirmPointButton();
+  }
+}
+
+function setPendingPoint(lat, lon) {
+  pendingPoint = { lat, lon };
+  pendingPointLayer.clearLayers();
+  L.circleMarker([lat, lon], {
+    radius: 5,
+    color: "#0f172a",
+    fillColor: "#22c55e",
+    fillOpacity: 0.95,
+    weight: 1,
+  }).addTo(pendingPointLayer);
+  refreshConfirmButtonVisibility();
+}
+
+function clearPendingPoint() {
+  pendingPoint = null;
+  pendingPointLayer.clearLayers();
+  refreshConfirmButtonVisibility();
+}
+
+function _cross(o, a, b) {
+  return ((a.lng - o.lng) * (b.lat - o.lat)) - ((a.lat - o.lat) * (b.lng - o.lng));
+}
+
+function computeConvexHull(points) {
+  if (!Array.isArray(points) || points.length <= 1) {
+    return Array.isArray(points) ? [...points] : [];
+  }
+
+  const sorted = [...points].sort((p1, p2) => {
+    if (p1.lng !== p2.lng) {
+      return p1.lng - p2.lng;
+    }
+    return p1.lat - p2.lat;
+  });
+
+  const lower = [];
+  for (const p of sorted) {
+    while (lower.length >= 2 && _cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) {
+      lower.pop();
+    }
+    lower.push(p);
+  }
+
+  const upper = [];
+  for (let i = sorted.length - 1; i >= 0; i -= 1) {
+    const p = sorted[i];
+    while (upper.length >= 2 && _cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) {
+      upper.pop();
+    }
+    upper.push(p);
+  }
+
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper];
+}
+
+function getPolygonFromPoints() {
+  if (!Array.isArray(bboxDrawPoints) || bboxDrawPoints.length < 3) {
+    return null;
+  }
+
+  const hull = computeConvexHull(bboxDrawPoints);
+  if (hull.length < 3) {
+    return null;
+  }
+
+  return hull.map((p) => [Number(p.lng), Number(p.lat)]);
+}
+
+function redrawBBoxSelection() {
+  bboxSelectionLayer.clearLayers();
+  if (!bboxDrawPoints.length) {
+    refreshConfirmButtonVisibility();
+    return;
+  }
+
+  for (const p of bboxDrawPoints) {
+    L.circleMarker([p.lat, p.lng], {
+      radius: 4,
+      color: "#0f172a",
+      fillColor: "#2563eb",
+      fillOpacity: 0.9,
+      weight: 1,
+      interactive: false,
+    }).addTo(bboxSelectionLayer);
+  }
+
+  const hull = computeConvexHull(bboxDrawPoints);
+
+  if (hull.length >= 2) {
+    L.polyline(hull.map((p) => [p.lat, p.lng]), {
+      color: "#1f2937",
+      weight: 2,
+      dashArray: "6 4",
+      interactive: false,
+    }).addTo(bboxSelectionLayer);
+  }
+
+  if (hull.length >= 3) {
+    L.polygon(hull.map((p) => [p.lat, p.lng]), {
+      color: "#1f2937",
+      weight: 2,
+      fillColor: "#60a5fa",
+      fillOpacity: 0.12,
+      interactive: false,
+    }).addTo(bboxSelectionLayer);
+  }
+
+  refreshConfirmButtonVisibility();
+}
+
+function getAreaSelection() {
+  const raw = Number(areaValueEl.value);
+  if (areaMode === "radius") {
+    return {
+      areaMode: "radius",
+      minutes: 30,
+      radiusKm: Math.max(0.5, Number.isFinite(raw) ? raw : 10),
+    };
+  }
+
+  return {
+    areaMode: "time",
+    minutes: Math.max(1, Number.isFinite(raw) ? Math.round(raw) : 30),
+    radiusKm: 10,
+  };
+}
+
+function syncControlsFromIntent(intent) {
+  if (!intent || typeof intent !== "object") {
+    return;
+  }
+
+  const mode = String(intent.mode || "time").toLowerCase();
+  if (mode === "radius") {
+    areaMode = "radius";
+    const resolvedRadiusKm = Number(intent.radius_km);
+    if (Number.isFinite(resolvedRadiusKm)) {
+      areaValueEl.value = String(Math.max(0.5, Math.min(500, resolvedRadiusKm)));
+    }
+  } else {
+    areaMode = "time";
+    const resolvedMinutes = Number(intent.minutes);
+    if (Number.isFinite(resolvedMinutes)) {
+      areaValueEl.value = String(Math.max(1, Math.min(240, Math.round(resolvedMinutes))));
+    }
+  }
+
+  applyAreaModeUI();
+
+  const resolvedVehicle = String(intent.vehicle || "").trim().toLowerCase();
+  if (["walking", "cycling", "driving", "driving-hgv"].includes(resolvedVehicle)) {
+    vehicleEl.value = resolvedVehicle;
+  }
 }
 
 function cancelPending() {
@@ -156,6 +483,9 @@ function cancelPending() {
     map.off("moveend", pendingSearchMoveendHandler);
     pendingSearchMoveendHandler = null;
   }
+
+  // Immediately clear previous results when a new search cycle begins.
+  clearMap();
 }
 
 function clearMap() {
@@ -259,18 +589,31 @@ function featureIntersectsBbox(feature, bbox) {
   return extentsIntersectBbox(getGeometryExtents(geometry), bbox);
 }
 
-async function streamCategory({ bbox, spec, signal, onProgress }) {
+function _findCategorySpec(category) {
+  return SEARCH_CATEGORIES.find((s) => s.category === category) || null;
+}
+
+async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProgress, clientId, searchId, countsByLabel, addedRef }) {
+  if (!shouldContinue()) {
+    throw new DOMException("Search cancelled", "AbortError");
+  }
+
   const params = new URLSearchParams({
     bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
     category: spec.category,
-    limit: String(spec.limit),
+    limit: String(spec.limit || 100),
+    client_id: clientId,
+    search_id: searchId,
   });
 
-  const response = await fetch(`${API_BASE}/features/stream?${params.toString()}`, {
+  const response = await fetchWith429Retry(`${API_BASE}/features/stream?${params.toString()}`, {
     signal,
     headers: {
       Accept: "application/x-ndjson",
     },
+  }, {
+    retries: 1,
+    retryDelayMs: 1000,
   });
 
   if (!response.ok || !response.body) {
@@ -281,10 +624,13 @@ async function streamCategory({ bbox, spec, signal, onProgress }) {
   const decoder = new TextDecoder();
   let textBuffer = "";
   let batch = [];
-  let added = 0;
   const BATCH_SIZE = 100;
 
   while (true) {
+    if (!shouldContinue()) {
+      throw new DOMException("Search cancelled", "AbortError");
+    }
+
     const { done, value } = await reader.read();
     if (done) {
       break;
@@ -298,6 +644,10 @@ async function streamCategory({ bbox, spec, signal, onProgress }) {
       const line = rawLine.trim();
       if (!line) {
         continue;
+      }
+
+      if (!shouldContinue()) {
+        throw new DOMException("Search cancelled", "AbortError");
       }
 
       let parsed;
@@ -320,10 +670,14 @@ async function streamCategory({ bbox, spec, signal, onProgress }) {
       }
 
       batch.push(parsed);
+      countsByLabel.set(spec.label, (countsByLabel.get(spec.label) || 0) + 1);
       if (batch.length >= BATCH_SIZE) {
-        added += addFeatures(batch);
+        if (!shouldContinue()) {
+          throw new DOMException("Search cancelled", "AbortError");
+        }
+        addedRef.value += addFeatures(batch);
         batch = [];
-        onProgress(added);
+        onProgress(addedRef.value, countsByLabel);
       }
     }
   }
@@ -337,6 +691,7 @@ async function streamCategory({ bbox, spec, signal, onProgress }) {
           && featureIntersectsBbox(parsed, bbox)
         ) {
           batch.push(parsed);
+          countsByLabel.set(spec.label, (countsByLabel.get(spec.label) || 0) + 1);
         }
       }
     } catch {
@@ -344,48 +699,76 @@ async function streamCategory({ bbox, spec, signal, onProgress }) {
     }
   }
 
-  added += addFeatures(batch);
-  onProgress(added);
-  return added;
+  if (!shouldContinue()) {
+    throw new DOMException("Search cancelled", "AbortError");
+  }
+
+  addedRef.value += addFeatures(batch);
+  onProgress(addedRef.value, countsByLabel);
 }
 
-async function runSearch() {
-  cancelPending();
-  const localRunVersion = runVersion;
+async function streamCombined({ bbox, signal, shouldContinue, onProgress, clientId, searchId }) {
+  const countsByLabel = new Map(SEARCH_CATEGORIES.map((s) => [s.label, 0]));
+  const addedRef = { value: 0 };
 
-  const placeQuery = placeQueryEl.value.trim();
-  if (!placeQuery) {
-    updateStats("Provide a place query.");
-    return;
+  for (const spec of SEARCH_CATEGORIES) {
+    if (!shouldContinue()) {
+      throw new DOMException("Search cancelled", "AbortError");
+    }
+
+    await streamSingleCategory({
+      bbox,
+      spec,
+      signal,
+      shouldContinue,
+      onProgress,
+      clientId,
+      searchId,
+      countsByLabel,
+      addedRef,
+    });
   }
+
+  return addedRef.value;
+}
+
+async function runSearchRequest({ endpoint, body, loadingMessage }) {
+  cancelPending();
+  clearPendingPoint();
+  const localRunVersion = runVersion;
+  const searchId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function")
+    ? globalThis.crypto.randomUUID()
+    : `search-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   const controller = new AbortController();
   activeController = controller;
 
-  updateStats("Resolving search bbox...");
-
-  const params = new URLSearchParams({
-    place_query: placeQuery,
-    minutes: String(Math.max(1, Number(minutesEl.value) || 30)),
-    vehicle: vehicleEl.value,
-    metadata_only: "true",
-  });
-
-  const rawBbox = searchBboxEl.value.trim();
-  if (rawBbox) {
-    params.set("bbox", rawBbox);
-  }
+  updateStats(loadingMessage);
 
   try {
-    const response = await fetch(`${API_BASE}/features/search-mode?${params.toString()}`, {
+    const response = await fetchWith429Retry(`${API_BASE}${endpoint}`, {
+      method: "POST",
       signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        ...body,
+        client_id: clientSessionId,
+        search_id: searchId,
+      }),
+    }, {
+      retries: 1,
+      retryDelayMs: 1000,
     });
 
     if (!response.ok) {
-      throw new Error(`API error ${response.status}`);
+      const errorText = await response.text();
+      throw new Error(`API error ${response.status}: ${errorText || "request failed"}`);
     }
 
     const payload = await response.json();
+    syncControlsFromIntent(payload.parsed_intent);
 
     if (localRunVersion !== runVersion || controller.signal.aborted) {
       return;
@@ -432,46 +815,42 @@ async function runSearch() {
         return;
       }
 
-      const progress = new Map();
-      for (const spec of SEARCH_STREAM_SPECS) {
-        progress.set(spec.label, 0);
-      }
+      const shouldContinue = () => localRunVersion === runVersion && !controller.signal.aborted;
+      const progress = new Map(SEARCH_CATEGORIES.map((s) => [s.label, 0]));
 
-      updateStats("Streaming requested categories...");
+      const intent = payload.parsed_intent || {};
+      const mode = intent.mode || "default";
+      const modeText = mode === "radius"
+        ? `${Number(intent.radius_km || 0).toFixed(1)} km radius`
+        : `${Number(intent.minutes || 0)} min ${intent.vehicle || "driving"}`;
+      updateStats(`Streaming categories for ${payload.place_name || "location"} (${modeText})...`);
 
-      const jobs = SEARCH_STREAM_SPECS.map((spec) =>
-        streamCategory({
-          bbox: searchBbox,
-          spec,
-          signal: controller.signal,
-          onProgress: (delta) => {
-            progress.set(spec.label, delta);
-            const total = Array.from(progress.values()).reduce((sum, n) => sum + n, 0);
-            updateStats(`${spec.label}: +${delta} | total +${total}`);
-          },
-        })
-      );
+      const total = await streamCombined({
+        bbox: searchBbox,
+        signal: controller.signal,
+        shouldContinue,
+        clientId: String(payload.client_id || clientSessionId),
+        searchId: String(payload.search_id || searchId),
+        onProgress: (loadedTotal, countsByLabel) => {
+          if (!shouldContinue()) {
+            return;
+          }
+          for (const [label, value] of countsByLabel.entries()) {
+            progress.set(label, value);
+          }
+          const details = Array.from(progress.entries())
+            .map(([label, value]) => `${label}: +${value}`)
+            .join(" | ");
+          updateStats(`${details} | total +${loadedTotal}`);
+        },
+      });
 
-      const results = await Promise.all(jobs);
-      const total = results.reduce((sum, n) => sum + n, 0);
-      updateStats(`Done. Total plotted: ${total}`);
+      updateStats(`Done (${payload.parser_mode || "agent"}). Total plotted: ${total}`);
     };
 
-    let started = false;
-    const start = () => {
-      if (started) {
-        return;
-      }
-      started = true;
-      pendingSearchTimeout = null;
-      pendingSearchMoveendHandler = null;
-      void streamAfterZoom();
-    };
-
-    pendingSearchMoveendHandler = start;
-    map.once("moveend", start);
-    map.fitBounds(fitBounds, { animate: true, padding: [24, 24] });
-    pendingSearchTimeout = setTimeout(start, 700);
+    // Fit immediately and start loading right away for a snappy submit action.
+    map.fitBounds(fitBounds, { animate: false, padding: [24, 24] });
+    void streamAfterZoom();
   } catch (error) {
     if (error.name !== "AbortError") {
       updateStats(`Search failed: ${error.message}`);
@@ -484,7 +863,156 @@ async function runSearch() {
   }
 }
 
+async function runSearch() {
+  const selectedPolygon = getPolygonFromPoints();
+  if (selectedPolygon) {
+    await runBBoxSearch(selectedPolygon);
+    return;
+  }
+
+  const prompt = promptEl.value.trim();
+  if (!prompt) {
+    updateStats("Provide a location prompt, or draw a bbox and press Run search.");
+    return;
+  }
+
+  const area = getAreaSelection();
+  await runSearchRequest({
+    endpoint: "/features/agent-search",
+    loadingMessage: "Running agentic planner...",
+    body: {
+      prompt,
+      vehicle: vehicleEl.value,
+      area_mode: area.areaMode,
+      minutes: area.minutes,
+      radius_km: area.radiusKm,
+      metadata_only: true,
+    },
+  });
+}
+
+async function runBBoxSearch(bboxValues) {
+  await runSearchRequest({
+    endpoint: "/features/bbox-search",
+    loadingMessage: "Running bbox selection search...",
+    body: {
+      polygon: bboxValues,
+      metadata_only: true,
+    },
+  });
+}
+
+async function runPointSearch(lat, lon) {
+  const area = getAreaSelection();
+  await runSearchRequest({
+    endpoint: "/features/point-search",
+    loadingMessage: "Running map-click search...",
+    body: {
+      lat,
+      lon,
+      vehicle: vehicleEl.value,
+      area_mode: area.areaMode,
+      minutes: area.minutes,
+      radius_km: area.radiusKm,
+      metadata_only: true,
+    },
+  });
+}
+
 formEl.addEventListener("submit", (event) => {
   event.preventDefault();
+  if (promptChangeDebounce) {
+    clearTimeout(promptChangeDebounce);
+    promptChangeDebounce = null;
+  }
   void runSearch();
 });
+
+areaModeToggleEl.addEventListener("click", () => {
+  areaMode = areaMode === "time" ? "radius" : "time";
+  applyAreaModeUI();
+});
+
+bboxDrawToggleEl.addEventListener("click", () => {
+  bboxDrawMode = !bboxDrawMode;
+  if (bboxDrawMode) {
+    clearPendingPoint();
+  }
+  updateBBoxDrawUI();
+  if (bboxDrawMode) {
+    updateStats("Polygon select enabled: click multiple spots on the map, then press Run search.");
+  }
+});
+
+bboxClearEl.addEventListener("click", () => {
+  clearBBoxSelection();
+  updateStats("Polygon selection cleared.");
+});
+
+promptEl.addEventListener("input", () => {
+  // Abort in-flight requests immediately when the prompt changes.
+  cancelPending();
+  updateStats("Prompt updated. Searching...");
+
+  if (promptChangeDebounce) {
+    clearTimeout(promptChangeDebounce);
+    promptChangeDebounce = null;
+  }
+
+  promptChangeDebounce = setTimeout(() => {
+    promptChangeDebounce = null;
+    if (!promptEl.value.trim()) {
+      updateStats("Provide a location prompt.");
+      return;
+    }
+    void runSearch();
+  }, 450);
+});
+
+map.on("click", (event) => {
+  const lat = Number(event?.latlng?.lat);
+  const lon = Number(event?.latlng?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return;
+  }
+
+  if (bboxDrawMode) {
+    bboxDrawPoints.push({ lat, lng: lon });
+    redrawBBoxSelection();
+    const selectedPolygon = getPolygonFromPoints();
+    if (selectedPolygon) {
+      updateStats(
+        `Polygon ready (${selectedPolygon.length} points). Press Run search to load.`
+      );
+    } else {
+      updateStats("Polygon point added. Add at least two more points.");
+    }
+    return;
+  }
+
+  setPendingPoint(lat, lon);
+  updateStats("Point selected. Press Confirm to run search.");
+});
+
+confirmPointBtnEl.addEventListener("click", () => {
+  if (promptChangeDebounce) {
+    clearTimeout(promptChangeDebounce);
+    promptChangeDebounce = null;
+  }
+
+  if (bboxDrawMode) {
+    const polygon = getPolygonFromPoints();
+    if (polygon) {
+      void runBBoxSearch(polygon);
+      return;
+    }
+  }
+
+  if (pendingPoint) {
+    void runPointSearch(pendingPoint.lat, pendingPoint.lon);
+  }
+});
+
+applyAreaModeUI();
+updateBBoxDrawUI();
+refreshConfirmButtonVisibility();

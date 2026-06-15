@@ -22,21 +22,16 @@
     <div class="app-shell">
       <aside class="panel">
         <h1>EarthSearch</h1>
-        <p class="subtitle">Search-first frontend for fast streamed map loading</p>
+        <p class="subtitle">Agentic map search with one prompt</p>
 
         <form id="search-form" class="filters" autocomplete="off">
-          <label for="place-query">Place (natural language)</label>
-          <input
-            id="place-query"
-            name="place_query"
-            type="text"
-            value="Valencia, Spain"
-            placeholder="e.g., Statue of Liberty"
-            required
-          />
-
-          <label for="minutes">Reach time (minutes)</label>
-          <input id="minutes" name="minutes" type="number" min="1" max="240" value="35" />
+          <label for="agent-prompt">Search prompt</label>
+          <textarea
+            id="agent-prompt"
+            name="prompt"
+            rows="4"
+            placeholder="Optional if using drawn bbox. e.g., Valencia within 12 km or Valencia in 25 minutes by bicycle"
+          >Valencia, Spain in 35 minutes by driving car</textarea>
 
           <label for="vehicle">Vehicle</label>
           <select id="vehicle" name="vehicle">
@@ -46,22 +41,31 @@
             <option value="driving-hgv">driving-hgv</option>
           </select>
 
-          <label for="search-bbox">Optional bbox override</label>
-          <input
-            id="search-bbox"
-            name="search_bbox"
-            type="text"
-            placeholder="min_lon,min_lat,max_lon,max_lat"
-          />
+          <label for="area-value" id="area-value-label">Time (minutes)</label>
+          <div class="area-controls">
+            <button type="button" id="area-mode-toggle" class="mode-toggle" aria-pressed="false">Switch to Km</button>
+            <input id="area-value" name="area_value" type="number" min="1" max="240" value="30" />
+          </div>
 
-          <button type="submit">Run search</button>
+          <label>Polygon selection</label>
+          <div class="bbox-controls">
+            <button type="button" id="bbox-draw-toggle" class="mode-toggle" aria-pressed="false">Start Polygon Select</button>
+            <button type="button" id="bbox-clear" class="mode-toggle">Clear Polygon</button>
+          </div>
+
+          <button type="submit">Run agentic search</button>
         </form>
 
         <div class="stats" id="stats">Run a search to stream features...</div>
       </aside>
 
       <main>
-        <div id="map"></div>
+        <div class="map-wrap">
+          <div id="map"></div>
+          <div id="confirm-point-wrap" class="confirm-point-wrap hidden">
+            <button type="button" id="confirm-point-btn" class="confirm-point-btn">Confirm</button>
+          </div>
+        </div>
       </main>
     </div>
 
