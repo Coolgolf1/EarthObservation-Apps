@@ -117,7 +117,7 @@ wheels = [
 ]
 
 [[package]]
-name = "arcgis"
+name = "earthsearch"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

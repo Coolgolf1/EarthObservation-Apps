@@ -9,6 +9,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.python-version
 env/
 venv/
 ENV/
@@ -27,6 +28,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+uv.lock
 
 # IDEs
 .vscode/
