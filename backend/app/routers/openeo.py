@@ -159,7 +159,8 @@ async def openeo_result(payload: OpenEOResultRequest):
     connection = _connect(token=payload.bearer_token)
 
     try:
-        response = connection.post(path="/result", json=payload.model_dump())
+        # Only forward openEO /result schema fields (do not leak local helper fields like bearer_token).
+        response = connection.post(path="/result", json={"process": payload.process})
         content_type = response.headers.get("Content-Type", "application/octet-stream")
         raw = response.content
 
@@ -182,6 +183,7 @@ async def openeo_result(payload: OpenEOResultRequest):
             "bytes_base64": base64.b64encode(raw).decode("ascii"),
         }
     except OpenEoApiError as exc:
-        raise HTTPException(status_code=502, detail=f"openEO /result API error: {exc}") from exc
+        error_status = getattr(exc, "http_status_code", None) or 502
+        raise HTTPException(status_code=error_status, detail=f"openEO /result API error: {exc}") from exc
     except OpenEoClientException as exc:
         raise HTTPException(status_code=502, detail=f"openEO /result client error: {exc}") from exc

@@ -14,6 +14,13 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 const statsEl = document.getElementById("stats");
 const categoryEl = document.getElementById("category");
 const formEl = document.getElementById("filters-form");
+const openeoCollectionEl = document.getElementById("openeo-collection");
+const openeoBandsEl = document.getElementById("openeo-bands");
+const openeoStartEl = document.getElementById("openeo-start");
+const openeoEndEl = document.getElementById("openeo-end");
+const openeoOpacityEl = document.getElementById("openeo-opacity");
+const openeoLoadBtnEl = document.getElementById("openeo-load-btn");
+const openeoClearBtnEl = document.getElementById("openeo-clear-btn");
 
 const FRONTEND_LIMIT = 50000;
 const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
@@ -111,6 +118,7 @@ let debounceTimer = null;
 let loadVersion = 0;
 let activeRequestBbox = null;
 let pendingDeferredLoad = false;
+let openeoOverlay = null;
 
 const SMALL_MOVE_RATIO = 0.18;
 
@@ -159,6 +167,128 @@ function getBboxFromMap() {
     east: bounds.getEast(),
     north: bounds.getNorth(),
   };
+}
+
+function getMapBoundsArray() {
+  const bounds = map.getBounds();
+  return [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+}
+
+function getBandList() {
+  const raw = String(openeoBandsEl?.value || "B04,B03,B02");
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function buildOpenEOProcessGraph() {
+  const collectionId = String(openeoCollectionEl?.value || "SENTINEL2_L2A").trim();
+  const start = String(openeoStartEl?.value || "2024-06-01").trim();
+  const end = String(openeoEndEl?.value || "2024-06-30").trim();
+  const bands = getBandList();
+  const bbox = getMapBoundsArray();
+
+  return {
+    load_collection: {
+      process_id: "load_collection",
+      arguments: {
+        id: collectionId,
+        spatial_extent: {
+          west: bbox[0],
+          south: bbox[1],
+          east: bbox[2],
+          north: bbox[3],
+          crs: 4326,
+        },
+        temporal_extent: [start, end],
+        bands,
+      },
+    },
+    reduce_time: {
+      process_id: "reduce_dimension",
+      arguments: {
+        data: { from_node: "load_collection" },
+        dimension: "t",
+        reducer: {
+          process_graph: {
+            median1: {
+              process_id: "median",
+              arguments: { data: { from_parameter: "data" } },
+              result: true,
+            },
+          },
+        },
+      },
+    },
+    save_result: {
+      process_id: "save_result",
+      arguments: {
+        data: { from_node: "reduce_time" },
+        format: "PNG",
+      },
+      result: true,
+    },
+  };
+}
+
+function clearOpenEOOverlay() {
+  if (openeoOverlay) {
+    map.removeLayer(openeoOverlay);
+    openeoOverlay = null;
+  }
+}
+
+async function loadOpenEOOverlay() {
+  const boundsArray = getMapBoundsArray();
+  const opacity = Number(openeoOpacityEl?.value || 0.75);
+  const processGraph = buildOpenEOProcessGraph();
+
+  try {
+    updateStats("Loading openEO overlay...");
+    const response = await fetch(`${API_BASE}/openeo/result`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        process: {
+          process_graph: processGraph,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      if (response.status === 401) {
+        openeoLoadBtnEl?.setAttribute("disabled", "true");
+        throw new Error("openEO requires authentication (401). Overlay loading is disabled until a token is configured.");
+      }
+      throw new Error(`openEO error ${response.status}: ${errorText}`);
+    }
+
+    const payload = await response.json();
+    if (!payload?.bytes_base64 || !payload?.content_type) {
+      throw new Error("openEO /result did not return an image payload");
+    }
+
+    const imageUrl = `data:${payload.content_type};base64,${payload.bytes_base64}`;
+
+    clearOpenEOOverlay();
+    openeoOverlay = L.imageOverlay(
+      imageUrl,
+      [[boundsArray[1], boundsArray[0]], [boundsArray[3], boundsArray[2]]],
+      {
+        opacity: Math.max(0.1, Math.min(1, Number.isFinite(opacity) ? opacity : 0.75)),
+        interactive: false,
+      }
+    ).addTo(map);
+
+    updateStats("openEO overlay loaded for current viewport");
+  } catch (error) {
+    updateStats(`openEO overlay failed: ${error.message}`);
+    console.error(error);
+  }
 }
 
 function isSmallBboxMove(previousBbox, nextBbox) {
@@ -522,6 +652,29 @@ formEl.addEventListener("submit", (event) => {
   clearQueuedRequests();
   resetCachesAndLayer();
   runLoadCycle();
+});
+
+openeoLoadBtnEl?.addEventListener("click", () => {
+  void loadOpenEOOverlay();
+});
+
+openeoCollectionEl?.addEventListener("input", () => {
+  if (openeoLoadBtnEl?.hasAttribute("disabled")) {
+    openeoLoadBtnEl.removeAttribute("disabled");
+  }
+});
+
+openeoClearBtnEl?.addEventListener("click", () => {
+  clearOpenEOOverlay();
+  updateStats("openEO overlay cleared");
+});
+
+openeoOpacityEl?.addEventListener("input", () => {
+  if (!openeoOverlay) {
+    return;
+  }
+  const opacity = Number(openeoOpacityEl.value || 0.75);
+  openeoOverlay.setOpacity(Math.max(0.1, Math.min(1, Number.isFinite(opacity) ? opacity : 0.75)));
 });
 
 runLoadCycle();
