@@ -802,6 +802,13 @@ def _row_to_feature(row: dict[str, object]) -> Feature | None:
     return Feature(geometry=Geometry(**geometry_value), properties=properties)
 
 
+def _row_has_non_empty_name(row: dict[str, object]) -> bool:
+    name_value = row.get("name")
+    if not isinstance(name_value, str):
+        return False
+    return bool(name_value.strip())
+
+
 def _iter_feature_rows(bbox_obj: BBox, category: str | None, limit: int, chunk_size: int = 250) -> Iterator[dict[str, object]]:
     params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit)
 
@@ -822,6 +829,7 @@ def _iter_source_feature_rows(
     bbox_obj: BBox,
     category: str | None,
     limit: int,
+    places_named_only: bool,
     stop_event: Event,
     cancel_event: Event | None = None,
     chunk_size: int = 250,
@@ -840,6 +848,9 @@ def _iter_source_feature_rows(
                 for row in rows:
                     if stop_event.is_set() or (cancel_event is not None and cancel_event.is_set()):
                         break
+                    row_category = str(row.get("category") or "").strip().lower()
+                    if places_named_only and row_category == "places" and not _row_has_non_empty_name(row):
+                        continue
                     yield row
 
 
@@ -847,6 +858,7 @@ def _iter_feature_rows_concurrently(
     bbox_obj: BBox,
     category: str | None,
     limit: int,
+    places_named_only: bool = False,
     cancel_event: Event | None = None,
 ) -> Iterator[dict[str, object]]:
     queue: Queue[dict[str, object] | object] = Queue(maxsize=500)
@@ -861,6 +873,7 @@ def _iter_feature_rows_concurrently(
                 bbox_obj=bbox_obj,
                 category=category,
                 limit=limit,
+                places_named_only=places_named_only,
                 stop_event=stop_event,
                 cancel_event=cancel_event,
             ):
@@ -931,7 +944,7 @@ def _iter_feature_rows_concurrently(
 async def get_features(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     category: str = Query(default="places"),
-    limit: int = Query(default=1000, ge=1),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
 ):
     bbox_obj = _parse_bbox_param(bbox)
 
@@ -1024,7 +1037,8 @@ async def search_mode_features(
 async def stream_features(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     category: str | None = Query(default=None),
-    limit: int = Query(default=1000, ge=1),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    places_named_only: bool = Query(default=False),
     client_id: str = Query(..., min_length=1),
     search_id: str = Query(..., min_length=1),
 ):
@@ -1049,6 +1063,7 @@ async def stream_features(
                 bbox_obj=bbox_obj,
                 category=category,
                 limit=limit,
+                places_named_only=places_named_only,
                 cancel_event=cancel_event,
             ):
                 if not _is_current_search(norm_client_id, norm_search_id):
@@ -1070,7 +1085,8 @@ async def stream_features(
 async def stream_features_multi(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     categories: str = Query(default="places,transport,hydrography"),
-    limit: int = Query(default=1000, ge=1),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    places_named_only: bool = Query(default=False),
     client_id: str = Query(..., min_length=1),
     search_id: str = Query(..., min_length=1),
 ):
@@ -1107,6 +1123,7 @@ async def stream_features_multi(
                     bbox_obj=bbox_obj,
                     category=category,
                     limit=local_limit,
+                    places_named_only=places_named_only,
                     cancel_event=cancel_event,
                 ):
                     if cancel_event.is_set() or not _is_current_search(norm_client_id, norm_search_id):
@@ -1151,8 +1168,8 @@ async def agentic_search(payload: AgenticSearchRequest):
     if prompt_minutes is not None:
         minutes = prompt_minutes
     else:
-        # If no time is provided in prompt, default to 30 minutes for time-based area.
-        minutes = 30
+        # If prompt has no explicit time, use UI minutes (with 30-minute fallback).
+        minutes = payload.minutes
     minutes = max(1, min(240, int(minutes)))
 
     if prompt_radius_km is not None:
@@ -1174,6 +1191,10 @@ async def agentic_search(payload: AgenticSearchRequest):
     elif selected_mode == "radius":
         mode = "radius"
         radius_km = max(0.5, min(500.0, float(payload.radius_km)))
+        minutes = max(1, min(240, int(payload.minutes)))
+    elif selected_mode == "time":
+        # Prompt has no explicit time/radius: trust UI time box value.
+        mode = "time"
         minutes = max(1, min(240, int(payload.minutes)))
     elif llm_mode == "radius" and radius_raw is not None:
         mode = "radius"

@@ -16,6 +16,7 @@ const categoryEl = document.getElementById("category");
 const formEl = document.getElementById("filters-form");
 
 const FRONTEND_LIMIT = 50000;
+const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
 
 const CATEGORY_STYLE = {
   hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
@@ -126,6 +127,28 @@ function makeFeatureId(feature) {
     return `${String(props.source)}:${String(props.id)}`;
   }
   return `${JSON.stringify(feature.geometry || {})}|${String(props.name || "")}`;
+}
+
+function hasNonEmptyFeatureName(feature) {
+  const rawName = feature?.properties?.name;
+  return typeof rawName === "string" && rawName.trim().length > 0;
+}
+
+function shouldRestrictPlacesToNamed() {
+  return map.getZoom() <= LOW_ZOOM_NAMED_PLACES_THRESHOLD;
+}
+
+function isNamedPlacesRuleSatisfied(feature) {
+  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  if (category !== "places") {
+    return true;
+  }
+
+  if (!shouldRestrictPlacesToNamed()) {
+    return true;
+  }
+
+  return hasNonEmptyFeatureName(feature);
 }
 
 function getBboxFromMap() {
@@ -256,16 +279,21 @@ function addFeatures(features) {
     return 0;
   }
 
+  const filtered = features.filter((feature) => isNamedPlacesRuleSatisfied(feature));
+  if (filtered.length === 0) {
+    return 0;
+  }
+
   geoJsonLayer.addData({
     type: "FeatureCollection",
-    features,
+    features: filtered,
   });
 
-  for (const feature of features) {
+  for (const feature of filtered) {
     renderedFeatureIds.add(makeFeatureId(feature));
   }
 
-  return features.length;
+  return filtered.length;
 }
 
 function renderCacheForViewport() {
@@ -339,6 +367,9 @@ async function streamCurrentViewport(requestBbox = null) {
   if (category) {
     params.set("category", category);
   }
+  if ((!category || category.toLowerCase() === "places") && shouldRestrictPlacesToNamed()) {
+    params.set("places_named_only", "true");
+  }
 
   const url = `${API_BASE}/features/stream?${params.toString()}`;
   let streamAdded = 0;
@@ -389,6 +420,9 @@ async function streamCurrentViewport(requestBbox = null) {
         }
 
         const featureId = makeFeatureId(parsed);
+        if (!isNamedPlacesRuleSatisfied(parsed)) {
+          continue;
+        }
         if (!featureCache.has(featureId)) {
           featureCache.set(featureId, parsed);
         }
@@ -407,7 +441,7 @@ async function streamCurrentViewport(requestBbox = null) {
     if (textBuffer.trim()) {
       try {
         const parsed = JSON.parse(textBuffer.trim());
-        if (!(parsed.meta && parsed.meta.done)) {
+        if (!(parsed.meta && parsed.meta.done) && isNamedPlacesRuleSatisfied(parsed)) {
           const featureId = makeFeatureId(parsed);
           if (!featureCache.has(featureId)) {
             featureCache.set(featureId, parsed);
