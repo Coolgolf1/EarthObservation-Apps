@@ -1039,14 +1039,20 @@ async def stream_features(
     category: str | None = Query(default=None),
     limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
     places_named_only: bool = Query(default=False),
-    client_id: str = Query(..., min_length=1),
-    search_id: str = Query(..., min_length=1),
+    client_id: str | None = Query(default=None),
+    search_id: str | None = Query(default=None),
 ):
     bbox_obj = _parse_bbox_param(bbox)
-    norm_client_id = _sanitize_token(client_id)
-    norm_search_id = _sanitize_token(search_id)
-    if not _is_current_search(norm_client_id, norm_search_id):
-        raise HTTPException(status_code=409, detail="Stale search id")
+    if client_id and search_id:
+        norm_client_id = _sanitize_token(client_id)
+        norm_search_id = _sanitize_token(search_id)
+        if not _is_current_search(norm_client_id, norm_search_id):
+            raise HTTPException(status_code=409, detail="Stale search id")
+    else:
+        # Backward-compatible session for simple viewport stream clients (e.g. EarthMapper).
+        norm_client_id = _sanitize_token(None)
+        norm_search_id = _sanitize_token(None)
+        _register_active_search(norm_client_id, norm_search_id)
 
     if not _try_acquire_stream_slot(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
@@ -1087,14 +1093,20 @@ async def stream_features_multi(
     categories: str = Query(default="places,transport,hydrography"),
     limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
     places_named_only: bool = Query(default=False),
-    client_id: str = Query(..., min_length=1),
-    search_id: str = Query(..., min_length=1),
+    client_id: str | None = Query(default=None),
+    search_id: str | None = Query(default=None),
 ):
     bbox_obj = _parse_bbox_param(bbox)
-    norm_client_id = _sanitize_token(client_id)
-    norm_search_id = _sanitize_token(search_id)
-    if not _is_current_search(norm_client_id, norm_search_id):
-        raise HTTPException(status_code=409, detail="Stale search id")
+    if client_id and search_id:
+        norm_client_id = _sanitize_token(client_id)
+        norm_search_id = _sanitize_token(search_id)
+        if not _is_current_search(norm_client_id, norm_search_id):
+            raise HTTPException(status_code=409, detail="Stale search id")
+    else:
+        # Backward-compatible session for simple viewport stream clients (e.g. EarthMapper).
+        norm_client_id = _sanitize_token(None)
+        norm_search_id = _sanitize_token(None)
+        _register_active_search(norm_client_id, norm_search_id)
 
     if not _try_acquire_stream_slot(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
