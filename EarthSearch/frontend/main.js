@@ -49,20 +49,23 @@ const SEARCH_CATEGORIES = [
   {
     category: "transport",
     label: "transport",
-    limit: 120,
+    limit: 50000,
   },
   {
     category: "hydrography",
     label: "rivers/ocean",
     featureFilter: isHydroFeatureAllowed,
-    limit: 120,
+    limit: 50000,
   },
   {
     category: "places",
     label: "places",
-    limit: 120,
+    limit: 50000,
   },
 ];
+
+const STREAMING_LIMIT = 50000;
+const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
 
 const CATEGORY_STYLE = {
   hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
@@ -84,6 +87,9 @@ map.createPane("hydroPane");
 map.getPane("hydroPane").style.zIndex = "420";
 map.createPane("adminPane");
 map.getPane("adminPane").style.zIndex = "430";
+map.createPane("reachAreaPane");
+map.getPane("reachAreaPane").style.zIndex = "500";
+map.getPane("reachAreaPane").style.pointerEvents = "none";
 
 const canvasRenderer = L.canvas({ padding: 0.5 });
 
@@ -200,6 +206,7 @@ const geoJsonLayer = L.geoJSON([], {
 geoJsonLayer.addTo(map);
 
 const reachAreaLayer = L.geoJSON([], {
+  pane: "reachAreaPane",
   renderer: canvasRenderer,
   interactive: false,
   style: {
@@ -212,15 +219,25 @@ const reachAreaLayer = L.geoJSON([], {
 });
 reachAreaLayer.addTo(map);
 
+function keepReachAreaOnTop() {
+  if (reachAreaLayer && typeof reachAreaLayer.bringToFront === "function") {
+    reachAreaLayer.bringToFront();
+  }
+}
+
 const centerMarkerLayer = L.layerGroup().addTo(map);
 const bboxSelectionLayer = L.layerGroup().addTo(map);
 const pendingPointLayer = L.layerGroup().addTo(map);
+const cachedFeaturesById = new Map();
+const plottedFeatureIds = new Set();
 
 let activeController = null;
 let runVersion = 0;
 let pendingSearchTimeout = null;
 let pendingSearchMoveendHandler = null;
 let promptChangeDebounce = null;
+let streamInFlight = false;
+let activePlotBbox = null;
 let areaMode = "time";
 let bboxDrawMode = false;
 let bboxDrawPoints = [];
@@ -261,6 +278,7 @@ function applyAreaModeUI() {
     areaModeToggleEl.setAttribute("aria-pressed", "true");
     areaValueEl.min = "0.5";
     areaValueEl.max = "500";
+    areaValueEl.step = "0.1";
     const numeric = Math.max(0.5, Number(areaValueEl.value) || 10);
     areaValueEl.value = String(Number(numeric.toFixed(1)));
     return;
@@ -271,6 +289,7 @@ function applyAreaModeUI() {
   areaModeToggleEl.setAttribute("aria-pressed", "false");
   areaValueEl.min = "1";
   areaValueEl.max = "240";
+  areaValueEl.step = "1";
   const numeric = Math.max(1, Math.round(Number(areaValueEl.value) || 30));
   areaValueEl.value = String(numeric);
 }
@@ -425,7 +444,8 @@ function redrawBBoxSelection() {
 }
 
 function getAreaSelection() {
-  const raw = Number(areaValueEl.value);
+  const normalizedValue = String(areaValueEl.value || "").replace(",", ".").trim();
+  const raw = Number(normalizedValue);
   if (areaMode === "radius") {
     return {
       areaMode: "radius",
@@ -484,6 +504,8 @@ function cancelPending() {
     pendingSearchMoveendHandler = null;
   }
 
+  activePlotBbox = null;
+
   // Immediately clear previous results when a new search cycle begins.
   clearMap();
 }
@@ -492,17 +514,163 @@ function clearMap() {
   geoJsonLayer.clearLayers();
   reachAreaLayer.clearLayers();
   centerMarkerLayer.clearLayers();
+  plottedFeatureIds.clear();
+}
+
+function makeFeatureId(feature) {
+  const props = feature?.properties || {};
+  if (props.source != null && props.id != null) {
+    return `${String(props.source)}:${String(props.id)}`;
+  }
+  return `${JSON.stringify(feature?.geometry || {})}|${String(props.name || "")}`;
+}
+
+function hasNonEmptyFeatureName(feature) {
+  const rawName = feature?.properties?.name;
+  return typeof rawName === "string" && rawName.trim().length > 0;
+}
+
+function shouldRestrictPlacesToNamed() {
+  return map.getZoom() <= LOW_ZOOM_NAMED_PLACES_THRESHOLD;
+}
+
+function isSeaOrOceanFeature(feature) {
+  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  if (category !== "hydrography") {
+    return false;
+  }
+
+  const geometryType = String(feature?.geometry?.type || "");
+  if (!geometryType.includes("Polygon")) {
+    return false;
+  }
+
+  const props = feature?.properties || {};
+  const text = `${String(props.name || "")} ${String(props.subcategory || "")}`.toLowerCase();
+  return text.includes("sea") || text.includes("ocean");
+}
+
+function featureEligibleForSearchCache(feature) {
+  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  const spec = _findCategorySpec(category);
+  if (!spec) {
+    return false;
+  }
+
+  if (typeof spec.featureFilter === "function" && !spec.featureFilter(feature)) {
+    return false;
+  }
+
+  return true;
+}
+
+function featureVisibleAtCurrentZoom(feature) {
+  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  if (category !== "places") {
+    return true;
+  }
+  if (!shouldRestrictPlacesToNamed()) {
+    return true;
+  }
+  return hasNonEmptyFeatureName(feature);
+}
+
+function featureRelevantToBbox(feature, bbox) {
+  if (!bbox) {
+    return true;
+  }
+
+  if (!featureIntersectsBbox(feature, bbox)) {
+    return false;
+  }
+  return true;
 }
 
 function addFeatures(features) {
   if (!features.length) {
     return 0;
   }
+
+  const toPlot = [];
+  for (const feature of features) {
+    if (!featureEligibleForSearchCache(feature)) {
+      continue;
+    }
+
+    if (!featureRelevantToBbox(feature, activePlotBbox)) {
+      continue;
+    }
+
+    const featureId = makeFeatureId(feature);
+    cachedFeaturesById.set(featureId, feature);
+
+    if (!featureVisibleAtCurrentZoom(feature)) {
+      continue;
+    }
+
+    if (plottedFeatureIds.has(featureId)) {
+      continue;
+    }
+
+    plottedFeatureIds.add(featureId);
+    toPlot.push(feature);
+  }
+
+  if (!toPlot.length) {
+    return 0;
+  }
+
   geoJsonLayer.addData({
     type: "FeatureCollection",
-    features,
+    features: toPlot,
   });
-  return features.length;
+
+  keepReachAreaOnTop();
+
+  return toPlot.length;
+}
+
+function loadCachedFeaturesForBbox(bbox) {
+  const cached = [];
+
+  for (const feature of cachedFeaturesById.values()) {
+    if (!featureIntersectsBbox(feature, bbox)) {
+      continue;
+    }
+    cached.push(feature);
+  }
+
+  return addFeatures(cached);
+}
+
+function rerenderFromCacheForCurrentViewport() {
+  if (!activePlotBbox) {
+    return;
+  }
+
+  const bounds = map.getBounds();
+  const viewportBbox = {
+    west: bounds.getWest(),
+    south: bounds.getSouth(),
+    east: bounds.getEast(),
+    north: bounds.getNorth(),
+  };
+  geoJsonLayer.clearLayers();
+  plottedFeatureIds.clear();
+
+  const visibleFromCache = [];
+  for (const feature of cachedFeaturesById.values()) {
+    if (!featureIntersectsBbox(feature, activePlotBbox)) {
+      continue;
+    }
+    if (!featureIntersectsBbox(feature, viewportBbox)) {
+      continue;
+    }
+    visibleFromCache.push(feature);
+  }
+
+  const rendered = addFeatures(visibleFromCache);
+  updateStats(`Zoom refresh from cache +${rendered}`);
 }
 
 function bboxContainsPoint(bbox, lon, lat) {
@@ -593,7 +761,7 @@ function _findCategorySpec(category) {
   return SEARCH_CATEGORIES.find((s) => s.category === category) || null;
 }
 
-async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProgress, clientId, searchId, countsByLabel, addedRef }) {
+async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProgress, clientId, searchId, countsByLabel, addedRef, limit }) {
   if (!shouldContinue()) {
     throw new DOMException("Search cancelled", "AbortError");
   }
@@ -601,10 +769,13 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
   const params = new URLSearchParams({
     bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
     category: spec.category,
-    limit: String(spec.limit || 100),
+    limit: String(limit),
     client_id: clientId,
     search_id: searchId,
   });
+  if (spec.category === "places" && shouldRestrictPlacesToNamed()) {
+    params.set("places_named_only", "true");
+  }
 
   const response = await fetchWith429Retry(`${API_BASE}/features/stream?${params.toString()}`, {
     signal,
@@ -665,7 +836,11 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
         continue;
       }
 
-      if (!featureIntersectsBbox(parsed, bbox)) {
+      if (spec.category === "places" && shouldRestrictPlacesToNamed() && !hasNonEmptyFeatureName(parsed)) {
+        continue;
+      }
+
+      if (!featureRelevantToBbox(parsed, bbox)) {
         continue;
       }
 
@@ -688,7 +863,8 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
       if (!(parsed.meta && parsed.meta.done)) {
         if (
           (typeof spec.featureFilter !== "function" || spec.featureFilter(parsed))
-          && featureIntersectsBbox(parsed, bbox)
+          && (!(spec.category === "places" && shouldRestrictPlacesToNamed()) || hasNonEmptyFeatureName(parsed))
+          && featureRelevantToBbox(parsed, bbox)
         ) {
           batch.push(parsed);
           countsByLabel.set(spec.label, (countsByLabel.get(spec.label) || 0) + 1);
@@ -726,6 +902,7 @@ async function streamCombined({ bbox, signal, shouldContinue, onProgress, client
       searchId,
       countsByLabel,
       addedRef,
+      limit: STREAMING_LIMIT,
     });
   }
 
@@ -782,6 +959,7 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
         geometry: payload.reach_area,
         properties: { kind: "reach-area" },
       });
+      keepReachAreaOnTop();
     }
 
     if (payload.center && Number.isFinite(Number(payload.center.lat)) && Number.isFinite(Number(payload.center.lon))) {
@@ -809,6 +987,7 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
       east: fitBounds.getEast(),
       north: fitBounds.getNorth(),
     };
+    activePlotBbox = searchBbox;
 
     const streamAfterZoom = async () => {
       if (localRunVersion !== runVersion || controller.signal.aborted) {
@@ -823,8 +1002,13 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
       const modeText = mode === "radius"
         ? `${Number(intent.radius_km || 0).toFixed(1)} km radius`
         : `${Number(intent.minutes || 0)} min ${intent.vehicle || "driving"}`;
-      updateStats(`Streaming categories for ${payload.place_name || "location"} (${modeText})...`);
 
+      const cachedAdded = loadCachedFeaturesForBbox(searchBbox);
+      updateStats(
+        `Using cache +${cachedAdded}. Streaming categories for ${payload.place_name || "location"} (${modeText})...`
+      );
+
+      streamInFlight = true;
       const total = await streamCombined({
         bbox: searchBbox,
         signal: controller.signal,
@@ -841,11 +1025,13 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
           const details = Array.from(progress.entries())
             .map(([label, value]) => `${label}: +${value}`)
             .join(" | ");
-          updateStats(`${details} | total +${loadedTotal}`);
+          updateStats(`${details} | cache +${cachedAdded} | streamed +${loadedTotal} | total +${cachedAdded + loadedTotal}`);
         },
       });
 
-      updateStats(`Done (${payload.parser_mode || "agent"}). Total plotted: ${total}`);
+      streamInFlight = false;
+
+      updateStats(`Done (${payload.parser_mode || "agent"}). Cached +${cachedAdded} | streamed +${total} | total plotted: ${cachedAdded + total}`);
     };
 
     // Fit immediately and start loading right away for a snappy submit action.
@@ -856,6 +1042,7 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
       updateStats(`Search failed: ${error.message}`);
       console.error(error);
     }
+    streamInFlight = false;
   } finally {
     if (activeController === controller) {
       activeController = null;
@@ -992,6 +1179,10 @@ map.on("click", (event) => {
 
   setPendingPoint(lat, lon);
   updateStats("Point selected. Press Confirm to run search.");
+});
+
+map.on("zoomend", () => {
+  rerenderFromCacheForCurrentViewport();
 });
 
 confirmPointBtnEl.addEventListener("click", () => {
