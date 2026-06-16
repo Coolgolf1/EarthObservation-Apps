@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .routers.health import router as health_router
 from .routers.features import router as features_router
+from .routers.openeo import router as openeo_router
 
 app = FastAPI()
 
@@ -22,4 +23,5 @@ app.add_middleware(
 
 app.include_router(health_router)
 app.include_router(features_router)
+app.include_router(openeo_router)
 
