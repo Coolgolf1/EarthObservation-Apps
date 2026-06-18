@@ -1,43 +1,5 @@
-version: 1
-
-apps:
-  - name: backend
-    description: FastAPI API serving feature and openEO endpoints.
-    working_dir: backend
-    command:
-      - uv
-      - run
-      - uvicorn
-      - app.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    env:
-      PORT: "8000"
-
-  - name: earthmapper-frontend
-    description: Static Leaflet frontend for viewport-driven EarthMapper queries.
-    working_dir: EarthMapper/frontend
-    command:
-      - python3
-      - -m
-      - http.server
-      - "5500"
-      - --bind
-      - 0.0.0.0
-    env:
-      PORT: "5500"
-
-  - name: earthsearch-frontend
-    description: Static Leaflet frontend for prompt-driven EarthSearch workflows.
-    working_dir: EarthSearch/frontend
-    command:
-      - python3
-      - -m
-      - http.server
-      - "5600"
-      - --bind
-      - 0.0.0.0
-    env:
-      PORT: "5600"
+working_dir: .
+command:
+  - sh
+  - -lc
+  - uv lock --project backend && uv sync --project backend --frozen && uv run --project backend uvicorn backend.app.main:app --host 0.0.0.0 --port "$DATABRICKS_APP_PORT"
