@@ -3,6 +3,8 @@
 .env.local
 .env.*.local
 
+.databricks
+
 # Python
 __pycache__/
 *.py[cod]
