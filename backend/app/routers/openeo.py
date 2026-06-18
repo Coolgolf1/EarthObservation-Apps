@@ -12,8 +12,14 @@ from pydantic import BaseModel, Field
 router = APIRouter(prefix="/openeo", tags=["openeo"])
 
 
-OPENEO_BACKEND_URL = os.getenv("OPENEO_BACKEND_URL", "https://openeo.cloud").rstrip("/")
+OPENEO_BACKEND_URL = os.getenv(
+    "OPENEO_BACKEND_URL", "https://openeo.dataspace.copernicus.eu"
+).rstrip("/")
 OPENEO_BEARER_TOKEN = (os.getenv("OPENEO_BEARER_TOKEN", "") or "").strip()
+OPENEO_ENABLE_INTERACTIVE_LOGIN = (
+    (os.getenv("OPENEO_ENABLE_INTERACTIVE_LOGIN", "false") or "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 
 class OpenEOResultRequest(BaseModel):
@@ -48,12 +54,35 @@ def _resolve_token(token: str | None) -> str | None:
     return resolved or None
 
 
+def _authenticate_non_interactive(connection):
+    """Try non-interactive auth paths first to avoid blocking API requests."""
+    refresh_auth = getattr(connection, "authenticate_oidc_refresh_token", None)
+    if callable(refresh_auth):
+        return refresh_auth()
+    return None
+
+
 def _connect(token: str | None = None):
     try:
         connection = openeo.connect(OPENEO_BACKEND_URL)
         resolved = _resolve_token(token)
         if resolved:
             connection = connection.authenticate_bearer_token(resolved)
+        else:
+            refreshed = _authenticate_non_interactive(connection)
+            if refreshed is not None:
+                connection = refreshed
+            elif OPENEO_ENABLE_INTERACTIVE_LOGIN:
+                # One-time interactive bootstrap can persist credentials for next requests.
+                connection = connection.authenticate_oidc(store_refresh_token=True)
+            else:
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "openEO authentication missing. Configure OPENEO_BEARER_TOKEN, "
+                        "or enable one-time interactive login with OPENEO_ENABLE_INTERACTIVE_LOGIN=true."
+                    ),
+                )
         return connection
     except OpenEoApiError as exc:
         raise HTTPException(status_code=502, detail=f"openEO API error while connecting: {exc}") from exc
