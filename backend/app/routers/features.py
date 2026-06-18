@@ -48,6 +48,7 @@ VEHICLE_SPEED_KMH = {
 
 SEARCH_MODE_DEFAULT_LIMIT = 12000
 SEARCH_MODE_MAX_LIMIT = 12000
+EARTHSEARCH_SESSION_LIMIT = max(1, int(os.getenv("EARTHSEARCH_SESSION_LIMIT", "5")))
 _GEOCODE_CACHE: dict[tuple[str, str | None], dict[str, object]] = {}
 MAX_GLOBAL_STREAM_JOBS = max(2, int(os.getenv("MAX_GLOBAL_STREAM_JOBS", "8")))
 MAX_CLIENT_STREAM_JOBS = 1
@@ -325,6 +326,10 @@ def _build_source_query_params(bbox_obj: BBox, category: str | None, limit: int)
     )
 
 
+def _cap_earthsearch_session_limit(requested_limit: int) -> int:
+    return max(1, min(requested_limit, SEARCH_MODE_MAX_LIMIT, EARTHSEARCH_SESSION_LIMIT))
+
+
 def _normalize_vehicle(vehicle: str) -> str:
     key = vehicle.strip().lower()
     if key in VEHICLE_SPEED_KMH:
@@ -474,6 +479,17 @@ def _bbox_from_radius(center_lon: float, center_lat: float, radius_km: float) ->
         max_lon=center_lon + lon_delta,
         max_lat=center_lat + lat_delta,
     )
+
+
+def _bbox_to_polygon_geojson(bbox_obj: BBox) -> dict[str, object]:
+    ring = [
+        [bbox_obj.min_lon, bbox_obj.min_lat],
+        [bbox_obj.max_lon, bbox_obj.min_lat],
+        [bbox_obj.max_lon, bbox_obj.max_lat],
+        [bbox_obj.min_lon, bbox_obj.max_lat],
+        [bbox_obj.min_lon, bbox_obj.min_lat],
+    ]
+    return _ring_to_polygon_geojson(ring)
 
 
 def _reach_area_geojson(center_lon: float, center_lat: float, minutes: int, vehicle: str, points: int = 72) -> dict[str, object]:
@@ -1043,7 +1059,9 @@ async def stream_features(
     search_id: str | None = Query(default=None),
 ):
     bbox_obj = _parse_bbox_param(bbox)
-    if client_id and search_id:
+    is_earthsearch_session = bool(client_id and search_id)
+
+    if is_earthsearch_session:
         norm_client_id = _sanitize_token(client_id)
         norm_search_id = _sanitize_token(search_id)
         if not _is_current_search(norm_client_id, norm_search_id):
@@ -1053,6 +1071,12 @@ async def stream_features(
         norm_client_id = _sanitize_token(None)
         norm_search_id = _sanitize_token(None)
         _register_active_search(norm_client_id, norm_search_id)
+
+    effective_limit = (
+        _cap_earthsearch_session_limit(limit)
+        if is_earthsearch_session
+        else min(limit, SEARCH_MODE_MAX_LIMIT)
+    )
 
     if not _try_acquire_stream_slot(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
@@ -1068,7 +1092,7 @@ async def stream_features(
             for row in _iter_feature_rows_concurrently(
                 bbox_obj=bbox_obj,
                 category=category,
-                limit=limit,
+                limit=effective_limit,
                 places_named_only=places_named_only,
                 cancel_event=cancel_event,
             ):
@@ -1097,7 +1121,9 @@ async def stream_features_multi(
     search_id: str | None = Query(default=None),
 ):
     bbox_obj = _parse_bbox_param(bbox)
-    if client_id and search_id:
+    is_earthsearch_session = bool(client_id and search_id)
+
+    if is_earthsearch_session:
         norm_client_id = _sanitize_token(client_id)
         norm_search_id = _sanitize_token(search_id)
         if not _is_current_search(norm_client_id, norm_search_id):
@@ -1107,6 +1133,12 @@ async def stream_features_multi(
         norm_client_id = _sanitize_token(None)
         norm_search_id = _sanitize_token(None)
         _register_active_search(norm_client_id, norm_search_id)
+
+    effective_limit = (
+        _cap_earthsearch_session_limit(limit)
+        if is_earthsearch_session
+        else min(limit, SEARCH_MODE_MAX_LIMIT)
+    )
 
     if not _try_acquire_stream_slot(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
@@ -1123,8 +1155,8 @@ async def stream_features_multi(
     def stream() -> Iterator[str]:
         emitted = 0
         try:
-            per_category_limit = max(1, limit // len(category_list))
-            remainder = limit - (per_category_limit * len(category_list))
+            per_category_limit = max(1, effective_limit // len(category_list))
+            remainder = effective_limit - (per_category_limit * len(category_list))
 
             for index, category in enumerate(category_list):
                 if cancel_event.is_set() or not _is_current_search(norm_client_id, norm_search_id):
@@ -1155,6 +1187,7 @@ async def stream_features_multi(
 
 @router.post("/agent-search")
 async def agentic_search(payload: AgenticSearchRequest):
+    is_earthsearch_session = bool(payload.client_id and payload.search_id)
     client_id = _sanitize_token(payload.client_id)
     search_id = _sanitize_token(payload.search_id)
     _register_active_search(client_id, search_id)
@@ -1241,7 +1274,11 @@ async def agentic_search(payload: AgenticSearchRequest):
     if not requested_categories:
         requested_categories = ["places", "transport", "hydrography"]
 
-    effective_limit = min(payload.limit, SEARCH_MODE_MAX_LIMIT)
+    effective_limit = (
+        _cap_earthsearch_session_limit(payload.limit)
+        if is_earthsearch_session
+        else min(payload.limit, SEARCH_MODE_MAX_LIMIT)
+    )
     features: list[Feature] = []
     if not payload.metadata_only:
         features = _fetch_features_for_categories(
@@ -1288,6 +1325,7 @@ async def agentic_search(payload: AgenticSearchRequest):
 
 @router.post("/point-search")
 async def point_search(payload: PointSearchRequest):
+    is_earthsearch_session = bool(payload.client_id and payload.search_id)
     client_id = _sanitize_token(payload.client_id)
     search_id = _sanitize_token(payload.search_id)
     _register_active_search(client_id, search_id)
@@ -1301,15 +1339,24 @@ async def point_search(payload: PointSearchRequest):
     center_lat = float(payload.lat)
 
     if mode == "radius":
-        bbox_obj = _bbox_from_radius(center_lon=center_lon, center_lat=center_lat, radius_km=radius_km)
-        reach_area = _radius_area_geojson(center_lon=center_lon, center_lat=center_lat, radius_km=radius_km)
+        search_radius_km = radius_km
     else:
-        bbox_obj = _bbox_from_reach(
+        speed_kmh = VEHICLE_SPEED_KMH[normalized_vehicle]
+        search_radius_km = max(0.5, speed_kmh * (minutes / 60.0))
+
+    # Point search uses a fast bbox-only strategy (min/max lon/lat around center).
+    bbox_obj = _bbox_from_radius(
+        center_lon=center_lon,
+        center_lat=center_lat,
+        radius_km=search_radius_km,
+    )
+    if mode == "radius":
+        reach_area = _radius_area_geojson(
             center_lon=center_lon,
             center_lat=center_lat,
-            minutes=minutes,
-            vehicle=normalized_vehicle,
+            radius_km=search_radius_km,
         )
+    else:
         reach_area = _reach_area_geojson(
             center_lon=center_lon,
             center_lat=center_lat,
@@ -1321,7 +1368,11 @@ async def point_search(payload: PointSearchRequest):
     if not requested_categories:
         requested_categories = ["places", "transport", "hydrography"]
 
-    effective_limit = min(payload.limit, SEARCH_MODE_MAX_LIMIT)
+    effective_limit = (
+        _cap_earthsearch_session_limit(payload.limit)
+        if is_earthsearch_session
+        else min(payload.limit, SEARCH_MODE_MAX_LIMIT)
+    )
     features: list[Feature] = []
     if not payload.metadata_only:
         features = _fetch_features_for_categories(
@@ -1368,6 +1419,7 @@ async def point_search(payload: PointSearchRequest):
 
 @router.post("/bbox-search")
 async def bbox_search(payload: BBoxSearchRequest):
+    is_earthsearch_session = bool(payload.client_id and payload.search_id)
     client_id = _sanitize_token(payload.client_id)
     search_id = _sanitize_token(payload.search_id)
     _register_active_search(client_id, search_id)
@@ -1396,7 +1448,11 @@ async def bbox_search(payload: BBoxSearchRequest):
     if not requested_categories:
         requested_categories = ["places", "transport", "hydrography"]
 
-    effective_limit = min(payload.limit, SEARCH_MODE_MAX_LIMIT)
+    effective_limit = (
+        _cap_earthsearch_session_limit(payload.limit)
+        if is_earthsearch_session
+        else min(payload.limit, SEARCH_MODE_MAX_LIMIT)
+    )
     features: list[Feature] = []
     if not payload.metadata_only:
         features = _fetch_features_for_categories(
