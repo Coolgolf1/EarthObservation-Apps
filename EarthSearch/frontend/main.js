@@ -1,4 +1,11 @@
-const API_BASE = "http://127.0.0.1:8000";
+const isLocalStaticFrontend =
+  (window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost")
+  && window.location.port !== "8000";
+
+const API_BASE = (window.location.protocol === "file:" || isLocalStaticFrontend)
+  ? "http://127.0.0.1:8000"
+  : window.location.origin;
+const MAPBOX_TOKEN = "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
 
 function isHydroFeatureAllowed(feature) {
   const geometryType = String(feature?.geometry?.type || "");
@@ -70,7 +77,7 @@ const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
 const CATEGORY_STYLE = {
   hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
   administrative: { stroke: "#2ca25f", fill: "transparent", point: "#2ca25f", fillOpacity: 0.0 },
-  transport: { stroke: "#6b7280", fill: "#9ca3af", point: "#6b7280", fillOpacity: 0.45 },
+  transport: { stroke: "#facc15", fill: "#facc15", point: "#facc15", fillOpacity: 0.45 },
   places: { stroke: "#f59e0b", fill: "#f59e0b", point: "#f59e0b", fillOpacity: 0.35 },
   default: { stroke: "#1d3557", fill: "#2a9d8f", point: "#0f5132", fillOpacity: 0.35 },
 };
@@ -110,9 +117,13 @@ function getCategoryPane(category) {
   return "overlayPane";
 }
 
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 15,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+L.tileLayer("https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}", {
+  id: "mapbox/satellite-streets-v12",
+  accessToken: MAPBOX_TOKEN,
+  tileSize: 512,
+  zoomOffset: -1,
+  maxZoom: 20,
+  attribution: '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
 }).addTo(map);
 
 const statsEl = document.getElementById("stats");
@@ -127,13 +138,6 @@ const bboxDrawToggleEl = document.getElementById("bbox-draw-toggle");
 const bboxClearEl = document.getElementById("bbox-clear");
 const confirmPointWrapEl = document.getElementById("confirm-point-wrap");
 const confirmPointBtnEl = document.getElementById("confirm-point-btn");
-const openeoCollectionEl = document.getElementById("openeo-collection");
-const openeoBandsEl = document.getElementById("openeo-bands");
-const openeoStartEl = document.getElementById("openeo-start");
-const openeoEndEl = document.getElementById("openeo-end");
-const openeoOpacityEl = document.getElementById("openeo-opacity");
-const openeoLoadBtnEl = document.getElementById("openeo-load-btn");
-const openeoClearBtnEl = document.getElementById("openeo-clear-btn");
 
 const geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
@@ -146,10 +150,10 @@ const geoJsonLayer = L.geoJSON([], {
     if (geometryType.includes("LineString")) {
       let lineWeight = zoom <= 6 ? 2.2 : 1.5;
       if (cat === "transport") {
-        lineWeight = zoom <= 6 ? 3.2 : 2.6;
+        lineWeight = zoom <= 6 ? 4.6 : 3.6;
       }
       if (cat === "hydrography") {
-        lineWeight = zoom <= 6 ? 3.0 : 2.4;
+        lineWeight = zoom <= 6 ? 3.6 : 2.9;
       }
       return {
         pane: getCategoryPane(cat),
@@ -249,7 +253,6 @@ let areaMode = "time";
 let bboxDrawMode = false;
 let bboxDrawPoints = [];
 let pendingPoint = null;
-let openeoOverlay = null;
 const clientSessionId = (() => {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -282,143 +285,6 @@ function updateStats(text) {
 function getMapBoundsArray() {
   const bounds = map.getBounds();
   return [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
-}
-
-function getBandList() {
-  const raw = String(openeoBandsEl?.value || "B04,B03,B02");
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-}
-
-function buildOpenEOProcessGraph() {
-  const collectionId = String(openeoCollectionEl?.value || "SENTINEL2_L2A").trim();
-  const start = String(openeoStartEl?.value || "2024-06-01").trim();
-  const end = String(openeoEndEl?.value || "2024-06-30").trim();
-  const bands = getBandList();
-  const bbox = getMapBoundsArray();
-
-  return {
-    load_collection: {
-      process_id: "load_collection",
-      arguments: {
-        id: collectionId,
-        spatial_extent: {
-          west: bbox[0],
-          south: bbox[1],
-          east: bbox[2],
-          north: bbox[3],
-          crs: 4326,
-        },
-        temporal_extent: [start, end],
-        bands,
-      },
-    },
-    reduce_time: {
-      process_id: "reduce_dimension",
-      arguments: {
-        data: { from_node: "load_collection" },
-        dimension: "t",
-        reducer: {
-          process_graph: {
-            median1: {
-              process_id: "median",
-              arguments: { data: { from_parameter: "data" } },
-              result: true,
-            },
-          },
-        },
-      },
-    },
-    save_result: {
-      process_id: "save_result",
-      arguments: {
-        data: { from_node: "reduce_time" },
-        format: "PNG",
-      },
-      result: true,
-    },
-  };
-}
-
-function clearOpenEOOverlay() {
-  if (openeoOverlay) {
-    map.removeLayer(openeoOverlay);
-    openeoOverlay = null;
-  }
-}
-
-async function loadOpenEOOverlay() {
-  const boundsArray = getMapBoundsArray();
-  const opacity = Number(openeoOpacityEl?.value || 0.75);
-  const processGraph = buildOpenEOProcessGraph();
-  const timeoutMs = 45000;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  if (openeoLoadBtnEl) {
-    openeoLoadBtnEl.disabled = true;
-  }
-
-  try {
-    updateStats("Loading openEO overlay...");
-    const response = await fetch(`${API_BASE}/openeo/result`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        process: {
-          process_graph: processGraph,
-        },
-      }),
-    });
-
-    if (!response.ok) {
-      let errorText = await response.text();
-      try {
-        const parsed = JSON.parse(errorText);
-        if (parsed?.detail) {
-          errorText = String(parsed.detail);
-        }
-      } catch {
-        // Keep raw response text when not JSON.
-      }
-      throw new Error(`openEO error ${response.status}: ${errorText || "request failed"}`);
-    }
-
-    const payload = await response.json();
-    if (!payload?.bytes_base64 || !payload?.content_type) {
-      throw new Error("openEO /result did not return an image payload");
-    }
-
-    const imageUrl = `data:${payload.content_type};base64,${payload.bytes_base64}`;
-
-    clearOpenEOOverlay();
-    openeoOverlay = L.imageOverlay(
-      imageUrl,
-      [[boundsArray[1], boundsArray[0]], [boundsArray[3], boundsArray[2]]],
-      {
-        opacity: Math.max(0.1, Math.min(1, Number.isFinite(opacity) ? opacity : 0.75)),
-        interactive: false,
-      }
-    ).addTo(map);
-
-    updateStats("openEO overlay loaded for current viewport");
-  } catch (error) {
-    const message = error?.name === "AbortError"
-      ? `openEO request timed out after ${Math.round(timeoutMs / 1000)}s`
-      : (error?.message || "unknown error");
-    updateStats(`openEO overlay failed: ${message}`);
-    console.error(error);
-  } finally {
-    clearTimeout(timeoutId);
-    if (openeoLoadBtnEl) {
-      openeoLoadBtnEl.disabled = false;
-    }
-  }
 }
 
 function applyAreaModeUI() {
@@ -1091,7 +957,12 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`API error ${response.status}: ${errorText || "request failed"}`);
+      const compactError = String(errorText || "request failed").replace(/\s+/g, " ").trim();
+      const staticServerHint =
+        response.status === 501 && /Unsupported method \('POST'\)/i.test(compactError)
+          ? " The request likely went to a static frontend server instead of FastAPI."
+          : "";
+      throw new Error(`API error ${response.status}: ${compactError}${staticServerHint}`);
     }
 
     const payload = await response.json();
@@ -1351,22 +1222,6 @@ confirmPointBtnEl.addEventListener("click", () => {
 
   if (pendingPoint) {
     void runPointSearch(pendingPoint.lat, pendingPoint.lon);
-  }
-});
-
-openeoLoadBtnEl?.addEventListener("click", () => {
-  void loadOpenEOOverlay();
-});
-
-openeoClearBtnEl?.addEventListener("click", () => {
-  clearOpenEOOverlay();
-  updateStats("openEO overlay cleared.");
-});
-
-openeoOpacityEl?.addEventListener("input", () => {
-  if (openeoOverlay && typeof openeoOverlay.setOpacity === "function") {
-    const opacity = Number(openeoOpacityEl.value || 0.75);
-    openeoOverlay.setOpacity(Math.max(0.1, Math.min(1, Number.isFinite(opacity) ? opacity : 0.75)));
   }
 });
 

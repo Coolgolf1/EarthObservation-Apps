@@ -49,30 +49,6 @@
           <button type="submit" id="reload-btn">Reload viewport</button>
         </form>
 
-        <section class="openeo-panel" id="openeo-panel">
-          <h2>Earth Observation (openEO)</h2>
-
-          <label for="openeo-collection">Collection</label>
-          <input id="openeo-collection" type="text" value="SENTINEL2_L2A" />
-
-          <label for="openeo-bands">Bands (comma-separated RGB)</label>
-          <input id="openeo-bands" type="text" value="B04,B03,B02" />
-
-          <label for="openeo-start">Start date</label>
-          <input id="openeo-start" type="date" value="2024-06-01" />
-
-          <label for="openeo-end">End date</label>
-          <input id="openeo-end" type="date" value="2024-06-30" />
-
-          <label for="openeo-opacity">Overlay opacity</label>
-          <input id="openeo-opacity" type="range" min="0.1" max="1" step="0.05" value="0.75" />
-
-          <div class="openeo-actions">
-            <button type="button" id="openeo-load-btn">Load openEO overlay</button>
-            <button type="button" id="openeo-clear-btn" class="secondary">Clear overlay</button>
-          </div>
-        </section>
-
         <div class="stats" id="stats">Move map to load features...</div>
       </aside>
 
@@ -90,6 +66,6 @@
       src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"
       crossorigin=""
     ></script>
-    <script src="main.js?v=20260611-16" type="module"></script>
+    <script src="main.js?v=20260618-02" type="module"></script>
   </body>
 </html>

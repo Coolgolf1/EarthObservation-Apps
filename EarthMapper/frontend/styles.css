@@ -58,27 +58,6 @@ h1 {
   gap: 10px;
 }
 
-.openeo-panel {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid rgba(17, 62, 96, 0.2);
-  display: grid;
-  gap: 10px;
-}
-
-.openeo-panel h2 {
-  margin: 0;
-  font-size: 0.98rem;
-  font-family: "Space Grotesk", sans-serif;
-  color: #163f5e;
-}
-
-.openeo-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-
 button.secondary {
   background: linear-gradient(160deg, #5e6f80, #495766);
 }
