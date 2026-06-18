@@ -127,6 +127,13 @@ const bboxDrawToggleEl = document.getElementById("bbox-draw-toggle");
 const bboxClearEl = document.getElementById("bbox-clear");
 const confirmPointWrapEl = document.getElementById("confirm-point-wrap");
 const confirmPointBtnEl = document.getElementById("confirm-point-btn");
+const openeoCollectionEl = document.getElementById("openeo-collection");
+const openeoBandsEl = document.getElementById("openeo-bands");
+const openeoStartEl = document.getElementById("openeo-start");
+const openeoEndEl = document.getElementById("openeo-end");
+const openeoOpacityEl = document.getElementById("openeo-opacity");
+const openeoLoadBtnEl = document.getElementById("openeo-load-btn");
+const openeoClearBtnEl = document.getElementById("openeo-clear-btn");
 
 const geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
@@ -242,6 +249,7 @@ let areaMode = "time";
 let bboxDrawMode = false;
 let bboxDrawPoints = [];
 let pendingPoint = null;
+let openeoOverlay = null;
 const clientSessionId = (() => {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
@@ -269,6 +277,148 @@ async function fetchWith429Retry(url, options, { retries = 1, retryDelayMs = 100
 
 function updateStats(text) {
   statsEl.textContent = text;
+}
+
+function getMapBoundsArray() {
+  const bounds = map.getBounds();
+  return [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+}
+
+function getBandList() {
+  const raw = String(openeoBandsEl?.value || "B04,B03,B02");
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function buildOpenEOProcessGraph() {
+  const collectionId = String(openeoCollectionEl?.value || "SENTINEL2_L2A").trim();
+  const start = String(openeoStartEl?.value || "2024-06-01").trim();
+  const end = String(openeoEndEl?.value || "2024-06-30").trim();
+  const bands = getBandList();
+  const bbox = getMapBoundsArray();
+
+  return {
+    load_collection: {
+      process_id: "load_collection",
+      arguments: {
+        id: collectionId,
+        spatial_extent: {
+          west: bbox[0],
+          south: bbox[1],
+          east: bbox[2],
+          north: bbox[3],
+          crs: 4326,
+        },
+        temporal_extent: [start, end],
+        bands,
+      },
+    },
+    reduce_time: {
+      process_id: "reduce_dimension",
+      arguments: {
+        data: { from_node: "load_collection" },
+        dimension: "t",
+        reducer: {
+          process_graph: {
+            median1: {
+              process_id: "median",
+              arguments: { data: { from_parameter: "data" } },
+              result: true,
+            },
+          },
+        },
+      },
+    },
+    save_result: {
+      process_id: "save_result",
+      arguments: {
+        data: { from_node: "reduce_time" },
+        format: "PNG",
+      },
+      result: true,
+    },
+  };
+}
+
+function clearOpenEOOverlay() {
+  if (openeoOverlay) {
+    map.removeLayer(openeoOverlay);
+    openeoOverlay = null;
+  }
+}
+
+async function loadOpenEOOverlay() {
+  const boundsArray = getMapBoundsArray();
+  const opacity = Number(openeoOpacityEl?.value || 0.75);
+  const processGraph = buildOpenEOProcessGraph();
+  const timeoutMs = 45000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  if (openeoLoadBtnEl) {
+    openeoLoadBtnEl.disabled = true;
+  }
+
+  try {
+    updateStats("Loading openEO overlay...");
+    const response = await fetch(`${API_BASE}/openeo/result`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        process: {
+          process_graph: processGraph,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      let errorText = await response.text();
+      try {
+        const parsed = JSON.parse(errorText);
+        if (parsed?.detail) {
+          errorText = String(parsed.detail);
+        }
+      } catch {
+        // Keep raw response text when not JSON.
+      }
+      throw new Error(`openEO error ${response.status}: ${errorText || "request failed"}`);
+    }
+
+    const payload = await response.json();
+    if (!payload?.bytes_base64 || !payload?.content_type) {
+      throw new Error("openEO /result did not return an image payload");
+    }
+
+    const imageUrl = `data:${payload.content_type};base64,${payload.bytes_base64}`;
+
+    clearOpenEOOverlay();
+    openeoOverlay = L.imageOverlay(
+      imageUrl,
+      [[boundsArray[1], boundsArray[0]], [boundsArray[3], boundsArray[2]]],
+      {
+        opacity: Math.max(0.1, Math.min(1, Number.isFinite(opacity) ? opacity : 0.75)),
+        interactive: false,
+      }
+    ).addTo(map);
+
+    updateStats("openEO overlay loaded for current viewport");
+  } catch (error) {
+    const message = error?.name === "AbortError"
+      ? `openEO request timed out after ${Math.round(timeoutMs / 1000)}s`
+      : (error?.message || "unknown error");
+    updateStats(`openEO overlay failed: ${message}`);
+    console.error(error);
+  } finally {
+    clearTimeout(timeoutId);
+    if (openeoLoadBtnEl) {
+      openeoLoadBtnEl.disabled = false;
+    }
+  }
 }
 
 function applyAreaModeUI() {
@@ -1201,6 +1351,22 @@ confirmPointBtnEl.addEventListener("click", () => {
 
   if (pendingPoint) {
     void runPointSearch(pendingPoint.lat, pendingPoint.lon);
+  }
+});
+
+openeoLoadBtnEl?.addEventListener("click", () => {
+  void loadOpenEOOverlay();
+});
+
+openeoClearBtnEl?.addEventListener("click", () => {
+  clearOpenEOOverlay();
+  updateStats("openEO overlay cleared.");
+});
+
+openeoOpacityEl?.addEventListener("input", () => {
+  if (openeoOverlay && typeof openeoOverlay.setOpacity === "function") {
+    const opacity = Number(openeoOpacityEl.value || 0.75);
+    openeoOverlay.setOpacity(Math.max(0.1, Math.min(1, Number.isFinite(opacity) ? opacity : 0.75)));
   }
 });
 
