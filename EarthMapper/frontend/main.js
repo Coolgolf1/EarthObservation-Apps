@@ -22,6 +22,12 @@ const formEl = document.getElementById("filters-form");
 
 const FRONTEND_LIMIT = 50000;
 const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
+const ADMIN_LIMIT_BY_DETAIL = {
+  z4: 1500,
+  z7: 6000,
+  z10: 18000,
+  full: FRONTEND_LIMIT,
+};
 
 const CATEGORY_STYLE = {
   hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
@@ -33,6 +39,24 @@ const CATEGORY_STYLE = {
   landmarks: { stroke: "#d62728", fill: "#ef4444", point: "#d62728", fillOpacity: 0.5 },
   default: { stroke: "#1d3557", fill: "#2a9d8f", point: "#0f5132", fillOpacity: 0.35 },
 };
+
+const POPUP_FIELD_PRIORITY = [
+  "source",
+  "category",
+  "subcategory",
+  "country_name",
+  "country_code",
+  "admin_level",
+  "admin_type_en",
+  "admin_id",
+  "admin1_name",
+  "admin2_name",
+  "admin3_name",
+  "min_zoom",
+  "label_min_zoom",
+  "display_rank",
+  "importance_score",
+];
 
 function currentCategoryPalette(feature = null) {
   const cat = String(feature?.properties?.category || categoryEl.value || "").trim().toLowerCase();
@@ -63,9 +87,13 @@ const geoJsonLayer = L.geoJSON([], {
     }
 
     if (featureCategory === "administrative") {
+      const adminLevel = Number(feature?.properties?.admin_level);
+      const levelWeight = Number.isFinite(adminLevel)
+        ? Math.max(0.7, 2.3 - adminLevel * 0.25)
+        : 1.2;
       return {
         color: palette.stroke,
-        weight: zoom <= 6 ? 1.8 : 1.2,
+        weight: zoom <= 6 ? Math.max(1.2, levelWeight) : levelWeight,
         fillColor: "transparent",
         fillOpacity: 0,
       };
@@ -96,9 +124,19 @@ const geoJsonLayer = L.geoJSON([], {
       }
 
       const props = feature.properties || {};
-      const title = props.name || props.label || props.category || "Feature";
-      const details = Object.entries(props)
-        .slice(0, 6)
+      const title = props.admin_name || props.name || props.label || props.category || "Feature";
+      const preferred = POPUP_FIELD_PRIORITY
+        .filter((field) => props[field] != null && props[field] !== "")
+        .map((field) => [field, props[field]]);
+      const fallback = Object.entries(props).filter(
+        ([field, value]) =>
+          value != null &&
+          value !== "" &&
+          !POPUP_FIELD_PRIORITY.includes(field) &&
+          field !== "id",
+      );
+      const details = [...preferred, ...fallback]
+        .slice(0, 10)
         .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
         .join("<br>");
       featureLayer.bindPopup(`<div><h4>${title}</h4><div>${details}</div></div>`);
@@ -116,6 +154,7 @@ let debounceTimer = null;
 let loadVersion = 0;
 let activeRequestBbox = null;
 let pendingDeferredLoad = false;
+let activeGeometryDetail = getGeometryDetailForZoom(map.getZoom());
 
 const SMALL_MOVE_RATIO = 0.18;
 
@@ -143,6 +182,27 @@ function shouldRestrictPlacesToNamed() {
   return map.getZoom() <= LOW_ZOOM_NAMED_PLACES_THRESHOLD;
 }
 
+function getGeometryDetailForZoom(zoom) {
+  if (zoom <= 5) {
+    return "z4";
+  }
+  if (zoom <= 8) {
+    return "z7";
+  }
+  if (zoom <= 11) {
+    return "z10";
+  }
+  return "full";
+}
+
+function getRequestLimitForCategory(category) {
+  if (String(category || "").toLowerCase() !== "administrative") {
+    return FRONTEND_LIMIT;
+  }
+  const detail = getGeometryDetailForZoom(map.getZoom());
+  return ADMIN_LIMIT_BY_DETAIL[detail] || FRONTEND_LIMIT;
+}
+
 function isNamedPlacesRuleSatisfied(feature) {
   const category = String(feature?.properties?.category || "").trim().toLowerCase();
   if (category !== "places") {
@@ -154,6 +214,19 @@ function isNamedPlacesRuleSatisfied(feature) {
   }
 
   return hasNonEmptyFeatureName(feature);
+}
+
+function isZoomRuleSatisfied(feature) {
+  const props = feature?.properties || {};
+  const minZoom = Number(props.min_zoom);
+  if (!Number.isFinite(minZoom)) {
+    return true;
+  }
+  return map.getZoom() >= minZoom;
+}
+
+function shouldRenderFeature(feature) {
+  return isNamedPlacesRuleSatisfied(feature) && isZoomRuleSatisfied(feature);
 }
 
 function getBboxFromMap() {
@@ -284,7 +357,7 @@ function addFeatures(features) {
     return 0;
   }
 
-  const filtered = features.filter((feature) => isNamedPlacesRuleSatisfied(feature));
+  const filtered = features.filter((feature) => shouldRenderFeature(feature));
   if (filtered.length === 0) {
     return 0;
   }
@@ -312,6 +385,9 @@ function renderCacheForViewport() {
     if (!featureInBounds(feature, bounds)) {
       continue;
     }
+    if (!shouldRenderFeature(feature)) {
+      continue;
+    }
     batch.push(feature);
   }
 
@@ -323,7 +399,7 @@ function pruneNonVisiblePlottedFeatures() {
   const toRemove = [];
 
   geoJsonLayer.eachLayer((layer) => {
-    if (layerInBounds(layer, bounds)) {
+    if (layerInBounds(layer, bounds) && shouldRenderFeature(layer.feature || {})) {
       return;
     }
 
@@ -365,7 +441,8 @@ async function streamCurrentViewport(requestBbox = null) {
 
   const params = new URLSearchParams({
     bbox: `${bbox.west},${bbox.south},${bbox.east},${bbox.north}`,
-    limit: String(FRONTEND_LIMIT),
+    limit: String(getRequestLimitForCategory(categoryEl.value.trim())),
+    zoom: String(map.getZoom()),
   });
 
   const category = categoryEl.value.trim();
@@ -425,7 +502,7 @@ async function streamCurrentViewport(requestBbox = null) {
         }
 
         const featureId = makeFeatureId(parsed);
-        if (!isNamedPlacesRuleSatisfied(parsed)) {
+        if (!shouldRenderFeature(parsed)) {
           continue;
         }
         if (!featureCache.has(featureId)) {
@@ -446,7 +523,7 @@ async function streamCurrentViewport(requestBbox = null) {
     if (textBuffer.trim()) {
       try {
         const parsed = JSON.parse(textBuffer.trim());
-        if (!(parsed.meta && parsed.meta.done) && isNamedPlacesRuleSatisfied(parsed)) {
+        if (!(parsed.meta && parsed.meta.done) && shouldRenderFeature(parsed)) {
           const featureId = makeFeatureId(parsed);
           if (!featureCache.has(featureId)) {
             featureCache.set(featureId, parsed);
@@ -489,6 +566,11 @@ function loadFeatures() {
 }
 
 function runLoadCycle() {
+  const nextGeometryDetail = getGeometryDetailForZoom(map.getZoom());
+  if (nextGeometryDetail !== activeGeometryDetail) {
+    activeGeometryDetail = nextGeometryDetail;
+    resetCachesAndLayer(false);
+  }
   loadFeatures();
 }
 
