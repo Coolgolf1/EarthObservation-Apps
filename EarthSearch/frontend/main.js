@@ -35,6 +35,11 @@ function isHydroFeatureAllowed(feature) {
   return false;
 }
 
+function isLandmarkFeatureAllowed(feature) {
+  const geometryType = String(feature?.geometry?.type || "");
+  return geometryType === "Point" || geometryType === "MultiPoint";
+}
+
 function formatFeatureHoverText(feature) {
   const props = feature?.properties || {};
   const name = String(props.name || "Unnamed feature");
@@ -70,9 +75,16 @@ const SEARCH_CATEGORIES = [
     label: "places",
     limit: 50000,
   },
+  {
+    category: "landmarks",
+    label: "landmarks",
+    featureFilter: isLandmarkFeatureAllowed,
+    limit: 50000,
+  },
 ];
 
-const STREAMING_LIMIT = 50000;
+// 0 asks the backend to stream until the database cursor is exhausted.
+const STREAMING_LIMIT = 0;
 const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
 
 const CATEGORY_STYLE = {
@@ -100,6 +112,12 @@ const CATEGORY_STYLE = {
     point: "#f59e0b",
     fillOpacity: 0.35,
   },
+  landmarks: {
+    stroke: "#ef4444",
+    fill: "#ef4444",
+    point: "#ef4444",
+    fillOpacity: 0.55,
+  },
   default: {
     stroke: "#1d3557",
     fill: "#2a9d8f",
@@ -114,6 +132,8 @@ const map = L.map("map", {
 
 map.createPane("placesPane");
 map.getPane("placesPane").style.zIndex = "350";
+map.createPane("landmarksPane");
+map.getPane("landmarksPane").style.zIndex = "360";
 map.createPane("transportPane");
 map.getPane("transportPane").style.zIndex = "410";
 map.createPane("hydroPane");
@@ -132,6 +152,9 @@ function getCategoryPane(category) {
     .toLowerCase();
   if (cat === "places") {
     return "placesPane";
+  }
+  if (cat === "landmarks") {
+    return "landmarksPane";
   }
   if (cat === "transport") {
     return "transportPane";
@@ -300,6 +323,24 @@ function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function nextAnimationFrame() {
+  return new Promise((resolve) => {
+    requestAnimationFrame(resolve);
+  });
+}
+
+async function waitForRenderPaint() {
+  await nextAnimationFrame();
+  await nextAnimationFrame();
+}
+
+function getParserLabel(parserMode) {
+  if (parserMode === "fallback") {
+    return "rule fallback";
+  }
+  return parserMode || "agent";
 }
 
 async function fetchWith429Retry(
@@ -664,7 +705,7 @@ function featureVisibleAtCurrentZoom(feature) {
   const category = String(feature?.properties?.category || "")
     .trim()
     .toLowerCase();
-  if (category !== "places") {
+  if (category !== "places" && category !== "landmarks") {
     return true;
   }
   if (!shouldRestrictPlacesToNamed()) {
@@ -891,7 +932,10 @@ async function streamSingleCategory({
     client_id: clientId,
     search_id: searchId,
   });
-  if (spec.category === "places" && shouldRestrictPlacesToNamed()) {
+  if (
+    (spec.category === "places" || spec.category === "landmarks") &&
+    shouldRestrictPlacesToNamed()
+  ) {
     params.set("places_named_only", "true");
   }
 
@@ -962,7 +1006,7 @@ async function streamSingleCategory({
       }
 
       if (
-        spec.category === "places" &&
+        (spec.category === "places" || spec.category === "landmarks") &&
         shouldRestrictPlacesToNamed() &&
         !hasNonEmptyFeatureName(parsed)
       ) {
@@ -993,7 +1037,10 @@ async function streamSingleCategory({
         if (
           (typeof spec.featureFilter !== "function" ||
             spec.featureFilter(parsed)) &&
-          (!(spec.category === "places" && shouldRestrictPlacesToNamed()) ||
+          (!(
+            (spec.category === "places" || spec.category === "landmarks") &&
+            shouldRestrictPlacesToNamed()
+          ) ||
             hasNonEmptyFeatureName(parsed)) &&
           featureRelevantToBbox(parsed, bbox)
         ) {
@@ -1208,10 +1255,22 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
         },
       });
 
+      if (!shouldContinue()) {
+        streamInFlight = false;
+        return;
+      }
+
+      updateStats("Finishing render...");
+      await waitForRenderPaint();
+      if (!shouldContinue()) {
+        streamInFlight = false;
+        return;
+      }
+
       streamInFlight = false;
 
       updateStats(
-        `Done (${payload.parser_mode || "agent"}). Cached +${cachedAdded} | streamed +${total} | total plotted: ${cachedAdded + total}`,
+        `Done. Parser: ${getParserLabel(payload.parser_mode)}. Cached +${cachedAdded} | streamed +${total} | total plotted: ${cachedAdded + total}`,
       );
     };
 

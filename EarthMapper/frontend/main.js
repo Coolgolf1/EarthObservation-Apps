@@ -233,7 +233,7 @@ let activeRequestBbox = null;
 let pendingDeferredLoad = false;
 let activeGeometryDetail = getGeometryDetailForZoom(map.getZoom());
 
-const SMALL_MOVE_RATIO = 0.1;
+const SMALL_MOVE_RATIO = 0.15;
 
 function clearQueuedRequests() {
   if (debounceTimer) {

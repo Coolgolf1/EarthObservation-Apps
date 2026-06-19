@@ -48,8 +48,11 @@ VEHICLE_SPEED_KMH = {
 }
 
 SEARCH_MODE_DEFAULT_LIMIT = 12000
-SEARCH_MODE_MAX_LIMIT = 12000
-EARTHSEARCH_SESSION_LIMIT = max(1, int(os.getenv("EARTHSEARCH_SESSION_LIMIT", "5")))
+SEARCH_MODE_MAX_LIMIT = 50000
+EARTHSEARCH_SESSION_LIMIT = max(
+    1,
+    int(os.getenv("EARTHSEARCH_SESSION_LIMIT", str(SEARCH_MODE_MAX_LIMIT))),
+)
 EARTHMAPPER_STREAM_CLIENT_ID = "earthmapper-viewport"
 _GEOCODE_CACHE: dict[tuple[str, str | None], dict[str, object]] = {}
 MAX_GLOBAL_STREAM_JOBS = max(2, int(os.getenv("MAX_GLOBAL_STREAM_JOBS", "8")))
@@ -569,7 +572,7 @@ def _parse_bbox_param(value: str) -> BBox:
 def _build_query_params(
     bbox_obj: BBox,
     category: str | None,
-    limit: int,
+    limit: int | None,
     zoom: int | None = None,
 ) -> tuple[object, ...]:
     normalized_zoom = _normalize_zoom(zoom)
@@ -590,7 +593,7 @@ def _build_query_params(
 def _build_source_query_params(
     bbox_obj: BBox,
     category: str | None,
-    limit: int,
+    limit: int | None,
     zoom: int | None = None,
     uses_zoom_filter: bool = False,
 ) -> tuple[object, ...]:
@@ -609,6 +612,14 @@ def _build_source_query_params(
 
 def _cap_earthsearch_session_limit(requested_limit: int) -> int:
     return max(1, min(requested_limit, SEARCH_MODE_MAX_LIMIT, EARTHSEARCH_SESSION_LIMIT))
+
+
+def _resolve_stream_limit(requested_limit: int, is_earthsearch_session: bool) -> int | None:
+    if is_earthsearch_session and requested_limit <= 0:
+        return None
+    if is_earthsearch_session:
+        return _cap_earthsearch_session_limit(requested_limit)
+    return min(max(1, requested_limit), SEARCH_MODE_MAX_LIMIT)
 
 
 def _normalize_vehicle(vehicle: str) -> str:
@@ -1110,7 +1121,7 @@ def _row_has_non_empty_name(row: dict[str, object]) -> bool:
 def _iter_feature_rows(
     bbox_obj: BBox,
     category: str | None,
-    limit: int,
+    limit: int | None,
     zoom: int | None = None,
     chunk_size: int = 250,
 ) -> Iterator[dict[str, object]]:
@@ -1132,7 +1143,7 @@ def _iter_source_feature_rows(
     cursor_name: str,
     bbox_obj: BBox,
     category: str | None,
-    limit: int,
+    limit: int | None,
     zoom: int | None,
     uses_zoom_filter: bool,
     places_named_only: bool,
@@ -1169,7 +1180,7 @@ def _iter_source_feature_rows(
 def _iter_feature_rows_concurrently(
     bbox_obj: BBox,
     category: str | None,
-    limit: int,
+    limit: int | None,
     zoom: int | None = None,
     places_named_only: bool = False,
     cancel_event: Event | None = None,
@@ -1230,7 +1241,7 @@ def _iter_feature_rows_concurrently(
     done_workers = 0
     emitted = 0
     try:
-        while done_workers < len(workers) and emitted < limit:
+        while done_workers < len(workers) and (limit is None or emitted < limit):
             if cancel_event is not None and cancel_event.is_set():
                 break
             try:
@@ -1363,7 +1374,7 @@ async def search_mode_features(
 async def stream_features(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     category: str | None = Query(default=None),
-    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=0),
     zoom: int | None = Query(default=None, ge=0, le=22),
     places_named_only: bool = Query(default=False),
     client_id: str | None = Query(default=None),
@@ -1383,11 +1394,7 @@ async def stream_features(
         norm_search_id = _sanitize_token(None)
         _register_active_search(norm_client_id, norm_search_id)
 
-    effective_limit = (
-        _cap_earthsearch_session_limit(limit)
-        if is_earthsearch_session
-        else min(limit, SEARCH_MODE_MAX_LIMIT)
-    )
+    effective_limit = _resolve_stream_limit(limit, is_earthsearch_session)
 
     if not await _try_acquire_stream_slot_replacing_oldest(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
@@ -1416,7 +1423,15 @@ async def stream_features(
                 emitted += 1
                 yield feature.model_dump_json() + "\n"
 
-            yield json.dumps({"meta": {"count": emitted, "done": True}}) + "\n"
+            yield json.dumps(
+                {
+                    "meta": {
+                        "count": emitted,
+                        "done": True,
+                        "limited": effective_limit is not None and emitted >= effective_limit,
+                    }
+                }
+            ) + "\n"
         finally:
             _release_stream_slot(norm_client_id)
 
@@ -1427,7 +1442,7 @@ async def stream_features(
 async def stream_features_multi(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     categories: str = Query(default="places,transport,hydrography"),
-    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=0),
     zoom: int | None = Query(default=None, ge=0, le=22),
     places_named_only: bool = Query(default=False),
     client_id: str | None = Query(default=None),
@@ -1447,11 +1462,7 @@ async def stream_features_multi(
         norm_search_id = _sanitize_token(None)
         _register_active_search(norm_client_id, norm_search_id)
 
-    effective_limit = (
-        _cap_earthsearch_session_limit(limit)
-        if is_earthsearch_session
-        else min(limit, SEARCH_MODE_MAX_LIMIT)
-    )
+    effective_limit = _resolve_stream_limit(limit, is_earthsearch_session)
 
     if not await _try_acquire_stream_slot_replacing_oldest(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
@@ -1468,14 +1479,26 @@ async def stream_features_multi(
     def stream() -> Iterator[str]:
         emitted = 0
         try:
-            per_category_limit = max(1, effective_limit // len(category_list))
-            remainder = effective_limit - (per_category_limit * len(category_list))
+            per_category_limit = (
+                max(1, effective_limit // len(category_list))
+                if effective_limit is not None
+                else None
+            )
+            remainder = (
+                effective_limit - (per_category_limit * len(category_list))
+                if effective_limit is not None and per_category_limit is not None
+                else 0
+            )
 
             for index, category in enumerate(category_list):
                 if cancel_event.is_set() or not _is_current_search(norm_client_id, norm_search_id):
                     break
 
-                local_limit = per_category_limit + (1 if index < remainder else 0)
+                local_limit = (
+                    per_category_limit + (1 if index < remainder else 0)
+                    if per_category_limit is not None
+                    else None
+                )
                 for row in _iter_feature_rows_concurrently(
                     bbox_obj=bbox_obj,
                     category=category,
@@ -1492,7 +1515,15 @@ async def stream_features_multi(
                     emitted += 1
                     yield feature.model_dump_json() + "\n"
 
-            yield json.dumps({"meta": {"count": emitted, "done": True}}) + "\n"
+            yield json.dumps(
+                {
+                    "meta": {
+                        "count": emitted,
+                        "done": True,
+                        "limited": effective_limit is not None and emitted >= effective_limit,
+                    }
+                }
+            ) + "\n"
         finally:
             _release_stream_slot(norm_client_id)
 
