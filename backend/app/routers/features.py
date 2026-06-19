@@ -188,7 +188,7 @@ def _release_stream_slot(client_id: str) -> None:
     _GLOBAL_STREAM_SEMAPHORE.release()
 
 
-NATURAL_EARTH_QUERY = """
+NATURAL_EARTH_QUERY_TEMPLATE = """
 WITH bounds AS (
     SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
 )
@@ -197,18 +197,19 @@ SELECT
     n.name,
     n.category,
     n.subcategory,
-    ST_AsGeoJSON(ST_GeomFromWKB(n.geom, 4326)) AS geom,
+    ST_AsGeoJSON(ST_GeomFromWKB({geom_expr}, 4326)) AS geom,
+    'full'::text AS geom_detail,
     'natural_earth'::text AS source
 FROM public.natural_earth_silver n
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
-    AND n.geom IS NOT NULL
-    AND ST_Intersects(ST_GeomFromWKB(n.geom, 4326), b.query_envelope)
+    AND {geom_expr} IS NOT NULL
+    AND ST_Intersects(ST_GeomFromWKB({geom_expr}, 4326), b.query_envelope)
 LIMIT %s;
 """
 
 
-GADM_QUERY = """
+GADM_QUERY_TEMPLATE = """
 WITH bounds AS (
     SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
 )
@@ -217,18 +218,39 @@ SELECT
     g.name,
     g.category,
     g.subcategory,
-    ST_AsGeoJSON(ST_GeomFromWKB(g.geom, 4326)) AS geom,
+    ST_AsGeoJSON(ST_GeomFromWKB({geom_expr}, 4326)) AS geom,
+    {geom_detail}::text AS geom_detail,
+    g.country_code,
+    g.country_name,
+    g.admin_level,
+    g.admin_id,
+    g.admin_name,
+    g.admin1_name,
+    g.admin2_name,
+    g.admin3_name,
+    g.admin_type_en,
+    g.alt_names,
+    g.search_name,
+    g.min_zoom,
+    g.label_min_zoom,
+    g.display_rank,
+    g.importance_score,
+    g.area_m2,
+    g.length_m,
+    g.vertex_count,
     'gadm'::text AS source
 FROM public.gadm_silver g
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
-    AND g.geom IS NOT NULL
-    AND ST_Intersects(ST_GeomFromWKB(g.geom, 4326), b.query_envelope)
+    AND (%s::integer IS NULL OR g.min_zoom IS NULL OR g.min_zoom <= %s::integer)
+    AND {geom_expr} IS NOT NULL
+    AND ST_Intersects(ST_GeomFromWKB({geom_expr}, 4326), b.query_envelope)
+ORDER BY g.display_rank DESC NULLS LAST, g.area_m2 DESC NULLS LAST
 LIMIT %s;
 """
 
 
-FEATURES_QUERY = """
+FEATURES_QUERY_TEMPLATE = """
 WITH bounds AS (
     SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
 )
@@ -237,13 +259,32 @@ SELECT
     n.name,
     n.category,
     n.subcategory,
-    ST_AsGeoJSON(ST_GeomFromWKB(n.geom, 4326)) AS geom,
+    ST_AsGeoJSON(ST_GeomFromWKB({ne_geom_expr}, 4326)) AS geom,
+    'full'::text AS geom_detail,
+    NULL::text AS country_code,
+    NULL::text AS country_name,
+    NULL::integer AS admin_level,
+    NULL::text AS admin_id,
+    NULL::text AS admin_name,
+    NULL::text AS admin1_name,
+    NULL::text AS admin2_name,
+    NULL::text AS admin3_name,
+    NULL::text AS admin_type_en,
+    NULL::text AS alt_names,
+    NULL::text AS search_name,
+    NULL::integer AS min_zoom,
+    NULL::integer AS label_min_zoom,
+    NULL::integer AS display_rank,
+    NULL::double precision AS importance_score,
+    NULL::double precision AS area_m2,
+    NULL::double precision AS length_m,
+    NULL::integer AS vertex_count,
     'natural_earth'::text AS source
 FROM public.natural_earth_silver n
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
-    AND n.geom IS NOT NULL
-    AND ST_Intersects(ST_GeomFromWKB(n.geom, 4326), b.query_envelope)
+    AND {ne_geom_expr} IS NOT NULL
+    AND ST_Intersects(ST_GeomFromWKB({ne_geom_expr}, 4326), b.query_envelope)
 
 UNION ALL
 
@@ -252,15 +293,77 @@ SELECT
     g.name,
     g.category,
     g.subcategory,
-    ST_AsGeoJSON(ST_GeomFromWKB(g.geom, 4326)) AS geom,
+    ST_AsGeoJSON(ST_GeomFromWKB({gadm_geom_expr}, 4326)) AS geom,
+    {gadm_geom_detail}::text AS geom_detail,
+    g.country_code,
+    g.country_name,
+    g.admin_level,
+    g.admin_id,
+    g.admin_name,
+    g.admin1_name,
+    g.admin2_name,
+    g.admin3_name,
+    g.admin_type_en,
+    g.alt_names,
+    g.search_name,
+    g.min_zoom,
+    g.label_min_zoom,
+    g.display_rank,
+    g.importance_score,
+    g.area_m2,
+    g.length_m,
+    g.vertex_count,
     'gadm'::text AS source
 FROM public.gadm_silver g
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
-    AND g.geom IS NOT NULL
-    AND ST_Intersects(ST_GeomFromWKB(g.geom, 4326), b.query_envelope)
+    AND (%s::integer IS NULL OR g.min_zoom IS NULL OR g.min_zoom <= %s::integer)
+    AND {gadm_geom_expr} IS NOT NULL
+    AND ST_Intersects(ST_GeomFromWKB({gadm_geom_expr}, 4326), b.query_envelope)
 LIMIT %s;
 """
+
+
+def _normalize_zoom(zoom: int | None) -> int | None:
+    if zoom is None:
+        return None
+    return max(0, min(22, int(zoom)))
+
+
+def _gadm_geometry_selection(zoom: int | None) -> tuple[str, str]:
+    normalized_zoom = _normalize_zoom(zoom)
+    if normalized_zoom is None:
+        return "g.geom", "'full'"
+    if normalized_zoom <= 5:
+        return "COALESCE(g.geom_z4, g.geom)", "'z4'"
+    if normalized_zoom <= 8:
+        return "COALESCE(g.geom_z7, g.geom)", "'z7'"
+    if normalized_zoom <= 11:
+        return "COALESCE(g.geom_z10, g.geom)", "'z10'"
+    return "g.geom", "'full'"
+
+
+def _build_natural_earth_query() -> str:
+    return NATURAL_EARTH_QUERY_TEMPLATE.format(geom_expr="n.geom")
+
+
+def _build_gadm_query(zoom: int | None = None) -> str:
+    geom_expr, geom_detail = _gadm_geometry_selection(zoom)
+    return GADM_QUERY_TEMPLATE.format(geom_expr=geom_expr, geom_detail=geom_detail)
+
+
+def _build_features_query(zoom: int | None = None) -> str:
+    gadm_geom_expr, gadm_geom_detail = _gadm_geometry_selection(zoom)
+    return FEATURES_QUERY_TEMPLATE.format(
+        ne_geom_expr="n.geom",
+        gadm_geom_expr=gadm_geom_expr,
+        gadm_geom_detail=gadm_geom_detail,
+    )
+
+
+NATURAL_EARTH_QUERY = _build_natural_earth_query()
+GADM_QUERY = _build_gadm_query()
+FEATURES_QUERY = _build_features_query()
 
 
 def _parse_json(value: object) -> object:
@@ -300,7 +403,13 @@ def _parse_bbox_param(value: str) -> BBox:
         raise HTTPException(status_code=422, detail=f"Invalid bbox value: {exc}") from exc
 
 
-def _build_query_params(bbox_obj: BBox, category: str | None, limit: int) -> tuple[object, ...]:
+def _build_query_params(
+    bbox_obj: BBox,
+    category: str | None,
+    limit: int,
+    zoom: int | None = None,
+) -> tuple[object, ...]:
+    normalized_zoom = _normalize_zoom(zoom)
     return (
         bbox_obj.min_lon,
         bbox_obj.min_lat,
@@ -310,18 +419,32 @@ def _build_query_params(bbox_obj: BBox, category: str | None, limit: int) -> tup
         category,
         category,
         category,
+        normalized_zoom,
+        normalized_zoom,
         limit,
     )
 
 
-def _build_source_query_params(bbox_obj: BBox, category: str | None, limit: int) -> tuple[object, ...]:
-    return (
+def _build_source_query_params(
+    bbox_obj: BBox,
+    category: str | None,
+    limit: int,
+    zoom: int | None = None,
+    uses_zoom_filter: bool = False,
+) -> tuple[object, ...]:
+    normalized_zoom = _normalize_zoom(zoom)
+    params: tuple[object, ...] = (
         bbox_obj.min_lon,
         bbox_obj.min_lat,
         bbox_obj.max_lon,
         bbox_obj.max_lat,
         category,
         category,
+    )
+    if uses_zoom_filter:
+        params = (*params, normalized_zoom, normalized_zoom)
+    return (
+        *params,
         limit,
     )
 
@@ -758,6 +881,7 @@ def _fetch_features_for_categories(
     bbox_obj: BBox,
     categories: list[str],
     total_limit: int,
+    zoom: int | None = None,
 ) -> list[Feature]:
     if total_limit <= 0 or not categories:
         return []
@@ -771,11 +895,11 @@ def _fetch_features_for_categories(
         if local_limit <= 0:
             return []
 
-        params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=local_limit)
+        params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=local_limit, zoom=zoom)
         local_features: list[Feature] = []
         with get_db_connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(FEATURES_QUERY, params)
+                cur.execute(cast(PsycopgQuery, _build_features_query(zoom)), params)
                 rows = cur.fetchall()
 
         for row in rows:
@@ -825,12 +949,18 @@ def _row_has_non_empty_name(row: dict[str, object]) -> bool:
     return bool(name_value.strip())
 
 
-def _iter_feature_rows(bbox_obj: BBox, category: str | None, limit: int, chunk_size: int = 250) -> Iterator[dict[str, object]]:
-    params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit)
+def _iter_feature_rows(
+    bbox_obj: BBox,
+    category: str | None,
+    limit: int,
+    zoom: int | None = None,
+    chunk_size: int = 250,
+) -> Iterator[dict[str, object]]:
+    params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit, zoom=zoom)
 
     with get_db_connection() as conn:
         with conn.cursor(name="feature_stream_cursor", row_factory=dict_row) as cur:
-            cur.execute(FEATURES_QUERY, params)
+            cur.execute(cast(PsycopgQuery, _build_features_query(zoom)), params)
             while True:
                 rows = cur.fetchmany(chunk_size)
                 if not rows:
@@ -845,12 +975,20 @@ def _iter_source_feature_rows(
     bbox_obj: BBox,
     category: str | None,
     limit: int,
+    zoom: int | None,
+    uses_zoom_filter: bool,
     places_named_only: bool,
     stop_event: Event,
     cancel_event: Event | None = None,
     chunk_size: int = 250,
 ) -> Iterator[dict[str, object]]:
-    params = _build_source_query_params(bbox_obj=bbox_obj, category=category, limit=limit)
+    params = _build_source_query_params(
+        bbox_obj=bbox_obj,
+        category=category,
+        limit=limit,
+        zoom=zoom,
+        uses_zoom_filter=uses_zoom_filter,
+    )
 
     with get_db_connection() as conn:
         with conn.cursor(name=cursor_name, row_factory=dict_row) as cur:
@@ -874,6 +1012,7 @@ def _iter_feature_rows_concurrently(
     bbox_obj: BBox,
     category: str | None,
     limit: int,
+    zoom: int | None = None,
     places_named_only: bool = False,
     cancel_event: Event | None = None,
 ) -> Iterator[dict[str, object]]:
@@ -889,6 +1028,8 @@ def _iter_feature_rows_concurrently(
                 bbox_obj=bbox_obj,
                 category=category,
                 limit=limit,
+                zoom=zoom,
+                uses_zoom_filter=query == gadm_query,
                 places_named_only=places_named_only,
                 stop_event=stop_event,
                 cancel_event=cancel_event,
@@ -911,6 +1052,7 @@ def _iter_feature_rows_concurrently(
                         break
 
     request_key = uuid4().hex
+    gadm_query = _build_gadm_query(zoom)
     workers = [
         Thread(
             target=producer,
@@ -919,7 +1061,7 @@ def _iter_feature_rows_concurrently(
         ),
         Thread(
             target=producer,
-            args=(GADM_QUERY, f"stream_gadm_{request_key}"),
+            args=(gadm_query, f"stream_gadm_{request_key}"),
             daemon=True,
         ),
     ]
@@ -961,14 +1103,15 @@ async def get_features(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     category: str = Query(default="places"),
     limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    zoom: int | None = Query(default=None, ge=0, le=22),
 ):
     bbox_obj = _parse_bbox_param(bbox)
 
-    params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit)
+    params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit, zoom=zoom)
 
     with get_db_connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(FEATURES_QUERY, params)
+            cur.execute(cast(PsycopgQuery, _build_features_query(zoom)), params)
             rows = cur.fetchall()
 
     features: list[Feature] = []
@@ -1054,6 +1197,7 @@ async def stream_features(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     category: str | None = Query(default=None),
     limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    zoom: int | None = Query(default=None, ge=0, le=22),
     places_named_only: bool = Query(default=False),
     client_id: str | None = Query(default=None),
     search_id: str | None = Query(default=None),
@@ -1093,6 +1237,7 @@ async def stream_features(
                 bbox_obj=bbox_obj,
                 category=category,
                 limit=effective_limit,
+                zoom=zoom,
                 places_named_only=places_named_only,
                 cancel_event=cancel_event,
             ):
@@ -1116,6 +1261,7 @@ async def stream_features_multi(
     bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
     categories: str = Query(default="places,transport,hydrography"),
     limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    zoom: int | None = Query(default=None, ge=0, le=22),
     places_named_only: bool = Query(default=False),
     client_id: str | None = Query(default=None),
     search_id: str | None = Query(default=None),
@@ -1167,6 +1313,7 @@ async def stream_features_multi(
                     bbox_obj=bbox_obj,
                     category=category,
                     limit=local_limit,
+                    zoom=zoom,
                     places_named_only=places_named_only,
                     cancel_event=cancel_event,
                 ):
@@ -1498,5 +1645,3 @@ async def bbox_search(payload: BBoxSearchRequest):
         "features": features,
         "count": len(features),
     }
-
-
