@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import os
@@ -49,12 +50,14 @@ VEHICLE_SPEED_KMH = {
 SEARCH_MODE_DEFAULT_LIMIT = 12000
 SEARCH_MODE_MAX_LIMIT = 12000
 EARTHSEARCH_SESSION_LIMIT = max(1, int(os.getenv("EARTHSEARCH_SESSION_LIMIT", "5")))
+EARTHMAPPER_STREAM_CLIENT_ID = "earthmapper-viewport"
 _GEOCODE_CACHE: dict[tuple[str, str | None], dict[str, object]] = {}
 MAX_GLOBAL_STREAM_JOBS = max(2, int(os.getenv("MAX_GLOBAL_STREAM_JOBS", "8")))
 MAX_CLIENT_STREAM_JOBS = 1
 _GLOBAL_STREAM_SEMAPHORE = Semaphore(MAX_GLOBAL_STREAM_JOBS)
 _STREAM_COUNTER_LOCK = Lock()
 _ACTIVE_STREAMS_BY_CLIENT: dict[str, int] = {}
+_ACTIVE_STREAM_CLIENT_ORDER: list[str] = []
 _SEARCH_STATE_LOCK = Lock()
 _ACTIVE_SEARCH_BY_CLIENT: dict[str, tuple[str, Event]] = {}
 LLM_API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
@@ -174,7 +177,74 @@ def _try_acquire_stream_slot(client_id: str) -> bool:
             return False
 
         _ACTIVE_STREAMS_BY_CLIENT[client_id] = active_count + 1
+        if active_count == 0:
+            _ACTIVE_STREAM_CLIENT_ORDER.append(client_id)
         return True
+
+
+def _cancel_oldest_stream() -> bool:
+    with _STREAM_COUNTER_LOCK:
+        oldest_client_id = next(
+            (
+                client_id
+                for client_id in _ACTIVE_STREAM_CLIENT_ORDER
+                if _ACTIVE_STREAMS_BY_CLIENT.get(client_id, 0) > 0
+            ),
+            None,
+        )
+
+    if oldest_client_id is None:
+        return False
+
+    with _SEARCH_STATE_LOCK:
+        active = _ACTIVE_SEARCH_BY_CLIENT.get(oldest_client_id)
+
+    if active is None:
+        return False
+
+    _, cancel_event = active
+    cancel_event.set()
+    return True
+
+
+def _client_has_active_stream(client_id: str) -> bool:
+    with _STREAM_COUNTER_LOCK:
+        return _ACTIVE_STREAMS_BY_CLIENT.get(client_id, 0) > 0
+
+
+def _reset_stream_slots() -> None:
+    global _GLOBAL_STREAM_SEMAPHORE
+
+    with _STREAM_COUNTER_LOCK:
+        _ACTIVE_STREAMS_BY_CLIENT.clear()
+        _ACTIVE_STREAM_CLIENT_ORDER.clear()
+        _GLOBAL_STREAM_SEMAPHORE = Semaphore(MAX_GLOBAL_STREAM_JOBS)
+
+
+async def _try_acquire_stream_slot_replacing_oldest(client_id: str) -> bool:
+    if _try_acquire_stream_slot(client_id):
+        return True
+
+    if _client_has_active_stream(client_id):
+        for _ in range(12):
+            await asyncio.sleep(0.08)
+            if _try_acquire_stream_slot(client_id):
+                return True
+
+        _reset_stream_slots()
+        return _try_acquire_stream_slot(client_id)
+
+    if not _cancel_oldest_stream():
+        _reset_stream_slots()
+        return _try_acquire_stream_slot(client_id)
+
+    for _ in range(12):
+        await asyncio.sleep(0.08)
+        if _try_acquire_stream_slot(client_id):
+            return True
+
+    _reset_stream_slots()
+    return _try_acquire_stream_slot(client_id)
 
 
 def _release_stream_slot(client_id: str) -> None:
@@ -182,15 +252,43 @@ def _release_stream_slot(client_id: str) -> None:
         active_count = _ACTIVE_STREAMS_BY_CLIENT.get(client_id, 0)
         if active_count <= 1:
             _ACTIVE_STREAMS_BY_CLIENT.pop(client_id, None)
+            while client_id in _ACTIVE_STREAM_CLIENT_ORDER:
+                _ACTIVE_STREAM_CLIENT_ORDER.remove(client_id)
         else:
             _ACTIVE_STREAMS_BY_CLIENT[client_id] = active_count - 1
 
     _GLOBAL_STREAM_SEMAPHORE.release()
 
 
+def _clear_stream_state() -> dict[str, int]:
+    with _SEARCH_STATE_LOCK:
+        cancelled_searches = 0
+        for _, cancel_event in _ACTIVE_SEARCH_BY_CLIENT.values():
+            if not cancel_event.is_set():
+                cancel_event.set()
+                cancelled_searches += 1
+        active_searches = len(_ACTIVE_SEARCH_BY_CLIENT)
+        _ACTIVE_SEARCH_BY_CLIENT.clear()
+
+    with _STREAM_COUNTER_LOCK:
+        active_streams = sum(_ACTIVE_STREAMS_BY_CLIENT.values())
+        active_clients = len(_ACTIVE_STREAMS_BY_CLIENT)
+
+    _reset_stream_slots()
+
+    return {
+        "active_searches": active_searches,
+        "cancelled_searches": cancelled_searches,
+        "active_clients": active_clients,
+        "active_streams": active_streams,
+    }
+
+
 NATURAL_EARTH_QUERY_TEMPLATE = """
 WITH bounds AS (
-    SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
+    SELECT
+        ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope,
+        %s::integer AS request_zoom
 )
 SELECT
     n.id,
@@ -198,12 +296,42 @@ SELECT
     n.category,
     n.subcategory,
     ST_AsGeoJSON(ST_GeomFromWKB({geom_expr}, 4326)) AS geom,
+    ST_GeometryType(ST_GeomFromWKB({geom_expr}, 4326)) AS geometry_type,
     'full'::text AS geom_detail,
+    CASE
+        WHEN lower(COALESCE(n.category::text, '')) <> 'transport' THEN NULL::integer
+        WHEN lower(COALESCE(n.subcategory::text, '')) <> 'road' THEN 8
+        WHEN ST_Length(ST_GeomFromWKB({geom_expr}, 4326)) >= 1.35 THEN 0
+        WHEN ST_Length(ST_GeomFromWKB({geom_expr}, 4326)) >= 0.80 THEN 6
+        WHEN ST_Length(ST_GeomFromWKB({geom_expr}, 4326)) >= 0.40 THEN 8
+        ELSE 10
+    END AS min_zoom,
     'natural_earth'::text AS source
 FROM public.natural_earth_silver n
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
     AND {geom_expr} IS NOT NULL
+    AND (
+        lower(COALESCE(n.category::text, '')) <> 'places'
+        OR ST_GeometryType(ST_GeomFromWKB({geom_expr}, 4326)) IN ('ST_Point', 'ST_MultiPoint', 'ST_Polygon', 'ST_MultiPolygon')
+    )
+    AND (
+        lower(COALESCE(n.category::text, '')) <> 'transport'
+        OR b.request_zoom IS NULL
+        OR b.request_zoom >= 10
+        OR (
+            lower(COALESCE(n.subcategory::text, '')) = 'road'
+            AND (
+                (b.request_zoom <= 5 AND ST_Length(ST_GeomFromWKB({geom_expr}, 4326)) >= 1.35)
+                OR (b.request_zoom > 5 AND b.request_zoom <= 7 AND ST_Length(ST_GeomFromWKB({geom_expr}, 4326)) >= 0.80)
+                OR (b.request_zoom > 7 AND b.request_zoom <= 9 AND ST_Length(ST_GeomFromWKB({geom_expr}, 4326)) >= 0.40)
+            )
+        )
+        OR (
+            lower(COALESCE(n.subcategory::text, '')) <> 'road'
+            AND b.request_zoom >= 8
+        )
+    )
     AND ST_Intersects(ST_GeomFromWKB({geom_expr}, 4326), b.query_envelope)
 LIMIT %s;
 """
@@ -211,7 +339,9 @@ LIMIT %s;
 
 GADM_QUERY_TEMPLATE = """
 WITH bounds AS (
-    SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
+    SELECT
+        ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope,
+        %s::integer AS request_zoom
 )
 SELECT
     g.id,
@@ -219,6 +349,7 @@ SELECT
     g.category,
     g.subcategory,
     ST_AsGeoJSON(ST_GeomFromWKB({geom_expr}, 4326)) AS geom,
+    ST_GeometryType(ST_GeomFromWKB({geom_expr}, 4326)) AS geometry_type,
     {geom_detail}::text AS geom_detail,
     g.country_code,
     g.country_name,
@@ -242,8 +373,9 @@ SELECT
 FROM public.gadm_silver g
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
-    AND (%s::integer IS NULL OR g.min_zoom IS NULL OR g.min_zoom <= %s::integer)
+    AND (b.request_zoom IS NULL OR g.min_zoom IS NULL OR g.min_zoom <= b.request_zoom)
     AND {geom_expr} IS NOT NULL
+    AND ST_GeometryType(ST_GeomFromWKB({geom_expr}, 4326)) IN ('ST_Polygon', 'ST_MultiPolygon')
     AND ST_Intersects(ST_GeomFromWKB({geom_expr}, 4326), b.query_envelope)
 ORDER BY g.display_rank DESC NULLS LAST, g.area_m2 DESC NULLS LAST
 LIMIT %s;
@@ -252,7 +384,9 @@ LIMIT %s;
 
 FEATURES_QUERY_TEMPLATE = """
 WITH bounds AS (
-    SELECT ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope
+    SELECT
+        ST_MakeEnvelope(%s, %s, %s, %s, 4326) AS query_envelope,
+        %s::integer AS request_zoom
 )
 SELECT
     n.id,
@@ -260,6 +394,7 @@ SELECT
     n.category,
     n.subcategory,
     ST_AsGeoJSON(ST_GeomFromWKB({ne_geom_expr}, 4326)) AS geom,
+    ST_GeometryType(ST_GeomFromWKB({ne_geom_expr}, 4326)) AS geometry_type,
     'full'::text AS geom_detail,
     NULL::text AS country_code,
     NULL::text AS country_name,
@@ -272,7 +407,14 @@ SELECT
     NULL::text AS admin_type_en,
     NULL::text AS alt_names,
     NULL::text AS search_name,
-    NULL::integer AS min_zoom,
+    CASE
+        WHEN lower(COALESCE(n.category::text, '')) <> 'transport' THEN NULL::integer
+        WHEN lower(COALESCE(n.subcategory::text, '')) <> 'road' THEN 8
+        WHEN ST_Length(ST_GeomFromWKB({ne_geom_expr}, 4326)) >= 1.35 THEN 0
+        WHEN ST_Length(ST_GeomFromWKB({ne_geom_expr}, 4326)) >= 0.80 THEN 6
+        WHEN ST_Length(ST_GeomFromWKB({ne_geom_expr}, 4326)) >= 0.40 THEN 8
+        ELSE 10
+    END AS min_zoom,
     NULL::integer AS label_min_zoom,
     NULL::integer AS display_rank,
     NULL::double precision AS importance_score,
@@ -284,6 +426,27 @@ FROM public.natural_earth_silver n
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(n.category::text, '')) = lower(%s::text))
     AND {ne_geom_expr} IS NOT NULL
+    AND (
+        lower(COALESCE(n.category::text, '')) <> 'places'
+        OR ST_GeometryType(ST_GeomFromWKB({ne_geom_expr}, 4326)) IN ('ST_Point', 'ST_MultiPoint', 'ST_Polygon', 'ST_MultiPolygon')
+    )
+    AND (
+        lower(COALESCE(n.category::text, '')) <> 'transport'
+        OR b.request_zoom IS NULL
+        OR b.request_zoom >= 10
+        OR (
+            lower(COALESCE(n.subcategory::text, '')) = 'road'
+            AND (
+                (b.request_zoom <= 5 AND ST_Length(ST_GeomFromWKB({ne_geom_expr}, 4326)) >= 1.35)
+                OR (b.request_zoom > 5 AND b.request_zoom <= 7 AND ST_Length(ST_GeomFromWKB({ne_geom_expr}, 4326)) >= 0.80)
+                OR (b.request_zoom > 7 AND b.request_zoom <= 9 AND ST_Length(ST_GeomFromWKB({ne_geom_expr}, 4326)) >= 0.40)
+            )
+        )
+        OR (
+            lower(COALESCE(n.subcategory::text, '')) <> 'road'
+            AND b.request_zoom >= 8
+        )
+    )
     AND ST_Intersects(ST_GeomFromWKB({ne_geom_expr}, 4326), b.query_envelope)
 
 UNION ALL
@@ -294,6 +457,7 @@ SELECT
     g.category,
     g.subcategory,
     ST_AsGeoJSON(ST_GeomFromWKB({gadm_geom_expr}, 4326)) AS geom,
+    ST_GeometryType(ST_GeomFromWKB({gadm_geom_expr}, 4326)) AS geometry_type,
     {gadm_geom_detail}::text AS geom_detail,
     g.country_code,
     g.country_name,
@@ -317,8 +481,9 @@ SELECT
 FROM public.gadm_silver g
 CROSS JOIN bounds b
 WHERE (%s::text IS NULL OR lower(COALESCE(g.category::text, '')) = lower(%s::text))
-    AND (%s::integer IS NULL OR g.min_zoom IS NULL OR g.min_zoom <= %s::integer)
+    AND (b.request_zoom IS NULL OR g.min_zoom IS NULL OR g.min_zoom <= b.request_zoom)
     AND {gadm_geom_expr} IS NOT NULL
+    AND ST_GeometryType(ST_GeomFromWKB({gadm_geom_expr}, 4326)) IN ('ST_Polygon', 'ST_MultiPolygon')
     AND ST_Intersects(ST_GeomFromWKB({gadm_geom_expr}, 4326), b.query_envelope)
 LIMIT %s;
 """
@@ -334,8 +499,6 @@ def _gadm_geometry_selection(zoom: int | None) -> tuple[str, str]:
     normalized_zoom = _normalize_zoom(zoom)
     if normalized_zoom is None:
         return "g.geom", "'full'"
-    if normalized_zoom <= 5:
-        return "COALESCE(g.geom_z4, g.geom)", "'z4'"
     if normalized_zoom <= 8:
         return "COALESCE(g.geom_z7, g.geom)", "'z7'"
     if normalized_zoom <= 11:
@@ -415,12 +578,11 @@ def _build_query_params(
         bbox_obj.min_lat,
         bbox_obj.max_lon,
         bbox_obj.max_lat,
-        category,
-        category,
-        category,
-        category,
         normalized_zoom,
-        normalized_zoom,
+        category,
+        category,
+        category,
+        category,
         limit,
     )
 
@@ -433,18 +595,14 @@ def _build_source_query_params(
     uses_zoom_filter: bool = False,
 ) -> tuple[object, ...]:
     normalized_zoom = _normalize_zoom(zoom)
-    params: tuple[object, ...] = (
+    return (
         bbox_obj.min_lon,
         bbox_obj.min_lat,
         bbox_obj.max_lon,
         bbox_obj.max_lat,
+        normalized_zoom,
         category,
         category,
-    )
-    if uses_zoom_filter:
-        params = (*params, normalized_zoom, normalized_zoom)
-    return (
-        *params,
         limit,
     )
 
@@ -1123,6 +1281,15 @@ async def get_features(
     return features
 
 
+@router.post("/admin/clear-streams")
+async def clear_streams():
+    cleared = _clear_stream_state()
+    return {
+        "ok": True,
+        **cleared,
+    }
+
+
 @router.get("/search-mode")
 async def search_mode_features(
     place_query: str = Query(..., min_length=2),
@@ -1212,7 +1379,7 @@ async def stream_features(
             raise HTTPException(status_code=409, detail="Stale search id")
     else:
         # Backward-compatible session for simple viewport stream clients (e.g. EarthMapper).
-        norm_client_id = _sanitize_token(None)
+        norm_client_id = EARTHMAPPER_STREAM_CLIENT_ID
         norm_search_id = _sanitize_token(None)
         _register_active_search(norm_client_id, norm_search_id)
 
@@ -1222,7 +1389,7 @@ async def stream_features(
         else min(limit, SEARCH_MODE_MAX_LIMIT)
     )
 
-    if not _try_acquire_stream_slot(norm_client_id):
+    if not await _try_acquire_stream_slot_replacing_oldest(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
 
     cancel_event = _get_search_cancel_event(norm_client_id, norm_search_id)
@@ -1276,7 +1443,7 @@ async def stream_features_multi(
             raise HTTPException(status_code=409, detail="Stale search id")
     else:
         # Backward-compatible session for simple viewport stream clients (e.g. EarthMapper).
-        norm_client_id = _sanitize_token(None)
+        norm_client_id = EARTHMAPPER_STREAM_CLIENT_ID
         norm_search_id = _sanitize_token(None)
         _register_active_search(norm_client_id, norm_search_id)
 
@@ -1286,7 +1453,7 @@ async def stream_features_multi(
         else min(limit, SEARCH_MODE_MAX_LIMIT)
     )
 
-    if not _try_acquire_stream_slot(norm_client_id):
+    if not await _try_acquire_stream_slot_replacing_oldest(norm_client_id):
         raise HTTPException(status_code=429, detail="Too many active streams")
 
     cancel_event = _get_search_cancel_event(norm_client_id, norm_search_id)

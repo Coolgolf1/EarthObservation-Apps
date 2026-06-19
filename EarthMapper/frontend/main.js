@@ -1,5 +1,6 @@
-const API_BASE = "http://127.0.0.1:8000";
-const MAPBOX_TOKEN = "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
+const API_BASE = "http://127.0.0.1:8080";
+const MAPBOX_TOKEN =
+  "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
 
 const map = L.map("map", {
   zoomControl: true,
@@ -7,14 +8,18 @@ const map = L.map("map", {
 
 const canvasRenderer = L.canvas({ padding: 0.5 });
 
-L.tileLayer("https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}", {
-  id: "mapbox/satellite-streets-v12",
-  accessToken: MAPBOX_TOKEN,
-  tileSize: 512,
-  zoomOffset: -1,
-  maxZoom: 20,
-  attribution: '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-}).addTo(map);
+L.tileLayer(
+  "https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}",
+  {
+    id: "mapbox/satellite-streets-v12",
+    accessToken: MAPBOX_TOKEN,
+    tileSize: 512,
+    zoomOffset: -1,
+    maxZoom: 20,
+    attribution:
+      '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  },
+).addTo(map);
 
 const statsEl = document.getElementById("stats");
 const categoryEl = document.getElementById("category");
@@ -22,22 +27,75 @@ const formEl = document.getElementById("filters-form");
 
 const FRONTEND_LIMIT = 50000;
 const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
+const MOVE_DEBOUNCE_MS = 250;
 const ADMIN_LIMIT_BY_DETAIL = {
   z4: 1500,
   z7: 6000,
   z10: 18000,
   full: FRONTEND_LIMIT,
 };
+const TRANSPORT_LIMIT_BY_ZOOM = {
+  far: 2500,
+  mid: 8000,
+  near: 18000,
+  full: FRONTEND_LIMIT,
+};
+const GEOMETRY_DETAIL_RANK = {
+  z4: 1,
+  z7: 2,
+  z10: 3,
+  full: 4,
+};
 
 const CATEGORY_STYLE = {
-  hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
-  administrative: { stroke: "#2ca25f", fill: "transparent", point: "#2ca25f", fillOpacity: 0.0 },
-  transport: { stroke: "#facc15", fill: "#facc15", point: "#facc15", fillOpacity: 0.45 },
-  places: { stroke: "#f59e0b", fill: "#f59e0b", point: "#f59e0b", fillOpacity: 0.35 },
-  terrain: { stroke: "#8b5a2b", fill: "#a67c52", point: "#8b5a2b", fillOpacity: 0.4 },
-  regions: { stroke: "#0f766e", fill: "#14b8a6", point: "#0f766e", fillOpacity: 0.3 },
-  landmarks: { stroke: "#d62728", fill: "#ef4444", point: "#d62728", fillOpacity: 0.5 },
-  default: { stroke: "#1d3557", fill: "#2a9d8f", point: "#0f5132", fillOpacity: 0.35 },
+  hydrography: {
+    stroke: "#1f77b4",
+    fill: "#4aa3df",
+    point: "#1f77b4",
+    fillOpacity: 0.7,
+  },
+  administrative: {
+    stroke: "#2ca25f",
+    fill: "transparent",
+    point: "#2ca25f",
+    fillOpacity: 0.0,
+  },
+  transport: {
+    stroke: "#facc15",
+    fill: "#facc15",
+    point: "#facc15",
+    fillOpacity: 0.45,
+  },
+  places: {
+    stroke: "#f59e0b",
+    fill: "#f59e0b",
+    point: "#f59e0b",
+    fillOpacity: 0.35,
+  },
+  terrain: {
+    stroke: "#8b5a2b",
+    fill: "#a67c52",
+    point: "#8b5a2b",
+    fillOpacity: 0.4,
+  },
+  regions: {
+    stroke: "#0f766e",
+    fill: "#14b8a6",
+    point: "#0f766e",
+    fillOpacity: 0.3,
+  },
+  landmarks: {
+    stroke: "#d62728",
+    fill: "#ef4444",
+    point: "#d62728",
+    fillOpacity: 0.5,
+  },
+  default: {
+    stroke: "#1d3557",
+    fill: "#2a9d8f",
+    point: "#0f5132",
+    fillOpacity: 0.35,
+  },
 };
 
 const POPUP_FIELD_PRIORITY = [
@@ -59,7 +117,9 @@ const POPUP_FIELD_PRIORITY = [
 ];
 
 function currentCategoryPalette(feature = null) {
-  const cat = String(feature?.properties?.category || categoryEl.value || "").trim().toLowerCase();
+  const cat = String(feature?.properties?.category || categoryEl.value || "")
+    .trim()
+    .toLowerCase();
   return CATEGORY_STYLE[cat] || CATEGORY_STYLE.default;
 }
 
@@ -68,13 +128,23 @@ const geoJsonLayer = L.geoJSON([], {
   style: (feature) => {
     const palette = currentCategoryPalette(feature);
     const geometryType = feature?.geometry?.type || "";
-    const featureCategory = String(feature?.properties?.category || "").trim().toLowerCase();
+    const featureCategory = String(feature?.properties?.category || "")
+      .trim()
+      .toLowerCase();
     const zoom = map.getZoom();
 
     if (geometryType.includes("LineString")) {
       let lineWeight = zoom <= 6 ? 2.2 : 1.5;
       if (featureCategory === "transport") {
-        lineWeight = zoom <= 6 ? 4.6 : 3.6;
+        if (zoom <= 5) {
+          lineWeight = 0.8;
+        } else if (zoom <= 7) {
+          lineWeight = 1.2;
+        } else if (zoom <= 9) {
+          lineWeight = 1.8;
+        } else {
+          lineWeight = 3.0;
+        }
       }
       if (featureCategory === "hydrography") {
         lineWeight = zoom <= 6 ? 3.6 : 2.9;
@@ -124,10 +194,15 @@ const geoJsonLayer = L.geoJSON([], {
       }
 
       const props = feature.properties || {};
-      const title = props.admin_name || props.name || props.label || props.category || "Feature";
-      const preferred = POPUP_FIELD_PRIORITY
-        .filter((field) => props[field] != null && props[field] !== "")
-        .map((field) => [field, props[field]]);
+      const title =
+        props.admin_name ||
+        props.name ||
+        props.label ||
+        props.category ||
+        "Feature";
+      const preferred = POPUP_FIELD_PRIORITY.filter(
+        (field) => props[field] != null && props[field] !== "",
+      ).map((field) => [field, props[field]]);
       const fallback = Object.entries(props).filter(
         ([field, value]) =>
           value != null &&
@@ -139,7 +214,9 @@ const geoJsonLayer = L.geoJSON([], {
         .slice(0, 10)
         .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
         .join("<br>");
-      featureLayer.bindPopup(`<div><h4>${title}</h4><div>${details}</div></div>`);
+      featureLayer.bindPopup(
+        `<div><h4>${title}</h4><div>${details}</div></div>`,
+      );
     });
   },
 });
@@ -156,7 +233,7 @@ let activeRequestBbox = null;
 let pendingDeferredLoad = false;
 let activeGeometryDetail = getGeometryDetailForZoom(map.getZoom());
 
-const SMALL_MOVE_RATIO = 0.18;
+const SMALL_MOVE_RATIO = 0.1;
 
 function clearQueuedRequests() {
   if (debounceTimer) {
@@ -183,9 +260,6 @@ function shouldRestrictPlacesToNamed() {
 }
 
 function getGeometryDetailForZoom(zoom) {
-  if (zoom <= 5) {
-    return "z4";
-  }
   if (zoom <= 8) {
     return "z7";
   }
@@ -196,15 +270,59 @@ function getGeometryDetailForZoom(zoom) {
 }
 
 function getRequestLimitForCategory(category) {
-  if (String(category || "").toLowerCase() !== "administrative") {
-    return FRONTEND_LIMIT;
+  const normalizedCategory = String(category || "").toLowerCase();
+  if (normalizedCategory === "administrative") {
+    const detail = getGeometryDetailForZoom(map.getZoom());
+    return ADMIN_LIMIT_BY_DETAIL[detail] || FRONTEND_LIMIT;
   }
-  const detail = getGeometryDetailForZoom(map.getZoom());
-  return ADMIN_LIMIT_BY_DETAIL[detail] || FRONTEND_LIMIT;
+  if (normalizedCategory === "transport") {
+    const zoom = map.getZoom();
+    if (zoom <= 5) {
+      return TRANSPORT_LIMIT_BY_ZOOM.far;
+    }
+    if (zoom <= 7) {
+      return TRANSPORT_LIMIT_BY_ZOOM.mid;
+    }
+    if (zoom <= 9) {
+      return TRANSPORT_LIMIT_BY_ZOOM.near;
+    }
+    return TRANSPORT_LIMIT_BY_ZOOM.full;
+  }
+  return FRONTEND_LIMIT;
+}
+
+function getFeatureGeometryDetail(feature) {
+  return String(feature?.properties?.geom_detail || "full").toLowerCase();
+}
+
+function getFeatureDetailRank(feature) {
+  return GEOMETRY_DETAIL_RANK[getFeatureGeometryDetail(feature)] || 0;
+}
+
+function shouldReplaceCachedFeature(existingFeature, nextFeature) {
+  if (!existingFeature) {
+    return true;
+  }
+
+  const existingRank = getFeatureDetailRank(existingFeature);
+  const nextRank = getFeatureDetailRank(nextFeature);
+  return nextRank > existingRank;
+}
+
+function rememberFeature(feature) {
+  const featureId = makeFeatureId(feature);
+  const existingFeature = featureCache.get(featureId);
+  if (shouldReplaceCachedFeature(existingFeature, feature)) {
+    featureCache.set(featureId, feature);
+    return true;
+  }
+  return false;
 }
 
 function isNamedPlacesRuleSatisfied(feature) {
-  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  const category = String(feature?.properties?.category || "")
+    .trim()
+    .toLowerCase();
   if (category !== "places") {
     return true;
   }
@@ -226,7 +344,33 @@ function isZoomRuleSatisfied(feature) {
 }
 
 function shouldRenderFeature(feature) {
-  return isNamedPlacesRuleSatisfied(feature) && isZoomRuleSatisfied(feature);
+  return (
+    isCategoryGeometryAllowed(feature) &&
+    isNamedPlacesRuleSatisfied(feature) &&
+    isZoomRuleSatisfied(feature)
+  );
+}
+
+function isCategoryGeometryAllowed(feature) {
+  const category = String(feature?.properties?.category || "")
+    .trim()
+    .toLowerCase();
+  const geometryType = String(feature?.geometry?.type || "");
+
+  if (category === "places") {
+    return (
+      geometryType === "Point" ||
+      geometryType === "MultiPoint" ||
+      geometryType === "Polygon" ||
+      geometryType === "MultiPolygon"
+    );
+  }
+
+  if (category === "administrative") {
+    return geometryType === "Polygon" || geometryType === "MultiPolygon";
+  }
+
+  return true;
 }
 
 function getBboxFromMap() {
@@ -244,8 +388,14 @@ function isSmallBboxMove(previousBbox, nextBbox) {
     return false;
   }
 
-  const prevWidth = Math.max(1e-9, Math.abs(previousBbox.east - previousBbox.west));
-  const prevHeight = Math.max(1e-9, Math.abs(previousBbox.north - previousBbox.south));
+  const prevWidth = Math.max(
+    1e-9,
+    Math.abs(previousBbox.east - previousBbox.west),
+  );
+  const prevHeight = Math.max(
+    1e-9,
+    Math.abs(previousBbox.north - previousBbox.south),
+  );
 
   const prevCx = (previousBbox.east + previousBbox.west) / 2;
   const prevCy = (previousBbox.north + previousBbox.south) / 2;
@@ -304,7 +454,11 @@ function walkCoordinates(node, extents) {
     return;
   }
 
-  if (node.length >= 2 && typeof node[0] === "number" && typeof node[1] === "number") {
+  if (
+    node.length >= 2 &&
+    typeof node[0] === "number" &&
+    typeof node[1] === "number"
+  ) {
     updateExtents(extents, Number(node[0]), Number(node[1]));
     return;
   }
@@ -329,10 +483,10 @@ function getGeometryExtents(geometry) {
   walkCoordinates(geometry.coordinates, extents);
 
   if (
-    !Number.isFinite(extents.minLon)
-    || !Number.isFinite(extents.maxLon)
-    || !Number.isFinite(extents.minLat)
-    || !Number.isFinite(extents.maxLat)
+    !Number.isFinite(extents.minLon) ||
+    !Number.isFinite(extents.maxLon) ||
+    !Number.isFinite(extents.minLat) ||
+    !Number.isFinite(extents.maxLat)
   ) {
     return null;
   }
@@ -394,12 +548,20 @@ function renderCacheForViewport() {
   return addFeatures(batch);
 }
 
+function clearRenderedFeatures() {
+  renderedFeatureIds.clear();
+  geoJsonLayer.clearLayers();
+}
+
 function pruneNonVisiblePlottedFeatures() {
   const bounds = map.getBounds();
   const toRemove = [];
 
   geoJsonLayer.eachLayer((layer) => {
-    if (layerInBounds(layer, bounds) && shouldRenderFeature(layer.feature || {})) {
+    if (
+      layerInBounds(layer, bounds) &&
+      shouldRenderFeature(layer.feature || {})
+    ) {
       return;
     }
 
@@ -420,7 +582,13 @@ function updateStats(prefix = "") {
   statsEl.textContent = prefix ? `${prefix} | ${text}` : text;
 }
 
-async function streamCurrentViewport(requestBbox = null) {
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function streamCurrentViewport(requestBbox = null, retryCount = 0) {
   const bbox = requestBbox || getBboxFromMap();
 
   if (activeController) {
@@ -449,7 +617,10 @@ async function streamCurrentViewport(requestBbox = null) {
   if (category) {
     params.set("category", category);
   }
-  if ((!category || category.toLowerCase() === "places") && shouldRestrictPlacesToNamed()) {
+  if (
+    (!category || category.toLowerCase() === "places") &&
+    shouldRestrictPlacesToNamed()
+  ) {
     params.set("places_named_only", "true");
   }
 
@@ -463,6 +634,17 @@ async function streamCurrentViewport(requestBbox = null) {
         Accept: "application/x-ndjson",
       },
     });
+
+    if (response.status === 429 && retryCount < 3) {
+      updateStats("Server busy: replacing oldest request");
+      if (activeController === controller) {
+        activeController = null;
+        activeRequestBbox = null;
+      }
+      await delay(180 * (retryCount + 1));
+      void streamCurrentViewport(bbox, retryCount + 1);
+      return;
+    }
 
     if (!response.ok || !response.body) {
       throw new Error(`API error ${response.status}`);
@@ -502,14 +684,20 @@ async function streamCurrentViewport(requestBbox = null) {
         }
 
         const featureId = makeFeatureId(parsed);
+        const cacheReplaced = rememberFeature(parsed);
         if (!shouldRenderFeature(parsed)) {
           continue;
         }
-        if (!featureCache.has(featureId)) {
-          featureCache.set(featureId, parsed);
-        }
 
-        if (!renderedFeatureIds.has(featureId) && featureInBounds(parsed, map.getBounds())) {
+        if (
+          (!renderedFeatureIds.has(featureId) || cacheReplaced) &&
+          featureInBounds(parsed, map.getBounds())
+        ) {
+          if (cacheReplaced && renderedFeatureIds.has(featureId)) {
+            clearRenderedFeatures();
+            streamAdded += renderCacheForViewport();
+            continue;
+          }
           batch.push(parsed);
           if (batch.length >= BATCH_SIZE) {
             streamAdded += addFeatures(batch);
@@ -525,11 +713,17 @@ async function streamCurrentViewport(requestBbox = null) {
         const parsed = JSON.parse(textBuffer.trim());
         if (!(parsed.meta && parsed.meta.done) && shouldRenderFeature(parsed)) {
           const featureId = makeFeatureId(parsed);
-          if (!featureCache.has(featureId)) {
-            featureCache.set(featureId, parsed);
-          }
-          if (!renderedFeatureIds.has(featureId) && featureInBounds(parsed, map.getBounds())) {
-            batch.push(parsed);
+          const cacheReplaced = rememberFeature(parsed);
+          if (
+            (!renderedFeatureIds.has(featureId) || cacheReplaced) &&
+            featureInBounds(parsed, map.getBounds())
+          ) {
+            if (cacheReplaced && renderedFeatureIds.has(featureId)) {
+              clearRenderedFeatures();
+              streamAdded += renderCacheForViewport();
+            } else {
+              batch.push(parsed);
+            }
           }
         }
       } catch {
@@ -569,14 +763,14 @@ function runLoadCycle() {
   const nextGeometryDetail = getGeometryDetailForZoom(map.getZoom());
   if (nextGeometryDetail !== activeGeometryDetail) {
     activeGeometryDetail = nextGeometryDetail;
-    resetCachesAndLayer(false);
+    clearRenderedFeatures();
   }
   loadFeatures();
 }
 
 function scheduleLoad() {
   clearQueuedRequests();
-  debounceTimer = setTimeout(runLoadCycle, 250);
+  debounceTimer = setTimeout(runLoadCycle, MOVE_DEBOUNCE_MS);
 }
 
 function resetCachesAndLayer(showMessage = true) {

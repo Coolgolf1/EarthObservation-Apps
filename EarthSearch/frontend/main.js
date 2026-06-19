@@ -1,34 +1,35 @@
 const isLocalStaticFrontend =
-  (window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost")
-  && window.location.port !== "8000";
+  (window.location.hostname === "127.0.0.1" ||
+    window.location.hostname === "localhost") &&
+  window.location.port !== "8080";
 
-const API_BASE = (window.location.protocol === "file:" || isLocalStaticFrontend)
-  ? "http://127.0.0.1:8000"
-  : window.location.origin;
-const MAPBOX_TOKEN = "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
+const API_BASE =
+  window.location.protocol === "file:" || isLocalStaticFrontend
+    ? "http://127.0.0.1:8080"
+    : window.location.origin;
+const MAPBOX_TOKEN =
+  "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
 
 function isHydroFeatureAllowed(feature) {
   const geometryType = String(feature?.geometry?.type || "");
   const props = feature?.properties || {};
-  const text = `${String(props.name || "")} ${String(props.subcategory || "")}`.toLowerCase();
+  const text =
+    `${String(props.name || "")} ${String(props.subcategory || "")}`.toLowerCase();
 
   if (geometryType.includes("LineString")) {
     if (text.includes("coast") || text.includes("shore")) {
       return false;
     }
     return (
-      text.includes("river")
-      || text.includes("stream")
-      || text.includes("canal")
-      || text.includes("waterway")
+      text.includes("river") ||
+      text.includes("stream") ||
+      text.includes("canal") ||
+      text.includes("waterway")
     );
   }
 
   if (geometryType.includes("Polygon")) {
-    return (
-      text.includes("ocean")
-      || text.includes("sea")
-    );
+    return text.includes("ocean") || text.includes("sea");
   }
 
   return false;
@@ -75,11 +76,36 @@ const STREAMING_LIMIT = 50000;
 const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;
 
 const CATEGORY_STYLE = {
-  hydrography: { stroke: "#1f77b4", fill: "#4aa3df", point: "#1f77b4", fillOpacity: 0.7 },
-  administrative: { stroke: "#2ca25f", fill: "transparent", point: "#2ca25f", fillOpacity: 0.0 },
-  transport: { stroke: "#facc15", fill: "#facc15", point: "#facc15", fillOpacity: 0.45 },
-  places: { stroke: "#f59e0b", fill: "#f59e0b", point: "#f59e0b", fillOpacity: 0.35 },
-  default: { stroke: "#1d3557", fill: "#2a9d8f", point: "#0f5132", fillOpacity: 0.35 },
+  hydrography: {
+    stroke: "#1f77b4",
+    fill: "#4aa3df",
+    point: "#1f77b4",
+    fillOpacity: 0.7,
+  },
+  administrative: {
+    stroke: "#2ca25f",
+    fill: "transparent",
+    point: "#2ca25f",
+    fillOpacity: 0.0,
+  },
+  transport: {
+    stroke: "#facc15",
+    fill: "#facc15",
+    point: "#facc15",
+    fillOpacity: 0.45,
+  },
+  places: {
+    stroke: "#f59e0b",
+    fill: "#f59e0b",
+    point: "#f59e0b",
+    fillOpacity: 0.35,
+  },
+  default: {
+    stroke: "#1d3557",
+    fill: "#2a9d8f",
+    point: "#0f5132",
+    fillOpacity: 0.35,
+  },
 };
 
 const map = L.map("map", {
@@ -101,7 +127,9 @@ map.getPane("reachAreaPane").style.pointerEvents = "none";
 const canvasRenderer = L.canvas({ padding: 0.5 });
 
 function getCategoryPane(category) {
-  const cat = String(category || "").trim().toLowerCase();
+  const cat = String(category || "")
+    .trim()
+    .toLowerCase();
   if (cat === "places") {
     return "placesPane";
   }
@@ -117,14 +145,18 @@ function getCategoryPane(category) {
   return "overlayPane";
 }
 
-L.tileLayer("https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}", {
-  id: "mapbox/satellite-streets-v12",
-  accessToken: MAPBOX_TOKEN,
-  tileSize: 512,
-  zoomOffset: -1,
-  maxZoom: 20,
-  attribution: '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-}).addTo(map);
+L.tileLayer(
+  "https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}",
+  {
+    id: "mapbox/satellite-streets-v12",
+    accessToken: MAPBOX_TOKEN,
+    tileSize: 512,
+    zoomOffset: -1,
+    maxZoom: 20,
+    attribution:
+      '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  },
+).addTo(map);
 
 const statsEl = document.getElementById("stats");
 const formEl = document.getElementById("search-form");
@@ -142,7 +174,9 @@ const confirmPointBtnEl = document.getElementById("confirm-point-btn");
 const geoJsonLayer = L.geoJSON([], {
   renderer: canvasRenderer,
   style: (feature) => {
-    const cat = String(feature?.properties?.category || "").trim().toLowerCase();
+    const cat = String(feature?.properties?.category || "")
+      .trim()
+      .toLowerCase();
     const palette = CATEGORY_STYLE[cat] || CATEGORY_STYLE.default;
     const geometryType = feature?.geometry?.type || "";
     const zoom = map.getZoom();
@@ -182,7 +216,9 @@ const geoJsonLayer = L.geoJSON([], {
     };
   },
   pointToLayer: (feature, latlng) => {
-    const cat = String(feature?.properties?.category || "").trim().toLowerCase();
+    const cat = String(feature?.properties?.category || "")
+      .trim()
+      .toLowerCase();
     const palette = CATEGORY_STYLE[cat] || CATEGORY_STYLE.default;
     return L.circleMarker(latlng, {
       pane: getCategoryPane(cat),
@@ -266,7 +302,11 @@ function sleep(ms) {
   });
 }
 
-async function fetchWith429Retry(url, options, { retries = 1, retryDelayMs = 1000 } = {}) {
+async function fetchWith429Retry(
+  url,
+  options,
+  { retries = 1, retryDelayMs = 1000 } = {},
+) {
   let attempt = 0;
   while (true) {
     const response = await fetch(url, options);
@@ -284,7 +324,12 @@ function updateStats(text) {
 
 function getMapBoundsArray() {
   const bounds = map.getBounds();
-  return [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+  return [
+    bounds.getWest(),
+    bounds.getSouth(),
+    bounds.getEast(),
+    bounds.getNorth(),
+  ];
 }
 
 function applyAreaModeUI() {
@@ -311,8 +356,13 @@ function applyAreaModeUI() {
 }
 
 function updateBBoxDrawUI() {
-  bboxDrawToggleEl.textContent = bboxDrawMode ? "Stop Polygon Select" : "Start Polygon Select";
-  bboxDrawToggleEl.setAttribute("aria-pressed", bboxDrawMode ? "true" : "false");
+  bboxDrawToggleEl.textContent = bboxDrawMode
+    ? "Stop Polygon Select"
+    : "Start Polygon Select";
+  bboxDrawToggleEl.setAttribute(
+    "aria-pressed",
+    bboxDrawMode ? "true" : "false",
+  );
 
   const hideAreaInputs = bboxDrawMode;
   areaValueLabelEl.style.display = hideAreaInputs ? "none" : "";
@@ -367,7 +417,7 @@ function clearPendingPoint() {
 }
 
 function _cross(o, a, b) {
-  return ((a.lng - o.lng) * (b.lat - o.lat)) - ((a.lat - o.lat) * (b.lng - o.lng));
+  return (a.lng - o.lng) * (b.lat - o.lat) - (a.lat - o.lat) * (b.lng - o.lng);
 }
 
 function computeConvexHull(points) {
@@ -384,7 +434,10 @@ function computeConvexHull(points) {
 
   const lower = [];
   for (const p of sorted) {
-    while (lower.length >= 2 && _cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) {
+    while (
+      lower.length >= 2 &&
+      _cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0
+    ) {
       lower.pop();
     }
     lower.push(p);
@@ -393,7 +446,10 @@ function computeConvexHull(points) {
   const upper = [];
   for (let i = sorted.length - 1; i >= 0; i -= 1) {
     const p = sorted[i];
-    while (upper.length >= 2 && _cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) {
+    while (
+      upper.length >= 2 &&
+      _cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0
+    ) {
       upper.pop();
     }
     upper.push(p);
@@ -438,29 +494,37 @@ function redrawBBoxSelection() {
   const hull = computeConvexHull(bboxDrawPoints);
 
   if (hull.length >= 2) {
-    L.polyline(hull.map((p) => [p.lat, p.lng]), {
-      color: "#1f2937",
-      weight: 2,
-      dashArray: "6 4",
-      interactive: false,
-    }).addTo(bboxSelectionLayer);
+    L.polyline(
+      hull.map((p) => [p.lat, p.lng]),
+      {
+        color: "#1f2937",
+        weight: 2,
+        dashArray: "6 4",
+        interactive: false,
+      },
+    ).addTo(bboxSelectionLayer);
   }
 
   if (hull.length >= 3) {
-    L.polygon(hull.map((p) => [p.lat, p.lng]), {
-      color: "#1f2937",
-      weight: 2,
-      fillColor: "#60a5fa",
-      fillOpacity: 0.12,
-      interactive: false,
-    }).addTo(bboxSelectionLayer);
+    L.polygon(
+      hull.map((p) => [p.lat, p.lng]),
+      {
+        color: "#1f2937",
+        weight: 2,
+        fillColor: "#60a5fa",
+        fillOpacity: 0.12,
+        interactive: false,
+      },
+    ).addTo(bboxSelectionLayer);
   }
 
   refreshConfirmButtonVisibility();
 }
 
 function getAreaSelection() {
-  const normalizedValue = String(areaValueEl.value || "").replace(",", ".").trim();
+  const normalizedValue = String(areaValueEl.value || "")
+    .replace(",", ".")
+    .trim();
   const raw = Number(normalizedValue);
   if (areaMode === "radius") {
     return {
@@ -487,20 +551,28 @@ function syncControlsFromIntent(intent) {
     areaMode = "radius";
     const resolvedRadiusKm = Number(intent.radius_km);
     if (Number.isFinite(resolvedRadiusKm)) {
-      areaValueEl.value = String(Math.max(0.5, Math.min(500, resolvedRadiusKm)));
+      areaValueEl.value = String(
+        Math.max(0.5, Math.min(500, resolvedRadiusKm)),
+      );
     }
   } else {
     areaMode = "time";
     const resolvedMinutes = Number(intent.minutes);
     if (Number.isFinite(resolvedMinutes)) {
-      areaValueEl.value = String(Math.max(1, Math.min(240, Math.round(resolvedMinutes))));
+      areaValueEl.value = String(
+        Math.max(1, Math.min(240, Math.round(resolvedMinutes))),
+      );
     }
   }
 
   applyAreaModeUI();
 
-  const resolvedVehicle = String(intent.vehicle || "").trim().toLowerCase();
-  if (["walking", "cycling", "driving", "driving-hgv"].includes(resolvedVehicle)) {
+  const resolvedVehicle = String(intent.vehicle || "")
+    .trim()
+    .toLowerCase();
+  if (
+    ["walking", "cycling", "driving", "driving-hgv"].includes(resolvedVehicle)
+  ) {
     vehicleEl.value = resolvedVehicle;
   }
 }
@@ -551,7 +623,9 @@ function shouldRestrictPlacesToNamed() {
 }
 
 function isSeaOrOceanFeature(feature) {
-  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  const category = String(feature?.properties?.category || "")
+    .trim()
+    .toLowerCase();
   if (category !== "hydrography") {
     return false;
   }
@@ -562,18 +636,24 @@ function isSeaOrOceanFeature(feature) {
   }
 
   const props = feature?.properties || {};
-  const text = `${String(props.name || "")} ${String(props.subcategory || "")}`.toLowerCase();
+  const text =
+    `${String(props.name || "")} ${String(props.subcategory || "")}`.toLowerCase();
   return text.includes("sea") || text.includes("ocean");
 }
 
 function featureEligibleForSearchCache(feature) {
-  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  const category = String(feature?.properties?.category || "")
+    .trim()
+    .toLowerCase();
   const spec = _findCategorySpec(category);
   if (!spec) {
     return false;
   }
 
-  if (typeof spec.featureFilter === "function" && !spec.featureFilter(feature)) {
+  if (
+    typeof spec.featureFilter === "function" &&
+    !spec.featureFilter(feature)
+  ) {
     return false;
   }
 
@@ -581,7 +661,9 @@ function featureEligibleForSearchCache(feature) {
 }
 
 function featureVisibleAtCurrentZoom(feature) {
-  const category = String(feature?.properties?.category || "").trim().toLowerCase();
+  const category = String(feature?.properties?.category || "")
+    .trim()
+    .toLowerCase();
   if (category !== "places") {
     return true;
   }
@@ -693,7 +775,12 @@ function bboxContainsPoint(bbox, lon, lat) {
   if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
     return false;
   }
-  return lon >= bbox.west && lon <= bbox.east && lat >= bbox.south && lat <= bbox.north;
+  return (
+    lon >= bbox.west &&
+    lon <= bbox.east &&
+    lat >= bbox.south &&
+    lat <= bbox.north
+  );
 }
 
 function updateExtents(extents, lon, lat) {
@@ -711,7 +798,11 @@ function walkCoordinates(node, extents) {
     return;
   }
 
-  if (node.length >= 2 && typeof node[0] === "number" && typeof node[1] === "number") {
+  if (
+    node.length >= 2 &&
+    typeof node[0] === "number" &&
+    typeof node[1] === "number"
+  ) {
     updateExtents(extents, Number(node[0]), Number(node[1]));
     return;
   }
@@ -736,10 +827,10 @@ function getGeometryExtents(geometry) {
   walkCoordinates(geometry.coordinates, extents);
 
   if (
-    !Number.isFinite(extents.minLon)
-    || !Number.isFinite(extents.maxLon)
-    || !Number.isFinite(extents.minLat)
-    || !Number.isFinite(extents.maxLat)
+    !Number.isFinite(extents.minLon) ||
+    !Number.isFinite(extents.maxLon) ||
+    !Number.isFinite(extents.minLat) ||
+    !Number.isFinite(extents.maxLat)
   ) {
     return null;
   }
@@ -753,10 +844,10 @@ function extentsIntersectBbox(extents, bbox) {
   }
 
   return !(
-    extents.maxLon < bbox.west
-    || extents.minLon > bbox.east
-    || extents.maxLat < bbox.south
-    || extents.minLat > bbox.north
+    extents.maxLon < bbox.west ||
+    extents.minLon > bbox.east ||
+    extents.maxLat < bbox.south ||
+    extents.minLat > bbox.north
   );
 }
 
@@ -777,7 +868,18 @@ function _findCategorySpec(category) {
   return SEARCH_CATEGORIES.find((s) => s.category === category) || null;
 }
 
-async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProgress, clientId, searchId, countsByLabel, addedRef, limit }) {
+async function streamSingleCategory({
+  bbox,
+  spec,
+  signal,
+  shouldContinue,
+  onProgress,
+  clientId,
+  searchId,
+  countsByLabel,
+  addedRef,
+  limit,
+}) {
   if (!shouldContinue()) {
     throw new DOMException("Search cancelled", "AbortError");
   }
@@ -793,15 +895,19 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
     params.set("places_named_only", "true");
   }
 
-  const response = await fetchWith429Retry(`${API_BASE}/features/stream?${params.toString()}`, {
-    signal,
-    headers: {
-      Accept: "application/x-ndjson",
+  const response = await fetchWith429Retry(
+    `${API_BASE}/features/stream?${params.toString()}`,
+    {
+      signal,
+      headers: {
+        Accept: "application/x-ndjson",
+      },
     },
-  }, {
-    retries: 1,
-    retryDelayMs: 1000,
-  });
+    {
+      retries: 1,
+      retryDelayMs: 1000,
+    },
+  );
 
   if (!response.ok || !response.body) {
     throw new Error(`Stream API error ${response.status} for ${spec.label}`);
@@ -848,11 +954,18 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
         continue;
       }
 
-      if (typeof spec.featureFilter === "function" && !spec.featureFilter(parsed)) {
+      if (
+        typeof spec.featureFilter === "function" &&
+        !spec.featureFilter(parsed)
+      ) {
         continue;
       }
 
-      if (spec.category === "places" && shouldRestrictPlacesToNamed() && !hasNonEmptyFeatureName(parsed)) {
+      if (
+        spec.category === "places" &&
+        shouldRestrictPlacesToNamed() &&
+        !hasNonEmptyFeatureName(parsed)
+      ) {
         continue;
       }
 
@@ -878,12 +991,17 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
       const parsed = JSON.parse(textBuffer.trim());
       if (!(parsed.meta && parsed.meta.done)) {
         if (
-          (typeof spec.featureFilter !== "function" || spec.featureFilter(parsed))
-          && (!(spec.category === "places" && shouldRestrictPlacesToNamed()) || hasNonEmptyFeatureName(parsed))
-          && featureRelevantToBbox(parsed, bbox)
+          (typeof spec.featureFilter !== "function" ||
+            spec.featureFilter(parsed)) &&
+          (!(spec.category === "places" && shouldRestrictPlacesToNamed()) ||
+            hasNonEmptyFeatureName(parsed)) &&
+          featureRelevantToBbox(parsed, bbox)
         ) {
           batch.push(parsed);
-          countsByLabel.set(spec.label, (countsByLabel.get(spec.label) || 0) + 1);
+          countsByLabel.set(
+            spec.label,
+            (countsByLabel.get(spec.label) || 0) + 1,
+          );
         }
       }
     } catch {
@@ -899,7 +1017,14 @@ async function streamSingleCategory({ bbox, spec, signal, shouldContinue, onProg
   onProgress(addedRef.value, countsByLabel);
 }
 
-async function streamCombined({ bbox, signal, shouldContinue, onProgress, clientId, searchId }) {
+async function streamCombined({
+  bbox,
+  signal,
+  shouldContinue,
+  onProgress,
+  clientId,
+  searchId,
+}) {
   const countsByLabel = new Map(SEARCH_CATEGORIES.map((s) => [s.label, 0]));
   const addedRef = { value: 0 };
 
@@ -929,9 +1054,10 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
   cancelPending();
   clearPendingPoint();
   const localRunVersion = runVersion;
-  const searchId = (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function")
-    ? globalThis.crypto.randomUUID()
-    : `search-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const searchId =
+    globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `search-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   const controller = new AbortController();
   activeController = controller;
@@ -939,30 +1065,39 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
   updateStats(loadingMessage);
 
   try {
-    const response = await fetchWith429Retry(`${API_BASE}${endpoint}`, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
+    const response = await fetchWith429Retry(
+      `${API_BASE}${endpoint}`,
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          ...body,
+          client_id: clientSessionId,
+          search_id: searchId,
+        }),
       },
-      body: JSON.stringify({
-        ...body,
-        client_id: clientSessionId,
-        search_id: searchId,
-      }),
-    }, {
-      retries: 1,
-      retryDelayMs: 1000,
-    });
+      {
+        retries: 1,
+        retryDelayMs: 1000,
+      },
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
-      const compactError = String(errorText || "request failed").replace(/\s+/g, " ").trim();
+      const compactError = String(errorText || "request failed")
+        .replace(/\s+/g, " ")
+        .trim();
       const staticServerHint =
-        response.status === 501 && /Unsupported method \('POST'\)/i.test(compactError)
+        response.status === 501 &&
+        /Unsupported method \('POST'\)/i.test(compactError)
           ? " The request likely went to a static frontend server instead of FastAPI."
           : "";
-      throw new Error(`API error ${response.status}: ${compactError}${staticServerHint}`);
+      throw new Error(
+        `API error ${response.status}: ${compactError}${staticServerHint}`,
+      );
     }
 
     const payload = await response.json();
@@ -974,7 +1109,11 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
 
     clearMap();
 
-    if (payload.reach_area && payload.reach_area.type && payload.reach_area.coordinates) {
+    if (
+      payload.reach_area &&
+      payload.reach_area.type &&
+      payload.reach_area.coordinates
+    ) {
       reachAreaLayer.addData({
         type: "Feature",
         geometry: payload.reach_area,
@@ -983,25 +1122,40 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
       keepReachAreaOnTop();
     }
 
-    if (payload.center && Number.isFinite(Number(payload.center.lat)) && Number.isFinite(Number(payload.center.lon))) {
+    if (
+      payload.center &&
+      Number.isFinite(Number(payload.center.lat)) &&
+      Number.isFinite(Number(payload.center.lon))
+    ) {
       const starIcon = L.divIcon({
         className: "center-star-icon",
         html: "<span>★</span>",
         iconSize: [22, 22],
         iconAnchor: [11, 11],
       });
-      L.marker([Number(payload.center.lat), Number(payload.center.lon)], { icon: starIcon })
+      L.marker([Number(payload.center.lat), Number(payload.center.lon)], {
+        icon: starIcon,
+      })
         .bindPopup(`Center (${payload.center_source || "geocoder"})`)
         .addTo(centerMarkerLayer);
     }
 
-    const bboxValues = Array.isArray(payload.bbox) ? payload.bbox.map((v) => Number(v)) : null;
-    if (!bboxValues || bboxValues.length !== 4 || !bboxValues.every(Number.isFinite)) {
+    const bboxValues = Array.isArray(payload.bbox)
+      ? payload.bbox.map((v) => Number(v))
+      : null;
+    if (
+      !bboxValues ||
+      bboxValues.length !== 4 ||
+      !bboxValues.every(Number.isFinite)
+    ) {
       updateStats("No valid bbox returned.");
       return;
     }
 
-    const fitBounds = L.latLngBounds([bboxValues[1], bboxValues[0]], [bboxValues[3], bboxValues[2]]);
+    const fitBounds = L.latLngBounds(
+      [bboxValues[1], bboxValues[0]],
+      [bboxValues[3], bboxValues[2]],
+    );
     const searchBbox = {
       west: fitBounds.getWest(),
       south: fitBounds.getSouth(),
@@ -1015,18 +1169,20 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
         return;
       }
 
-      const shouldContinue = () => localRunVersion === runVersion && !controller.signal.aborted;
+      const shouldContinue = () =>
+        localRunVersion === runVersion && !controller.signal.aborted;
       const progress = new Map(SEARCH_CATEGORIES.map((s) => [s.label, 0]));
 
       const intent = payload.parsed_intent || {};
       const mode = intent.mode || "default";
-      const modeText = mode === "radius"
-        ? `${Number(intent.radius_km || 0).toFixed(1)} km radius`
-        : `${Number(intent.minutes || 0)} min ${intent.vehicle || "driving"}`;
+      const modeText =
+        mode === "radius"
+          ? `${Number(intent.radius_km || 0).toFixed(1)} km radius`
+          : `${Number(intent.minutes || 0)} min ${intent.vehicle || "driving"}`;
 
       const cachedAdded = loadCachedFeaturesForBbox(searchBbox);
       updateStats(
-        `Using cache +${cachedAdded}. Streaming categories for ${payload.place_name || "location"} (${modeText})...`
+        `Using cache +${cachedAdded}. Streaming categories for ${payload.place_name || "location"} (${modeText})...`,
       );
 
       streamInFlight = true;
@@ -1046,13 +1202,17 @@ async function runSearchRequest({ endpoint, body, loadingMessage }) {
           const details = Array.from(progress.entries())
             .map(([label, value]) => `${label}: +${value}`)
             .join(" | ");
-          updateStats(`${details} | cache +${cachedAdded} | streamed +${loadedTotal} | total +${cachedAdded + loadedTotal}`);
+          updateStats(
+            `${details} | cache +${cachedAdded} | streamed +${loadedTotal} | total +${cachedAdded + loadedTotal}`,
+          );
         },
       });
 
       streamInFlight = false;
 
-      updateStats(`Done (${payload.parser_mode || "agent"}). Cached +${cachedAdded} | streamed +${total} | total plotted: ${cachedAdded + total}`);
+      updateStats(
+        `Done (${payload.parser_mode || "agent"}). Cached +${cachedAdded} | streamed +${total} | total plotted: ${cachedAdded + total}`,
+      );
     };
 
     // Fit immediately and start loading right away for a snappy submit action.
@@ -1080,7 +1240,9 @@ async function runSearch() {
 
   const prompt = promptEl.value.trim();
   if (!prompt) {
-    updateStats("Provide a location prompt, or draw a bbox and press Run search.");
+    updateStats(
+      "Provide a location prompt, or draw a bbox and press Run search.",
+    );
     return;
   }
 
@@ -1148,7 +1310,9 @@ bboxDrawToggleEl.addEventListener("click", () => {
   }
   updateBBoxDrawUI();
   if (bboxDrawMode) {
-    updateStats("Polygon select enabled: click multiple spots on the map, then press Run search.");
+    updateStats(
+      "Polygon select enabled: click multiple spots on the map, then press Run search.",
+    );
   }
 });
 
@@ -1190,7 +1354,7 @@ map.on("click", (event) => {
     const selectedPolygon = getPolygonFromPoints();
     if (selectedPolygon) {
       updateStats(
-        `Polygon ready (${selectedPolygon.length} points). Press Run search to load.`
+        `Polygon ready (${selectedPolygon.length} points). Press Run search to load.`,
       );
     } else {
       updateStats("Polygon point added. Add at least two more points.");
