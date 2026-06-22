@@ -1,11 +1,11 @@
 const isLocalStaticFrontend =
   (window.location.hostname === "127.0.0.1" ||
     window.location.hostname === "localhost") &&
-  window.location.port !== "8080";
+  window.location.port !== "8000";
 
 const API_BASE =
   window.location.protocol === "file:" || isLocalStaticFrontend
-    ? "http://127.0.0.1:8080"
+    ? "http://127.0.0.1:8000"
     : window.location.origin;
 const MAPBOX_TOKEN =
   "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";

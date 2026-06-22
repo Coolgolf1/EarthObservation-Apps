@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EarthAnalyser Fire Timeline</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=Outfit:wght@500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="panel">
+        <h1>EarthAnalyser Fire</h1>
+        <p class="subtitle">MODIS 14A2 fire timeline inside your bbox</p>
+
+        <div class="group">
+          <label for="date-start">Start date</label>
+          <input id="date-start" type="date" value="2021-07-01" />
+          <label for="date-end">End date</label>
+          <input id="date-end" type="date" value="2021-09-10" />
+          <label for="confidence">Minimum confidence</label>
+          <select id="confidence">
+            <option value="7">Low+ (7, 8, 9)</option>
+            <option value="8" selected>Nominal+ (8, 9)</option>
+            <option value="9">High (9)</option>
+          </select>
+        </div>
+
+        <div class="group">
+          <label>Bbox selection</label>
+          <div class="row">
+            <button type="button" id="bbox-toggle">Start Bbox Select</button>
+            <button type="button" id="bbox-clear" class="ghost">Clear</button>
+          </div>
+          <small>Click 3+ points on map to draw a polygon. Its envelope is used as bbox.</small>
+        </div>
+
+        <div class="group">
+          <button type="button" id="load-fire">Load fire detections</button>
+        </div>
+
+        <div class="group timeline-wrap">
+          <label for="timeline">Day timeline</label>
+          <input id="timeline" type="range" min="0" max="0" step="1" value="0" disabled />
+          <div class="timeline-meta">
+            <span id="timeline-day">No data loaded</span>
+            <span id="timeline-count">0 points</span>
+          </div>
+          <div class="row">
+            <button type="button" id="prev-day" class="ghost">Prev</button>
+            <button type="button" id="play">Play</button>
+            <button type="button" id="pause" class="ghost">Pause</button>
+            <button type="button" id="next-day" class="ghost">Next</button>
+          </div>
+        </div>
+
+        <div id="status" class="status">Draw bbox or use current map bounds, then load fire detections.</div>
+      </aside>
+
+      <main class="map-area">
+        <div id="map"></div>
+      </main>
+    </div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="main.js" type="module"></script>
+  </body>
+</html>
