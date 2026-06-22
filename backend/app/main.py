@@ -5,6 +5,7 @@ from pathlib import Path
 from .routers.health import router as health_router
 from .routers.features import router as features_router
 from .routers.planet import router as planet_router
+from .routers.fire import router as fire_router
 
 app = FastAPI()
 
@@ -15,6 +16,8 @@ app.add_middleware(
 		"http://localhost:5500",
 		"http://127.0.0.1:5600",
 		"http://localhost:5600",
+		"http://127.0.0.1:5700",
+		"http://localhost:5700",
 		"http://127.0.0.1:5173",
 		"http://localhost:5173",
 	],
@@ -26,9 +29,15 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(features_router)
 app.include_router(planet_router)
+app.include_router(fire_router)
 
 repo_root = Path(__file__).resolve().parents[2]
 earthsearch_frontend_dir = repo_root / "EarthSearch" / "frontend"
+earthanalyser_frontend_dir = repo_root / "EarthAnalyser" / "frontend"
+
+if earthanalyser_frontend_dir.exists():
+	# Serve the fire visualizer without replacing the default EarthSearch root UI.
+	app.mount("/fireapp", StaticFiles(directory=earthanalyser_frontend_dir, html=True), name="earthanalyser_frontend")
 
 if earthsearch_frontend_dir.exists():
 	# Serve EarthSearch UI from root while preserving API routes.
