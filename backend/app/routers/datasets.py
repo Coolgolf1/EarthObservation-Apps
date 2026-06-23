@@ -187,6 +187,17 @@ def _build_datetime_steps(start: date, end: date, max_items: int) -> list[date]:
     return [start + timedelta(days=int(i * step)) for i in range(max_items)]
 
 
+def _item_acq_date(item, fallback: date) -> str:
+    """Extract acquisition date from a STAC item, handling various datetime fields."""
+    if getattr(item, "datetime", None):
+        return item.datetime.date().isoformat()
+    # MODIS and other products use start_datetime in properties
+    start_dt = (item.properties or {}).get("start_datetime")
+    if start_dt:
+        return start_dt[:10]  # "2024-05-26T00:00:00Z" → "2024-05-26"
+    return fallback.isoformat()
+
+
 def _window_for_bbox(ds, bbox_wgs84: list[float]):
     west, south, east, north = bbox_wgs84
     minx, miny, maxx, maxy = transform_bounds(
@@ -549,11 +560,7 @@ async def query_datasets_h3(payload: DatasetH3Request):
                     if item.id in seen_items:
                         continue
                     seen_items.add(item.id)
-                    acq_date = (
-                        item.datetime.date().isoformat()
-                        if getattr(item, "datetime", None)
-                        else payload.date_start.isoformat()
-                    )
+                    acq_date = _item_acq_date(item, payload.date_start)
                     items_by_date.setdefault(acq_date, []).append(item)
 
                 # Process all items concurrently (semaphore limits raster I/O)
@@ -677,7 +684,7 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
             }
             yield json.dumps(header) + "\n"
 
-            # Process all datasets concurrently, yield each as it finishes
+            # Process all datasets concurrently, stream frames as they arrive
             queue: asyncio.Queue[str | None] = asyncio.Queue()
 
             async def process_one_dataset(dataset_key: str) -> None:
@@ -687,7 +694,7 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                 is_static = dataset_key in ("landuse", "flood")
                 ds_h3_res = min(h3_res, config.get("max_h3_res", h3_res))
 
-                dataset_frames: list[dict[str, Any]] = []
+                frames_count = 0
                 aggregate_hex: dict[str, dict[str, Any]] = {}
                 seen_items: set[str] = set()
 
@@ -707,6 +714,28 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                                 return v
                     return asset
 
+                def _accumulate_aggregate(hexes):
+                    for h in hexes:
+                        cell_id = h["h3"]
+                        if cell_id not in aggregate_hex:
+                            aggregate_hex[cell_id] = {
+                                **h,
+                                "days_active": 0,
+                                "total_pixels": 0,
+                                "_value_sum": 0.0,
+                                "_value_count": 0,
+                            }
+                        agg = aggregate_hex[cell_id]
+                        agg["days_active"] = agg.get("days_active", 0) + 1
+                        agg["total_pixels"] = agg.get("total_pixels", 0) + h["pixel_count"]
+                        agg["_value_sum"] = agg.get("_value_sum", 0.0) + h["value_mean"] * h["pixel_count"]
+                        agg["_value_count"] = agg.get("_value_count", 0) + h["pixel_count"]
+                        if h["value_max"] > agg["value_max"]:
+                            agg["value_max"] = h["value_max"]
+                        for cls, cnt in h["classes"].items():
+                            agg["classes"][cls] = agg["classes"].get(cls, 0) + cnt
+                        agg["dominant_class"] = max(agg["classes"], key=agg["classes"].get)
+
                 if is_static:
                     items = await asyncio.to_thread(
                         _query_items_bbox_no_date, catalog, collection, bbox
@@ -723,11 +752,19 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                                 _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
                             )
                         if hexes:
-                            dataset_frames.append({"acq_date": "static", "hexagons": hexes})
+                            # Get date from item if available
+                            acq_date = _item_acq_date(item, payload.date_start)
+                            frame_msg = {
+                                "type": "frame",
+                                "key": dataset_key,
+                                "frame": {"acq_date": acq_date, "hexagons": hexes},
+                            }
+                            await queue.put(json.dumps(frame_msg) + "\n")
+                            frames_count += 1
                             for h in hexes:
                                 aggregate_hex[h["h3"]] = h
                 else:
-                    # Single STAC query for the entire date range (instead of per-day)
+                    # Single STAC query for the entire date range
                     all_items = await asyncio.to_thread(
                         _query_items_bbox_daterange, catalog, collection, bbox,
                         payload.date_start, payload.date_end, 200
@@ -739,79 +776,66 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                         if item.id in seen_items:
                             continue
                         seen_items.add(item.id)
-                        acq_date = (
-                            item.datetime.date().isoformat()
-                            if getattr(item, "datetime", None)
-                            else payload.date_start.isoformat()
-                        )
+                        acq_date = _item_acq_date(item, payload.date_start)
                         items_by_date.setdefault(acq_date, []).append(item)
 
-                    # Process all items concurrently (semaphore limits raster I/O)
-                    async def process_item(item, acq_date: str) -> dict[str, Any] | None:
-                        asset = _get_asset(item)
-                        if not asset or not asset.href:
-                            return None
-                        async with _RASTER_SEMAPHORE:
-                            hexes = await asyncio.to_thread(
-                                _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
-                            )
-                        if hexes:
-                            return {"acq_date": acq_date, "hexagons": hexes}
-                        return None
+                    # Process each date's items and stream frames immediately
+                    sorted_dates = sorted(items_by_date.keys())
+                    for acq_date in sorted_dates:
+                        date_items = items_by_date[acq_date]
 
-                    tasks = []
-                    for acq_date, items in items_by_date.items():
-                        for item in items:
-                            tasks.append(process_item(item, acq_date))
+                        async def process_item(item) -> list[dict[str, Any]]:
+                            asset = _get_asset(item)
+                            if not asset or not asset.href:
+                                return []
+                            async with _RASTER_SEMAPHORE:
+                                return await asyncio.to_thread(
+                                    _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
+                                )
 
-                    results_list = await asyncio.gather(*tasks)
+                        # Process items for this date concurrently
+                        results_list = await asyncio.gather(
+                            *(process_item(item) for item in date_items)
+                        )
 
-                    for frame in results_list:
-                        if frame and frame["hexagons"]:
-                                dataset_frames.append(frame)
-                                for h in frame["hexagons"]:
-                                    cell_id = h["h3"]
-                                    if cell_id not in aggregate_hex:
-                                        aggregate_hex[cell_id] = {
-                                            **h,
-                                            "days_active": 0,
-                                            "total_pixels": 0,
-                                            "_value_sum": 0.0,
-                                            "_value_count": 0,
-                                        }
-                                    agg = aggregate_hex[cell_id]
-                                    agg["days_active"] = agg.get("days_active", 0) + 1
-                                    agg["total_pixels"] = agg.get("total_pixels", 0) + h["pixel_count"]
-                                    agg["_value_sum"] = agg.get("_value_sum", 0.0) + h["value_mean"] * h["pixel_count"]
-                                    agg["_value_count"] = agg.get("_value_count", 0) + h["pixel_count"]
-                                    if h["value_max"] > agg["value_max"]:
-                                        agg["value_max"] = h["value_max"]
-                                    for cls, cnt in h["classes"].items():
-                                        agg["classes"][cls] = agg["classes"].get(cls, 0) + cnt
-                                    agg["dominant_class"] = max(agg["classes"], key=agg["classes"].get)
+                        # Merge all hexagons for this date
+                        day_hexagons: dict[str, dict[str, Any]] = {}
+                        for hexes in results_list:
+                            for h in hexes:
+                                day_hexagons[h["h3"]] = h
 
-                # Finalize value_mean
+                        if day_hexagons:
+                            merged_hexes = list(day_hexagons.values())
+                            frame_msg = {
+                                "type": "frame",
+                                "key": dataset_key,
+                                "frame": {"acq_date": acq_date, "hexagons": merged_hexes},
+                            }
+                            await queue.put(json.dumps(frame_msg) + "\n")
+                            frames_count += 1
+                            _accumulate_aggregate(merged_hexes)
+
+                # Finalize aggregate value_mean
                 for cell_id, agg in aggregate_hex.items():
                     if agg.get("_value_count", 0) > 0:
                         agg["value_mean"] = round(agg["_value_sum"] / agg["_value_count"], 2)
                     agg.pop("_value_sum", None)
                     agg.pop("_value_count", None)
 
-                # Put result into queue
-                dataset_result = {
-                    "type": "dataset",
+                # Signal dataset complete
+                done_msg = {
+                    "type": "dataset_done",
                     "key": dataset_key,
                     "data": {
                         "dataset": dataset_key,
                         "collection": config["collection"],
                         "description": config["description"],
-                        "frames": dataset_frames,
                         "hexagons": list(aggregate_hex.values()),
                         "total_hexagons": len(aggregate_hex),
-                        "frames_with_data": len(dataset_frames),
+                        "frames_with_data": frames_count,
                     },
                 }
-                await queue.put(json.dumps(dataset_result) + "\n")
+                await queue.put(json.dumps(done_msg) + "\n")
 
             # Launch all datasets concurrently
             async def run_all():

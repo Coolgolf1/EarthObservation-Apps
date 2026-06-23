@@ -368,12 +368,23 @@ function renderAllDatasets() {
     if (viewMode === "aggregate") {
       renderDatasetHexagons(ds, data.hexagons || []);
     } else {
-      // Timeline mode: find frame for current index
+      // Timeline mode: find the frame matching the current date
+      const currentDate = timeline[currentFrameIdx];
       const frames = data.frames || [];
-      if (frames.length > 0 && currentFrameIdx < frames.length) {
-        renderDatasetHexagons(ds, frames[currentFrameIdx].hexagons || []);
+      // Static datasets (flood, landuse) always show all frames
+      const isStatic = frames.length > 0 && frames.every(f => f.acq_date === "static");
+      if (isStatic) {
+        // Merge all static frames
+        const allHexes = frames.flatMap(f => f.hexagons || []);
+        renderDatasetHexagons(ds, allHexes);
       } else {
-        renderDatasetHexagons(ds, data.hexagons || []);
+        const frame = frames.find(f => f.acq_date === currentDate);
+        if (frame) {
+          renderDatasetHexagons(ds, frame.hexagons || []);
+        } else {
+          // No frame for this date — show nothing (gap day)
+          datasetLayers[ds].clearLayers();
+        }
       }
     }
   }
@@ -381,16 +392,17 @@ function renderAllDatasets() {
 
 // ─── Timeline ────────────────────────────────────────────────
 
-function stopPlayback() { if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; } }
+/** Full unfiltered timeline from backend (every day in range) */
+let fullTimeline = [];
 
-function getMaxFrameCount() {
-  let max = 0;
-  for (const ds of getCheckedDatasets()) {
-    const data = datasetResults[ds];
-    if (data && data.frames) max = Math.max(max, data.frames.length);
-  }
-  return max;
+/** Apply frequency step to the full timeline */
+function applyFrequencyStep(full) {
+  const step = Math.max(1, parseInt(frequency?.value) || 1);
+  if (step <= 1) return [...full];
+  return full.filter((_, i) => i % step === 0);
 }
+
+function stopPlayback() { if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; } }
 
 function drawTimelineChart() {
   if (!timelineChart) return;
@@ -416,7 +428,7 @@ function drawTimelineChart() {
   const iW = w - pad * 2;
   const iH = h - pad * 2;
   const barW = Math.max(1, iW / timeline.length);
-  const bandH = Math.max(3, Math.floor(iH / checked.length));
+  const bandH = Math.max(3, Math.floor(iH / Math.max(checked.length, 1)));
 
   // Draw a band per dataset
   checked.forEach((ds, bandIdx) => {
@@ -444,23 +456,19 @@ function drawTimelineChart() {
   });
 
   // Current position marker
-  if (viewMode === "timeline") {
-    const maxFrames = getMaxFrameCount();
-    if (maxFrames > 0) {
-      ctx.fillStyle = "#333";
-      ctx.globalAlpha = 0.8;
-      const x = Math.round(pad + (currentFrameIdx / Math.max(maxFrames - 1, 1)) * iW);
-      ctx.fillRect(x, pad, 2, iH);
-      ctx.globalAlpha = 1;
-    }
+  if (viewMode === "timeline" && timeline.length > 0) {
+    ctx.fillStyle = "#333";
+    ctx.globalAlpha = 0.8;
+    const x = Math.round(pad + (currentFrameIdx / Math.max(timeline.length - 1, 1)) * iW);
+    ctx.fillRect(x, pad, 2, iH);
+    ctx.globalAlpha = 1;
   }
 }
 
 function updateTimelineUI() {
-  const maxFrames = getMaxFrameCount();
   const totalDays = timeline.length;
 
-  if (!totalDays && !maxFrames) {
+  if (!totalDays) {
     if (timelineSlider) { timelineSlider.max = "0"; timelineSlider.value = "0"; }
     if (currentTimeLabel) currentTimeLabel.textContent = "—";
     if (timelineSummary) timelineSummary.textContent = "Select area & dates, then run analysis";
@@ -469,7 +477,7 @@ function updateTimelineUI() {
   }
 
   if (timelineSlider) {
-    timelineSlider.max = String(Math.max(0, maxFrames - 1));
+    timelineSlider.max = String(Math.max(0, totalDays - 1));
     timelineSlider.value = String(currentFrameIdx);
   }
 
@@ -477,29 +485,28 @@ function updateTimelineUI() {
   const totalHexes = checked.reduce((s, ds) => s + ((datasetResults[ds]?.hexagons || []).length), 0);
 
   if (viewMode === "aggregate") {
-    if (currentTimeLabel) currentTimeLabel.textContent = "All dates (aggregate)";
-    if (timelineSummary) timelineSummary.textContent = `${totalHexes} hexagons · ${checked.length} datasets · H3 res ${currentH3Res}`;
+    // Show date range
+    const dateLabel = totalDays === 1
+      ? timeline[0]
+      : `${timeline[0]} — ${timeline[totalDays - 1]}`;
+    if (currentTimeLabel) currentTimeLabel.textContent = dateLabel;
+    if (timelineSummary) timelineSummary.textContent = `${totalHexes} hexagons · ${checked.join(", ")} · H3 res ${currentH3Res}`;
   } else {
-    // Find date for current frame
-    let currentDate = "—";
-    for (const ds of checked) {
-      const frames = datasetResults[ds]?.frames || [];
-      if (currentFrameIdx < frames.length) { currentDate = frames[currentFrameIdx].acq_date; break; }
-    }
+    // Show current day
+    const currentDate = timeline[currentFrameIdx] || "—";
     if (currentTimeLabel) currentTimeLabel.textContent = currentDate;
-    if (timelineSummary) timelineSummary.textContent = `Frame ${currentFrameIdx + 1}/${maxFrames} · H3 res ${currentH3Res}`;
+    if (timelineSummary) timelineSummary.textContent = `Day ${currentFrameIdx + 1}/${totalDays} · H3 res ${currentH3Res}`;
   }
   drawTimelineChart();
 }
 
 function startPlayback() {
   stopPlayback();
-  const maxFrames = getMaxFrameCount();
-  if (maxFrames <= 0) return;
+  if (!timeline.length) return;
   viewMode = "timeline";
   const speed = Math.max(300, Number(playSpeed?.value) || 700);
   playbackTimer = setInterval(() => {
-    currentFrameIdx = (currentFrameIdx + 1) % maxFrames;
+    currentFrameIdx = (currentFrameIdx + 1) % timeline.length;
     renderAllDatasets();
     updateTimelineUI();
   }, speed);
@@ -522,7 +529,7 @@ async function fetchDatasetsH3Stream(bbox, start, end, resolution, datasets, sig
       date_end: end,
       resolution,
       datasets,
-      max_frames: 60,
+      max_frames: 365,
     }),
     signal,
   });
@@ -555,7 +562,41 @@ async function fetchDatasetsH3Stream(bbox, start, end, resolution, datasets, sig
         if (msg.type === "header") {
           header = msg;
           result.timeline = msg.timeline || [];
+          // Set global timeline immediately from header so UI shows full date range
+          if (result.timeline.length > fullTimeline.length) {
+            fullTimeline = result.timeline;
+            timeline = applyFrequencyStep(fullTimeline);
+            viewMode = "timeline";
+            if (currentFrameIdx >= timeline.length) currentFrameIdx = 0;
+            updateTimelineUI();
+          }
+        } else if (msg.type === "frame") {
+          // Per-day frame arrival — accumulate into dataset results
+          const key = msg.key;
+          if (!result.datasets[key]) {
+            result.datasets[key] = {
+              dataset: key,
+              frames: [],
+              hexagons: [],
+              total_hexagons: 0,
+              frames_with_data: 0,
+            };
+          }
+          result.datasets[key].frames.push(msg.frame);
+          result.datasets[key].frames_with_data++;
+          // Notify callback with current accumulated data
+          if (onDataset) onDataset(key, result.datasets[key]);
+        } else if (msg.type === "dataset_done") {
+          // Final aggregate data for this dataset
+          if (result.datasets[msg.key]) {
+            result.datasets[msg.key].hexagons = msg.data.hexagons || [];
+            result.datasets[msg.key].total_hexagons = msg.data.total_hexagons || 0;
+          } else {
+            result.datasets[msg.key] = msg.data;
+          }
+          if (onDataset) onDataset(msg.key, result.datasets[msg.key]);
         } else if (msg.type === "dataset") {
+          // Legacy: full dataset in one message
           result.datasets[msg.key] = msg.data;
           if (onDataset) onDataset(msg.key, msg.data);
         } else if (msg.type === "error") {
@@ -582,7 +623,7 @@ async function fetchDatasetsH3(bbox, start, end, resolution, datasets, signal) {
       date_end: end,
       resolution,
       datasets,
-      max_frames: 60,
+      max_frames: 365,
     }),
     signal,
   });
@@ -695,7 +736,10 @@ async function refetchForCurrentView() {
       datasetResults[ds] = data;
       renderDatasetHexagons(ds, data.hexagons || []);
     }
-    if (cachedTimeline.length > timeline.length) timeline = cachedTimeline;
+    if (cachedTimeline.length > fullTimeline.length) {
+      fullTimeline = cachedTimeline;
+      timeline = applyFrequencyStep(fullTimeline);
+    }
     updateTimelineUI();
   }
 
@@ -726,6 +770,7 @@ async function refetchForCurrentView() {
 
   let datasetsLoaded = Object.keys(cached).length;
   const totalDs = datasets.length;
+  const seenDatasets = new Set(Object.keys(cached));
 
   try {
     const result = await fetchDatasetsH3Stream(
@@ -733,10 +778,16 @@ async function refetchForCurrentView() {
       (dsKey, dsData) => {
         if (fetchId !== _fetchGeneration) return;
         datasetResults[dsKey] = dsData;
-        datasetsLoaded++;
+        if (!seenDatasets.has(dsKey) && dsData.total_hexagons != null) {
+          seenDatasets.add(dsKey);
+          datasetsLoaded++;
+        }
         setProgress(Math.round((datasetsLoaded / totalDs) * 90));
-        renderDatasetHexagons(dsKey, dsData.hexagons || []);
-        updateStatus(`${dsKey} loaded (${datasetsLoaded}/${totalDs})...`);
+        viewMode = "timeline";
+        if (currentFrameIdx >= timeline.length) currentFrameIdx = 0;
+        renderAllDatasets();
+        updateTimelineUI();
+        updateStatus(`${dsKey}: ${(dsData.frames || []).length} days loaded...`);
       }
     );
 
@@ -746,11 +797,12 @@ async function refetchForCurrentView() {
       for (const [ds, data] of Object.entries(result.datasets)) {
         datasetResults[ds] = data;
       }
-      if (result.timeline && result.timeline.length > timeline.length) {
-        timeline = result.timeline;
+      if (result.timeline && result.timeline.length > fullTimeline.length) {
+        fullTimeline = result.timeline;
+        timeline = applyFrequencyStep(fullTimeline);
       }
       // Cache the newly fetched datasets
-      cacheStoreDatasets(bbox, newRes, queryDateRange, result.datasets, timeline);
+      cacheStoreDatasets(bbox, newRes, queryDateRange, result.datasets, fullTimeline);
     }
     lastFetchKey = key;
     lastFetchBbox = [...bbox];
@@ -1094,7 +1146,10 @@ async function runQuery() {
     for (const [ds, data] of Object.entries(cachedDs)) {
       datasetResults[ds] = data;
     }
-    if (cachedTimeline.length > 0) timeline = cachedTimeline;
+    if (cachedTimeline.length > 0) {
+      fullTimeline = cachedTimeline;
+      timeline = applyFrequencyStep(fullTimeline);
+    }
   }
 
   // If everything was cached, render and respond
@@ -1126,6 +1181,7 @@ async function runQuery() {
 
   let datasetsLoaded = Object.keys(cachedDs).length;
   const totalDs = datasets.length;
+  const seenDs = new Set(Object.keys(cachedDs));
 
   // Render cached data while we wait
   if (Object.keys(cachedDs).length > 0) renderAllDatasets();
@@ -1135,10 +1191,16 @@ async function runQuery() {
       bbox, range.start, range.end, currentH3Res, missingDs, signal,
       (dsKey, dsData) => {
         datasetResults[dsKey] = dsData;
-        datasetsLoaded++;
+        if (!seenDs.has(dsKey) && dsData.total_hexagons != null) {
+          seenDs.add(dsKey);
+          datasetsLoaded++;
+        }
         setProgress(Math.round((datasetsLoaded / totalDs) * 85) + 5);
-        renderDatasetHexagons(dsKey, dsData.hexagons || []);
-        updateStatus(`${dsKey} ready (${datasetsLoaded}/${totalDs})...`);
+        viewMode = "timeline";
+        if (currentFrameIdx >= timeline.length) currentFrameIdx = 0;
+        renderAllDatasets();
+        updateTimelineUI();
+        updateStatus(`${dsKey}: ${(dsData.frames || []).length} days loaded...`);
       }
     );
 
@@ -1159,11 +1221,12 @@ async function runQuery() {
       for (const [ds, data] of Object.entries(result.datasets)) {
         datasetResults[ds] = data;
       }
-      if (result.timeline && result.timeline.length > timeline.length) {
-        timeline = result.timeline;
+      if (result.timeline && result.timeline.length > fullTimeline.length) {
+        fullTimeline = result.timeline;
+        timeline = applyFrequencyStep(fullTimeline);
       }
       // Cache newly fetched datasets individually
-      cacheStoreDatasets(bbox, currentH3Res, range, result.datasets, timeline);
+      cacheStoreDatasets(bbox, currentH3Res, range, result.datasets, fullTimeline);
     }
     lastFetchKey = cacheKey;
     lastFetchBbox = [...bbox];
@@ -1411,7 +1474,10 @@ async function handleAgentQuestion(question) {
       if (layer && !map.hasLayer(layer)) layer.addTo(map);
       renderDatasetHexagons(ds, data.hexagons || []);
     }
-    if (agentCachedTimeline.length > timeline.length) timeline = agentCachedTimeline;
+    if (agentCachedTimeline.length > fullTimeline.length) {
+      fullTimeline = agentCachedTimeline;
+      timeline = applyFrequencyStep(fullTimeline);
+    }
     updateTimelineUI();
   }
 
@@ -1438,19 +1504,26 @@ async function handleAgentQuestion(question) {
   try {
     const totalDs = needed.length;
     let loadedDs = Object.keys(agentCached).length;
+    const seenAgentDs = new Set(Object.keys(agentCached));
 
     const result = await fetchDatasetsH3Stream(
       bbox, queryDateRange.start, queryDateRange.end, res, agentMissing, agentSignal,
       (dsKey, dsData) => {
         datasetResults[dsKey] = dsData;
-        loadedDs++;
+        if (!seenAgentDs.has(dsKey) && dsData.total_hexagons != null) {
+          seenAgentDs.add(dsKey);
+          loadedDs++;
+        }
         setProgress(Math.round((loadedDs / totalDs) * 85) + 5);
         const cb = $(`#dataset-grid input[value="${dsKey}"]`);
         if (cb && !cb.checked) cb.checked = true;
         const layer = datasetLayers[dsKey];
         if (layer && !map.hasLayer(layer)) layer.addTo(map);
-        renderDatasetHexagons(dsKey, dsData.hexagons || []);
-        updateStatus(`${dsKey} ready (${loadedDs}/${totalDs})...`);
+        viewMode = "timeline";
+        if (currentFrameIdx >= timeline.length) currentFrameIdx = 0;
+        renderAllDatasets();
+        updateTimelineUI();
+        updateStatus(`${dsKey}: ${(dsData.frames || []).length} days loaded...`);
       }
     );
 
@@ -1458,8 +1531,9 @@ async function handleAgentQuestion(question) {
       for (const [ds, data] of Object.entries(result.datasets)) {
         datasetResults[ds] = data;
       }
-      if (result.timeline && result.timeline.length > timeline.length) {
-        timeline = result.timeline;
+      if (result.timeline && result.timeline.length > fullTimeline.length) {
+        fullTimeline = result.timeline;
+        timeline = applyFrequencyStep(fullTimeline);
       }
       lastFetchBbox = [...bbox];
       lastFetchRes = res;
@@ -1642,7 +1716,15 @@ if (timelineSlider) timelineSlider.addEventListener("input", () => {
   renderAllDatasets(); updateTimelineUI();
 });
 if (timelinePlay) timelinePlay.addEventListener("click", startPlayback);
-if (timelinePause) timelinePause.addEventListener("click", () => { stopPlayback(); viewMode = "aggregate"; renderAllDatasets(); updateTimelineUI(); });
+if (timelinePause) timelinePause.addEventListener("click", () => { stopPlayback(); renderAllDatasets(); updateTimelineUI(); });
+
+// Frequency step change — re-filter timeline
+if (frequency) frequency.addEventListener("change", () => {
+  timeline = applyFrequencyStep(fullTimeline);
+  if (currentFrameIdx >= timeline.length) currentFrameIdx = Math.max(0, timeline.length - 1);
+  renderAllDatasets();
+  updateTimelineUI();
+});
 
 // Satellite
 if (layerSatellite) layerSatellite.addEventListener("click", () => {
