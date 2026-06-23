@@ -3,11 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>EarthAnalyser Fire Timeline</title>
+    <title>EarthAnalyser</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=Outfit:wght@500;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
     <link
@@ -19,58 +19,121 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="shell">
-      <aside class="panel">
-        <h1>EarthAnalyser Fire</h1>
-        <p class="subtitle">MODIS 14A2 fire timeline inside your bbox</p>
+    <div class="app-shell">
+      <!-- LEFT PANEL -->
+      <aside class="panel left-panel">
+        <h1>EarthAnalyser</h1>
+        <p class="subtitle">Ask &rarr; See &rarr; Understand</p>
 
-        <div class="group">
-          <label for="date-start">Start date</label>
-          <input id="date-start" type="date" value="2021-07-01" />
-          <label for="date-end">End date</label>
-          <input id="date-end" type="date" value="2021-09-10" />
-          <label for="confidence">Minimum confidence</label>
-          <select id="confidence">
-            <option value="7">Low+ (7, 8, 9)</option>
-            <option value="8" selected>Nominal+ (8, 9)</option>
-            <option value="9">High (9)</option>
-          </select>
-        </div>
-
-        <div class="group">
-          <label>Bbox selection</label>
-          <div class="row">
-            <button type="button" id="bbox-toggle">Start Bbox Select</button>
-            <button type="button" id="bbox-clear" class="ghost">Clear</button>
+        <form id="query-form" class="filters" autocomplete="off">
+          <div class="two-col">
+            <div>
+              <label for="start-date">From</label>
+              <input id="start-date" type="date" value="2026-03-01" />
+            </div>
+            <div>
+              <label for="end-date">To</label>
+              <input id="end-date" type="date" value="2026-06-01" />
+            </div>
           </div>
-          <small>Click 3+ points on map to draw a polygon. Its envelope is used as bbox.</small>
-        </div>
 
-        <div class="group">
-          <button type="button" id="load-fire">Load fire detections</button>
-        </div>
-
-        <div class="group timeline-wrap">
-          <label for="timeline">Day timeline</label>
-          <input id="timeline" type="range" min="0" max="0" step="1" value="0" disabled />
-          <div class="timeline-meta">
-            <span id="timeline-day">No data loaded</span>
-            <span id="timeline-count">0 points</span>
+          <div class="two-col">
+            <div>
+              <label for="frequency">Frequency</label>
+              <select id="frequency">
+                <option value="hourly">Hourly</option>
+                <option value="daily" selected>Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
+            <div>
+              <label for="play-speed">Playback</label>
+              <select id="play-speed">
+                <option value="1200">Slow</option>
+                <option value="700" selected>Normal</option>
+                <option value="350">Fast</option>
+              </select>
+            </div>
           </div>
-          <div class="row">
-            <button type="button" id="prev-day" class="ghost">Prev</button>
-            <button type="button" id="play">Play</button>
-            <button type="button" id="pause" class="ghost">Pause</button>
-            <button type="button" id="next-day" class="ghost">Next</button>
-          </div>
-        </div>
 
-        <div id="status" class="status">Draw bbox or use current map bounds, then load fire detections.</div>
+          <label>Area selection</label>
+          <div class="bbox-controls">
+            <button type="button" id="draw-toggle" class="mode-toggle">Draw polygon</button>
+            <button type="button" id="draw-clear" class="mode-toggle">Clear</button>
+          </div>
+
+          <label for="resolution-slider">Resolution level: <span id="resolution-value">Auto</span></label>
+          <input id="resolution-slider" type="range" min="0" max="10" value="0" step="1" />
+          <div class="resolution-hint">0 = Auto (from area size) · Higher = more detail</div>
+
+          <label>Datasets</label>
+          <div class="dataset-grid" id="dataset-grid">
+            <label class="dataset-chip fire"><input type="checkbox" value="fire" checked /><span>🔥 Fire</span></label>
+            <label class="dataset-chip flood"><input type="checkbox" value="flood" /><span>🌊 Flood</span></label>
+            <label class="dataset-chip vegetation"><input type="checkbox" value="vegetation" /><span>🌱 Vegetation</span></label>
+            <label class="dataset-chip weather"><input type="checkbox" value="weather" /><span>🌪️ Weather</span></label>
+            <label class="dataset-chip landuse"><input type="checkbox" value="landuse" /><span>🏙️ Land Use</span></label>
+          </div>
+
+          <button type="submit" id="ask-run">Run analysis</button>
+        </form>
+
+        <div class="stats" id="status-box">Ready. Set area & dates, then ask in the chat panel →</div>
       </aside>
 
-      <main class="map-area">
-        <div id="map"></div>
+      <!-- CENTER: Map + Timeline -->
+      <main class="center-panel">
+        <div class="map-wrap">
+          <div id="map"></div>
+
+          <div id="ask-hint" class="ask-hint">Ask something to explore Earth data</div>
+
+          <div id="loading-overlay" class="loading-bar-container hidden">
+            <div class="loading-bar-track">
+              <div class="loading-bar-fill" id="progress-bar"></div>
+            </div>
+            <span class="loading-bar-text" id="loading-text">Loading...</span>
+          </div>
+
+          <div id="hover-data" class="hover-tooltip hidden"></div>
+
+          <div id="draw-confirm-bar" class="draw-confirm-bar hidden">
+            <span id="draw-confirm-text">3 points</span>
+            <button type="button" id="draw-confirm-btn">✓ Confirm area</button>
+            <button type="button" id="draw-cancel-btn">✕ Cancel</button>
+          </div>
+
+          <div class="map-controls">
+            <button type="button" id="layer-satellite" class="map-btn active">Satellite</button>
+            <button type="button" id="timeline-play" class="map-btn">▶ Play</button>
+            <button type="button" id="timeline-pause" class="map-btn">⏸ Pause</button>
+            <button type="button" id="export-csv" class="map-btn">CSV</button>
+          </div>
+        </div>
+
+        <div class="timeline-panel">
+          <div class="timeline-header">
+            <strong id="current-time-label">No timeline</strong>
+            <span id="timeline-summary">Run a query to load data</span>
+          </div>
+          <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" />
+          <canvas id="timeline-chart" height="40"></canvas>
+        </div>
       </main>
+
+      <!-- RIGHT PANEL: AI Agent -->
+      <aside class="panel right-panel">
+        <h2>Earth Analyst</h2>
+        <p class="subtitle">AI-powered geospatial reasoning</p>
+
+        <div id="chat-log" class="chat-log"></div>
+
+        <form id="chat-form" class="chat-form" autocomplete="off">
+          <textarea id="chat-input" rows="1" placeholder="e.g. Show fire activity in Portugal last 3 months"></textarea>
+          <button type="submit">Ask</button>
+        </form>
+      </aside>
     </div>
 
     <script
@@ -78,6 +141,7 @@
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
       crossorigin=""
     ></script>
-    <script src="main.js" type="module"></script>
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    <script src="main.js?v=20260622-h3" type="module"></script>
   </body>
 </html>
