@@ -679,6 +679,9 @@ def _geocode_place(place_query: str, country_hint: str | None = None) -> dict[st
         "maxLocations": "1",
         "outFields": "*",
     }
+    esri_key = os.getenv("ESRI_API_KEY", "")
+    if esri_key:
+        esri_params["token"] = esri_key
     if country_hint:
         esri_params["countryCode"] = country_hint
 
