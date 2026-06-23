@@ -5,7 +5,7 @@ from pathlib import Path
 from .routers.health import router as health_router
 from .routers.features import router as features_router
 from .routers.planet import router as planet_router
-from .routers.fire import router as fire_router
+from .routers.datasets import router as datasets_router
 
 app = FastAPI()
 
@@ -29,7 +29,7 @@ app.add_middleware(
 app.include_router(health_router)
 app.include_router(features_router)
 app.include_router(planet_router)
-app.include_router(fire_router)
+app.include_router(datasets_router)
 
 repo_root = Path(__file__).resolve().parents[2]
 earthsearch_frontend_dir = repo_root / "EarthSearch" / "frontend"
