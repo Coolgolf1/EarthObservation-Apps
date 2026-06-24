@@ -65,7 +65,7 @@ _SEARCH_STATE_LOCK = Lock()
 _ACTIVE_SEARCH_BY_CLIENT: dict[str, tuple[str, Event]] = {}
 LLM_API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
 OPENROUTER_API_URL_DEFAULT = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-next-80b-a3b-instruct:free")
+LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-235b-a22b:free")
 
 
 class AgenticSearchRequest(BaseModel):
