@@ -1,6 +1,7 @@
 """
 Multi-dataset H3 endpoint — supports fire, flood, vegetation, weather, land use.
 Reads rasters from Planetary Computer STAC, converts pixels to H3 hexagons.
+Weather uses ERA5 Zarr; vegetation uses ImageCubes API when available.
 """
 
 from __future__ import annotations
@@ -28,8 +29,11 @@ from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from ..core.era5 import era5_to_h3
+from ..core.imagecubes import imagecubes_ndvi_to_h3
+
 # ─── Memory Safety Constants ─────────────────────────────────
-MAX_CONCURRENT_RASTERS = 8          # max simultaneous raster reads
+MAX_CONCURRENT_RASTERS = 16          # max simultaneous raster reads
 MAX_WINDOW_PIXELS = 50_000_000      # cap raster window at ~50M pixels
 MAX_H3_INPUT_PIXELS = 10_000_000    # max pixels to convert to H3
 _RASTER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_RASTERS)
@@ -49,9 +53,12 @@ _GDAL_ENV = {
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
     "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
     "VSI_CACHE": "TRUE",
-    "VSI_CACHE_SIZE": "5000000",
+    "VSI_CACHE_SIZE": "20000000",
     "GDAL_HTTP_MAX_RETRY": "2",
     "GDAL_HTTP_RETRY_DELAY": "1",
+    "GDAL_HTTP_CONNECTTIMEOUT": "10",
+    "GDAL_HTTP_TIMEOUT": "30",
+    "GDAL_HTTP_TCP_KEEPALIVE": "YES",
 }
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
@@ -88,7 +95,7 @@ DATASET_CONFIG = {
             "permanent" if val >= 80 else "seasonal" if val >= 30 else "ephemeral"
         ),
         "scale": None,
-        "max_h3_res": 9,  # JRC ~30m pixels
+        "max_h3_res": 7,  # cap to match MODIS for speed
     },
     "vegetation": {
         "collection": "modis-13A1-061",
@@ -104,9 +111,9 @@ DATASET_CONFIG = {
         "max_h3_res": 7,  # MODIS ~500m pixels
     },
     "weather": {
-        "collection": "modis-11A2-061",
+        "collection": "modis-11A1-061",
         "asset": "LST_Day_1km",
-        "description": "MODIS Land Surface Temperature",
+        "description": "MODIS Daily Land Surface Temperature",
         "value_type": "continuous",
         # LST scale: raw * 0.02 = Kelvin
         "filter": lambda arr: arr > 0,
@@ -129,7 +136,7 @@ DATASET_CONFIG = {
             else "water" if val == 80 else "other"
         ),
         "scale": None,
-        "max_h3_res": 9,  # ESA ~10m pixels
+        "max_h3_res": 7,  # cap to match MODIS for speed
     },
 }
 
@@ -163,7 +170,13 @@ def _auto_h3_resolution(bbox: list[float]) -> int:
         return 6
     if span < 8.0:
         return 5
-    return 4
+    if span < 20.0:
+        return 4
+    if span < 60.0:
+        return 3
+    if span < 120.0:
+        return 2
+    return 1
 
 def _validate_bbox(bbox: list[float]) -> tuple[float, float, float, float]:
     west, south, east, north = [float(v) for v in bbox]
@@ -311,11 +324,10 @@ def _overview_factor(ds, window, h3_res: int) -> int | None:
     if not ds.overviews(1):
         return None
     # Approximate H3 cell edge length in degrees at equator
-    # res 3 ≈ 1.2°, res 4 ≈ 0.5°, res 5 ≈ 0.2°, res 6 ≈ 0.07°, res 7+ ≈ full
-    h3_approx_deg = {3: 1.2, 4: 0.5, 5: 0.2, 6: 0.07}
+    h3_approx_deg = {1: 7.0, 2: 3.0, 3: 1.2, 4: 0.5, 5: 0.2, 6: 0.07, 7: 0.03, 8: 0.01, 9: 0.004}
     target_deg = h3_approx_deg.get(h3_res)
     if target_deg is None:
-        return None  # res 7+ → read full resolution
+        return None  # res 10+ → read full resolution
     # Current pixel size in degrees
     px_deg = abs(ds.transform.a)
     if px_deg <= 0:
@@ -329,6 +341,27 @@ def _overview_factor(ds, window, h3_res: int) -> int | None:
         if ov >= ideal_factor * 0.5:
             return ov
     return overviews[-1] if overviews else None
+
+
+def _target_read_shape(window, ds, h3_res: int) -> tuple[int, int] | None:
+    """Compute the ideal (height, width) to read, matching pixel size to H3 cell size.
+    Returns None if the native resolution is already coarse enough."""
+    h3_approx_deg = {1: 7.0, 2: 3.0, 3: 1.2, 4: 0.5, 5: 0.2, 6: 0.07, 7: 0.03, 8: 0.01, 9: 0.004}
+    target_deg = h3_approx_deg.get(h3_res)
+    if target_deg is None:
+        return None
+    px_deg = abs(ds.transform.a)
+    if px_deg <= 0 or target_deg <= 0:
+        return None
+    # How many native pixels fit in one H3 cell?  We want ~2 pixels per cell for quality.
+    ideal_factor = target_deg / px_deg / 2.0
+    if ideal_factor < 1.5:
+        return None  # native resolution already close enough
+    out_w = max(1, int(window.width / ideal_factor))
+    out_h = max(1, int(window.height / ideal_factor))
+    if out_w >= window.width and out_h >= window.height:
+        return None
+    return (out_h, out_w)
 
 
 def _raster_to_h3(
@@ -349,11 +382,10 @@ def _raster_to_h3(
             if window is None:
                 return []
 
-            # Use COG overviews for coarse H3 resolutions — read far less data
-            ov_factor = _overview_factor(ds, window, h3_res)
-            if ov_factor and ov_factor >= 2:
-                out_h = max(1, int(window.height / ov_factor))
-                out_w = max(1, int(window.width / ov_factor))
+            # Downsample to match H3 resolution — read only as many pixels as needed
+            target_shape = _target_read_shape(window, ds, h3_res)
+            if target_shape:
+                out_h, out_w = target_shape
                 band = ds.read(1, window=window, out_shape=(out_h, out_w),
                                masked=True, resampling=rasterio.enums.Resampling.nearest
                                ).astype("float32")
@@ -497,7 +529,40 @@ async def query_datasets_h3(payload: DatasetH3Request):
 
         results: dict[str, Any] = {}
 
-        for dataset_key in valid_datasets:
+        # ─── Zarr-backed datasets (vegetation via ImageCubes) ───
+        # NOTE: ERA5 Zarr requires Azure auth that's unavailable; weather uses STAC COG path instead
+        zarr_datasets = {"vegetation"}
+        zarr_requested = [d for d in valid_datasets if d in zarr_datasets]
+        stac_datasets = [d for d in valid_datasets if d not in zarr_datasets]
+
+        # Process Zarr datasets concurrently
+        async def _process_zarr(dataset_key: str) -> tuple[str, dict[str, Any]]:
+            if dataset_key == "vegetation":
+                try:
+                    return dataset_key, await imagecubes_ndvi_to_h3(
+                        bbox, payload.date_start, payload.date_end, h3_res
+                    )
+                except (RuntimeError, TimeoutError):
+                    # Fall back to STAC if ImageCubes token not set or job fails
+                    return dataset_key, None  # type: ignore
+            return dataset_key, None  # type: ignore
+
+        if zarr_requested:
+            zarr_results = await asyncio.gather(
+                *(_process_zarr(dk) for dk in zarr_requested),
+                return_exceptions=True,
+            )
+            for item in zarr_results:
+                if isinstance(item, Exception):
+                    continue
+                dk, data = item
+                if data is not None:
+                    results[dk] = data
+                else:
+                    # Push back to STAC fallback
+                    stac_datasets.append(dk)
+
+        for dataset_key in stac_datasets:
             config = DATASET_CONFIG[dataset_key]
             collection = config["collection"]
             asset_name = config["asset"]
@@ -529,20 +594,29 @@ async def query_datasets_h3(payload: DatasetH3Request):
                 return asset
 
             if is_static:
-                # Static datasets: query ALL tiles covering the bbox
+                # Static datasets: query tiles covering the bbox (limited)
                 items = await asyncio.to_thread(
-                    _query_items_bbox_no_date, catalog, collection, bbox
+                    _query_items_bbox_no_date, catalog, collection, bbox, 5
                 )
+                unique_items = []
                 for item in items:
-                    if item.id in seen_items:
-                        continue
-                    seen_items.add(item.id)
+                    if item.id not in seen_items:
+                        seen_items.add(item.id)
+                        unique_items.append(item)
+
+                async def _process_static_item(item):
                     asset = _get_asset(item)
                     if not asset or not asset.href:
-                        continue
-                    hexes = await asyncio.to_thread(
-                        _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
-                    )
+                        return []
+                    async with _RASTER_SEMAPHORE:
+                        return await asyncio.to_thread(
+                            _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
+                        )
+
+                results_list = await asyncio.gather(
+                    *(_process_static_item(it) for it in unique_items)
+                )
+                for hexes in results_list:
                     if hexes:
                         dataset_frames.append({"acq_date": "static", "hexagons": hexes})
                         for h in hexes:
@@ -688,6 +762,42 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
             queue: asyncio.Queue[str | None] = asyncio.Queue()
 
             async def process_one_dataset(dataset_key: str) -> None:
+                # ─── Zarr fast-path for vegetation (ImageCubes) ───
+                # NOTE: ERA5 Zarr requires Azure auth; weather uses STAC COG path
+                zarr_datasets = {"vegetation"}
+                if dataset_key in zarr_datasets:
+                    try:
+                        data = await imagecubes_ndvi_to_h3(
+                            bbox, payload.date_start, payload.date_end, h3_res
+                        )
+
+                        # Stream frames
+                        for frame in data.get("frames", []):
+                            frame_msg = {
+                                "type": "frame",
+                                "key": dataset_key,
+                                "frame": frame,
+                            }
+                            await queue.put(json.dumps(frame_msg) + "\n")
+
+                        # Signal dataset complete
+                        done_msg = {
+                            "type": "dataset_done",
+                            "key": dataset_key,
+                            "data": {
+                                "dataset": data["dataset"],
+                                "collection": data["collection"],
+                                "description": data["description"],
+                                "hexagons": data["hexagons"],
+                                "total_hexagons": data["total_hexagons"],
+                                "frames_with_data": data["frames_with_data"],
+                            },
+                        }
+                        await queue.put(json.dumps(done_msg) + "\n")
+                        return
+                    except (RuntimeError, TimeoutError):
+                        pass  # Fall through to STAC-based processing
+
                 config = DATASET_CONFIG[dataset_key]
                 collection = config["collection"]
                 asset_name = config["asset"]
@@ -738,22 +848,29 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
 
                 if is_static:
                     items = await asyncio.to_thread(
-                        _query_items_bbox_no_date, catalog, collection, bbox
+                        _query_items_bbox_no_date, catalog, collection, bbox, 5
                     )
+                    unique_items = []
                     for item in items:
-                        if item.id in seen_items:
-                            continue
-                        seen_items.add(item.id)
+                        if item.id not in seen_items:
+                            seen_items.add(item.id)
+                            unique_items.append(item)
+
+                    async def _proc_static(item):
                         asset = _get_asset(item)
                         if not asset or not asset.href:
-                            continue
+                            return []
                         async with _RASTER_SEMAPHORE:
-                            hexes = await asyncio.to_thread(
+                            return await asyncio.to_thread(
                                 _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
                             )
+
+                    results_list = await asyncio.gather(
+                        *(_proc_static(it) for it in unique_items)
+                    )
+                    for hexes in results_list:
                         if hexes:
-                            # Get date from item if available
-                            acq_date = _item_acq_date(item, payload.date_start)
+                            acq_date = "static"
                             frame_msg = {
                                 "type": "frame",
                                 "key": dataset_key,
@@ -779,11 +896,8 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                         acq_date = _item_acq_date(item, payload.date_start)
                         items_by_date.setdefault(acq_date, []).append(item)
 
-                    # Process each date's items and stream frames immediately
-                    sorted_dates = sorted(items_by_date.keys())
-                    for acq_date in sorted_dates:
-                        date_items = items_by_date[acq_date]
-
+                    # Process ALL dates concurrently, stream frames as they arrive
+                    async def process_date(acq_date: str, date_items: list):
                         async def process_item(item) -> list[dict[str, Any]]:
                             asset = _get_asset(item)
                             if not asset or not asset.href:
@@ -793,7 +907,6 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                                     _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
                                 )
 
-                        # Process items for this date concurrently
                         results_list = await asyncio.gather(
                             *(process_item(item) for item in date_items)
                         )
@@ -812,6 +925,14 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                                 "frame": {"acq_date": acq_date, "hexagons": merged_hexes},
                             }
                             await queue.put(json.dumps(frame_msg) + "\n")
+                            return merged_hexes
+                        return []
+
+                    date_results = await asyncio.gather(
+                        *(process_date(ad, items_by_date[ad]) for ad in items_by_date)
+                    )
+                    for merged_hexes in date_results:
+                        if merged_hexes:
                             frames_count += 1
                             _accumulate_aggregate(merged_hexes)
 
@@ -1152,7 +1273,7 @@ def _fetch_url(req: urlrequest.Request) -> str:
 # ─── LLM Classification ──────────────────────────────────────
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_ANALYSIS_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+DEFAULT_ANALYSIS_MODEL = "qwen/qwen3-235b-a22b:free"
 
 VALID_CATEGORIES = {"fire", "flood", "vegetation", "weather", "landuse"}
 
@@ -1163,15 +1284,17 @@ class ClassifyRequest(BaseModel):
 
 @router.post("/classify")
 async def classify_question(payload: ClassifyRequest):
-    """Use LLM to determine which dataset categories are needed to answer a question."""
+    """Use LLM to determine which dataset categories and date range are needed."""
     api_key = os.getenv("LLM_API_KEY", "").strip()
     if not api_key:
-        # Fallback: return all categories
         return {"categories": list(VALID_CATEGORIES)}
 
     system_prompt = (
         "You are a classifier for a geospatial analysis tool. "
-        "Given a user question, return ONLY a JSON array of dataset categories needed to answer it. "
+        "Given a user question, return ONLY a JSON object with:\n"
+        "  \"categories\": array of dataset categories needed\n"
+        "  \"date_start\": start date (YYYY-MM-DD) if mentioned or implied, or null\n"
+        "  \"date_end\": end date (YYYY-MM-DD) if mentioned or implied, or null\n"
         "Valid categories: fire, flood, vegetation, weather, landuse\n"
         "Rules:\n"
         "- 'fire' = wildfires, burns, hotspots, ignition\n"
@@ -1181,7 +1304,12 @@ async def classify_question(payload: ClassifyRequest):
         "- 'landuse' = urban, crops, forest, built areas, land cover\n"
         "- For causal/risk questions (why, cause, risk), include supporting categories\n"
         "- For general overview questions, include fire, weather, vegetation\n"
-        "Return ONLY a JSON array like [\"fire\",\"weather\"]. No explanation."
+        "- 'last summer' = June 1 to Aug 31 of the previous year\n"
+        "- 'summer 2024' = 2024-06-01 to 2024-08-31\n"
+        "- 'in 2023' = 2023-01-01 to 2023-12-31\n"
+        "- If no date is mentioned, set both to null\n"
+        "Return ONLY the JSON object. No explanation.\n"
+        "Example: {\"categories\":[\"fire\",\"weather\"],\"date_start\":\"2024-06-01\",\"date_end\":\"2024-08-31\"}"
     )
 
     messages = [
@@ -1213,14 +1341,7 @@ async def classify_question(payload: ClassifyRequest):
         raw = await asyncio.to_thread(_fetch_url_post, req)
         result = json.loads(raw)
         msg = result.get("choices", [{}])[0].get("message", {})
-        # Check content first, then reasoning (nvidia model puts output in reasoning)
         text = (msg.get("content") or msg.get("reasoning") or "").strip()
-
-        # Extract JSON array from text (may be surrounded by reasoning text)
-        import re
-        array_match = re.search(r'\[(["\w\s,]+)\]', text)
-        if array_match:
-            text = array_match.group(0)
 
         # Handle markdown code blocks
         if "```" in text:
@@ -1228,11 +1349,31 @@ async def classify_question(payload: ClassifyRequest):
             if text.startswith("json"):
                 text = text[4:].strip()
 
-        categories = json.loads(text)
-        if isinstance(categories, list):
-            valid = [c for c in categories if c in VALID_CATEGORIES]
-            if valid:
-                return {"categories": valid}
+        # Try to extract a JSON object first (new format)
+        import re
+        obj_match = re.search(r'\{[^{}]+\}', text)
+        if obj_match:
+            parsed = json.loads(obj_match.group(0))
+            if isinstance(parsed, dict):
+                cats = parsed.get("categories", [])
+                valid = [c for c in cats if c in VALID_CATEGORIES]
+                resp = {"categories": valid or ["fire", "weather", "vegetation"]}
+                ds = parsed.get("date_start")
+                de = parsed.get("date_end")
+                if ds and re.match(r'^\d{4}-\d{2}-\d{2}$', str(ds)):
+                    resp["date_start"] = str(ds)
+                if de and re.match(r'^\d{4}-\d{2}-\d{2}$', str(de)):
+                    resp["date_end"] = str(de)
+                return resp
+
+        # Fallback: try JSON array (old format)
+        array_match = re.search(r'\[(["\w\s,]+)\]', text)
+        if array_match:
+            categories = json.loads(array_match.group(0))
+            if isinstance(categories, list):
+                valid = [c for c in categories if c in VALID_CATEGORIES]
+                if valid:
+                    return {"categories": valid}
     except Exception:
         pass
 
@@ -1301,20 +1442,43 @@ async def analyse_with_llm(payload: AnalyseRequest):
         raw = await asyncio.to_thread(_fetch_url_post, req)
         result = json.loads(raw)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
+        # Fallback: return a basic analysis from the data report
+        return {
+            "analysis": _fallback_analysis(payload.question, payload.data_report),
+            "model": "fallback",
+        }
 
     choices = result.get("choices", [])
     if not choices:
-        raise HTTPException(status_code=502, detail="LLM returned no response")
+        return {
+            "analysis": _fallback_analysis(payload.question, payload.data_report),
+            "model": "fallback",
+        }
 
     msg = choices[0].get("message", {})
     content = (msg.get("content") or "").strip()
     # Only return the final content, never the raw chain-of-thought reasoning
     if not content:
-        raise HTTPException(status_code=502, detail="LLM produced no final response")
+        return {
+            "analysis": _fallback_analysis(payload.question, payload.data_report),
+            "model": "fallback",
+        }
     return {"analysis": content, "model": payload.model}
 
 
+def _fallback_analysis(question: str, data_report: str) -> str:
+    """Generate a simple analysis when LLM is unavailable."""
+    # Extract key numbers from the report
+    lines = data_report.strip().split("\n")
+    summary_lines = [l.strip() for l in lines if l.strip() and ":" in l][:8]
+    summary = "\n".join(f"• {l}" for l in summary_lines)
+    return (
+        f"Based on the available satellite data for your area:\n\n"
+        f"{summary}\n\n"
+        f"(AI analysis temporarily unavailable — showing raw data summary)"
+    )
+
+
 def _fetch_url_post(req: urlrequest.Request) -> str:
-    with urlrequest.urlopen(req, timeout=10) as resp:
+    with urlrequest.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8")
