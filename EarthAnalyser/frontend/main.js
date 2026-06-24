@@ -45,7 +45,9 @@ function bboxToH3Res(bbox) {
   if (span < 1.0) return 6;
   if (span < 3.0) return 5;
   if (span < 8.0) return 4;
-  return 3;
+  if (span < 20.0) return 3;
+  if (span < 60.0) return 2;
+  return 1;
 }
 
 // ─── Map ─────────────────────────────────────────────────────
@@ -377,14 +379,19 @@ function renderAllDatasets() {
         // Merge all static frames
         const allHexes = frames.flatMap(f => f.hexagons || []);
         renderDatasetHexagons(ds, allHexes);
-      } else {
-        const frame = frames.find(f => f.acq_date === currentDate);
-        if (frame) {
-          renderDatasetHexagons(ds, frame.hexagons || []);
-        } else {
-          // No frame for this date — show nothing (gap day)
-          datasetLayers[ds].clearLayers();
+      } else if (frames.length > 0 && currentDate) {
+        // Carry-forward: show the most recent frame at or before the current date
+        let best = null;
+        for (const f of frames) {
+          if (f.acq_date <= currentDate) {
+            if (!best || f.acq_date > best.acq_date) best = f;
+          }
         }
+        // If no frame at-or-before (current date is before first observation), show first frame
+        if (!best) best = frames[0];
+        renderDatasetHexagons(ds, best.hexagons || []);
+      } else {
+        datasetLayers[ds].clearLayers();
       }
     }
   }
@@ -1339,7 +1346,7 @@ async function handleAgentQuestion(question) {
     body: JSON.stringify({ question }),
   }).then(r => r.ok ? r.json() : null).catch(() => null);
 
-  // ─── Extract date range from question ───
+  // ─── Extract date range from question (client-side fallback, AI may override) ───
   const extractedRange = extractDateRange(question);
   if (extractedRange) {
     queryDateRange = extractedRange;
@@ -1414,13 +1421,21 @@ async function handleAgentQuestion(question) {
   }
 
   // Await LLM classification with a fast timeout — don't let it block
-  const classifyTimeout = new Promise(r => setTimeout(() => r(null), 2000));
+  const classifyTimeout = new Promise(r => setTimeout(() => r(null), 4000));
   const classifyResult = await Promise.race([classifyPromise, classifyTimeout]);
+
+  // Apply AI-determined date range (overrides client-side extraction)
+  if (classifyResult?.date_start && classifyResult?.date_end) {
+    queryDateRange = { start: classifyResult.date_start, end: classifyResult.date_end };
+    if (startDate) startDate.value = classifyResult.date_start;
+    if (endDate) endDate.value = classifyResult.date_end;
+  }
+
   const needed = classifyResult?.categories?.length
     ? classifyResult.categories
     : inferNeededDatasets(question); // fallback to keyword-based (instant)
 
-  // Update UI checkboxes to match LLM selection
+  // Update UI checkboxes to match AI selection
   for (const cb of $$("#dataset-grid input[type='checkbox']")) {
     cb.checked = needed.includes(cb.value);
   }
@@ -1539,7 +1554,7 @@ async function handleAgentQuestion(question) {
       lastFetchRes = res;
       lastFetchKey = makeFetchKey(bbox, res, queryDateRange, Object.keys(datasetResults));
       // Cache newly fetched datasets individually
-      cacheStoreDatasets(bbox, res, queryDateRange, result.datasets, timeline);
+      cacheStoreDatasets(bbox, res, queryDateRange, result.datasets, fullTimeline);
       renderAllDatasets();
       updateTimelineUI();
       setProgress(100);
