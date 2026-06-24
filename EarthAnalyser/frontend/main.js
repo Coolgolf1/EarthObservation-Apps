@@ -97,6 +97,7 @@ let isFetching = false;
 let refetchTimer = null;
 let activeAbortController = null; // cancel in-flight requests on new fetch
 let _fetchGeneration = 0; // monotonically increasing; detects stale fetches
+let _agentActive = false; // true while agent is processing (blocks refetch)
 
 // Client-side result cache (key → {datasets, timeline})
 const resultCache = new Map();
@@ -447,15 +448,25 @@ function drawTimelineChart() {
     const y0 = pad + bandIdx * bandH;
     const colors = DATASET_COLORS[ds] || DATASET_COLORS.fire;
 
+    // Find max hexagon count across all frames for relative intensity scaling
+    let maxHex = 0;
+    for (const f of frames) {
+      const c = (f.hexagons || []).length;
+      if (c > maxHex) maxHex = c;
+    }
+    if (maxHex < 1) maxHex = 1;
+
     for (let i = 0; i < timeline.length; i++) {
       const frame = frameByDate.get(timeline[i]);
       const hexCount = frame ? (frame.hexagons || []).length : 0;
       if (hexCount > 0) {
+        // Color intensity scales from 0.35 (1 detection) to 1.0 (max detections)
+        const intensity = 0.35 + 0.65 * (hexCount / maxHex);
         ctx.fillStyle = colors.base;
-        ctx.globalAlpha = 0.3 + Math.min(0.7, hexCount / 50);
+        ctx.globalAlpha = intensity;
       } else {
-        ctx.fillStyle = "#ddd";
-        ctx.globalAlpha = 0.2;
+        ctx.fillStyle = "#e0e0e0";
+        ctx.globalAlpha = 0.15;
       }
       ctx.fillRect(Math.round(pad + i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
     }
@@ -704,6 +715,7 @@ function cancelRefetch() {
 
 async function refetchForCurrentView() {
   if (!queryDateRange) return;
+  if (_agentActive) return; // don't interrupt the agent's fetch
 
   // Use drawn bbox if available, otherwise map bounds
   const bbox = activeBbox();
@@ -862,27 +874,70 @@ function streamText(text) {
     const el = document.createElement("div");
     el.className = "chat-msg agent";
     chatLog.appendChild(el);
-    let i = 0;
+    // Fast reveal: show text in large chunks (near-instant for short texts)
     const chars = text.split("");
-    const speed = Math.max(2, Math.min(8, 800 / chars.length)); // faster for longer texts
-    const chunkSize = Math.max(3, Math.ceil(chars.length / 150));
+    if (chars.length < 200) {
+      // Short text: show immediately
+      el.textContent = text;
+      chatLog.scrollTop = chatLog.scrollHeight;
+      resolve();
+      return;
+    }
+    // Longer text: rapid chunked reveal
+    let i = 0;
+    const chunkSize = Math.max(10, Math.ceil(chars.length / 30));
     const iv = setInterval(() => {
       el.textContent += chars.slice(i, i + chunkSize).join("");
       i += chunkSize;
       chatLog.scrollTop = chatLog.scrollHeight;
       if (i >= chars.length) { clearInterval(iv); resolve(); }
-    }, speed);
+    }, 16); // ~60fps
   });
 }
 
 /**
- * Get a natural AI response. Sends the data report to the LLM and returns
- * a conversational answer. Falls back to a simple summary if LLM unavailable.
+ * Get a natural AI response. Tries the LLM with a fast timeout,
+ * falls back instantly to local summary if unavailable.
  */
+let _llmAvailable = false; // start disabled; enable after first successful call
+let _llmFailCount = 0;
+let _llmChecked = false; // have we tried at all yet?
+
 async function getAIResponse(question, dataReport) {
+  // Quick check on first call — if it works, enable LLM going forward
+  if (!_llmChecked) {
+    _llmChecked = true;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 2000); // 2s probe
+      const res = await fetch(`${API_BASE}/datasets/analyse`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question: question || "test", data_report: dataReport }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.model && data.model !== "fallback") {
+          _llmAvailable = true;
+          return data.analysis;
+        }
+        // Server returned fallback — LLM is down, use local
+        return data.analysis || buildFallbackResponse(question, dataReport);
+      }
+    } catch (e) { /* LLM unavailable */ }
+    return buildFallbackResponse(question, dataReport);
+  }
+
+  // After first check, skip network if LLM is known unavailable
+  if (!_llmAvailable) {
+    return buildFallbackResponse(question, dataReport);
+  }
+
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000); // 8s max
+    const timeout = setTimeout(() => controller.abort(), 3000);
     const res = await fetch(`${API_BASE}/datasets/analyse`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -895,28 +950,135 @@ async function getAIResponse(question, dataReport) {
     clearTimeout(timeout);
     if (res.ok) {
       const data = await res.json();
-      if (data.analysis) return data.analysis;
+      _llmFailCount = 0;
+      if (data.analysis && data.model !== "fallback") return data.analysis;
+      return data.analysis || buildFallbackResponse(question, dataReport);
     }
   } catch (e) {
-    console.warn("LLM unavailable:", e);
+    _llmFailCount++;
+    if (_llmFailCount >= 2) {
+      _llmAvailable = false;
+      setTimeout(() => { _llmAvailable = true; _llmFailCount = 0; }, 60000);
+    }
   }
-  // Fallback: return a cleaned-up version of the data report
   return buildFallbackResponse(question, dataReport);
 }
 
 function buildFallbackResponse(question, report) {
-  // Convert the structured report into a more readable summary
   if (!report || report.length < 20) return "I don't have enough data yet. Try running an analysis first.";
-  // Just clean up the report a bit
+
+  const q = (question || "").toLowerCase();
+  const parts = [];
+
+  // Extract location
+  const locMatch = report.match(/Location:\s*(.+)/);
+  const loc = locMatch ? locMatch[1].trim() : "";
+  const locStr = loc ? ` near ${loc}` : "";
+
+  // ─── "Why" / causal questions: focus on the WHY section of the report
+  const isCausal = /why|cause|reason|explain|prevent|risk|trigger|what.*(led|start)/i.test(q);
+  if (isCausal) {
+    // Extract the WHY section from the report
+    const whyMatch = report.match(/WHY:\s*([\s\S]*?)(?:\n\n|\n---|\Z)/);
+    const tempMatch = report.match(/TEMPERATURE:.*?(\d+\.?\d*)\s*°C.*?max\s*(\d+\.?\d*)/i);
+    const vegMatch = report.match(/VEGETATION:.*?NDVI\s*(\d+\.\d+).*?(\d+)%.*?(?:dry|stressed)/i);
+    const fireMatch = report.match(/FIRE:\s*(\d+)\s*cells.*?(\d+)\s*days/);
+    const landMatch = report.match(/LAND USE:\s*(.+?)(?:\n|$)/);
+
+    if (whyMatch || tempMatch || vegMatch) {
+      // Build a causal explanation
+      if (fireMatch) {
+        parts.push(`The fires${locStr} (${fireMatch[1]} active cells over ${fireMatch[2]} days) are likely driven by several factors:`);
+      } else {
+        parts.push(`Here's what's contributing to fire risk${locStr}:`);
+      }
+
+      if (tempMatch) {
+        const avg = parseFloat(tempMatch[1]), max = parseFloat(tempMatch[2]);
+        if (avg > 35) parts.push(`Extreme heat — surface temperatures averaged ${avg.toFixed(0)}°C and peaked at ${max.toFixed(0)}°C. At these temperatures, vegetation dries rapidly, making ignition easy and spread fast.`);
+        else if (avg > 28) parts.push(`Warm conditions — surface temperatures averaged ${avg.toFixed(0)}°C (max ${max.toFixed(0)}°C), drying out fuels.`);
+        else parts.push(`Moderate temperatures (avg ${avg.toFixed(0)}°C) — heat alone isn't the main driver here.`);
+      }
+
+      if (vegMatch) {
+        const ndvi = parseFloat(vegMatch[1]), dryPct = parseInt(vegMatch[2]);
+        if (ndvi < 0.25) parts.push(`Vegetation is very dry (NDVI ${ndvi.toFixed(2)}) with ${dryPct}% of the area stressed or dormant. This creates abundant dry fuel that burns easily.`);
+        else if (ndvi < 0.4) parts.push(`Mixed vegetation conditions (NDVI ${ndvi.toFixed(2)}). ${dryPct}% of the area has dry/stressed vegetation that can carry fire.`);
+        else parts.push(`Vegetation is relatively green (NDVI ${ndvi.toFixed(2)}), so these fires are more likely human-caused (agricultural burns, arson, or equipment) rather than drought-driven.`);
+      }
+
+      if (landMatch) {
+        const landInfo = landMatch[1];
+        if (/shrub.*\d{2}%|grass.*\d{2}%/.test(landInfo)) parts.push(`The landscape has significant shrubland/grassland which burns easily, especially when dry.`);
+        if (/crop.*\d{2}%/.test(landInfo)) parts.push(`Cropland in the area suggests some fires may be agricultural burns.`);
+      }
+
+      if (whyMatch && whyMatch[1].trim()) {
+        // Use the WHY section from the report
+        const whyText = whyMatch[1].trim();
+        if (whyText.length > 10) {
+          parts.push(whyText);
+        }
+      }
+
+      // If we still only have the intro and no details from data, add general reasoning
+      if (parts.length <= 1) {
+        if (fireMatch) {
+          parts.push("Fires in this region are typically caused by a combination of high temperatures, dry vegetation, and human activity (agricultural burns, arson, power line faults). Mediterranean landscapes with eucalyptus and shrubland are especially fire-prone during summer.");
+          parts.push("To understand the specific drivers better, try asking about weather or vegetation in this area — I'll load the temperature and NDVI data to give you a more detailed picture.");
+        } else {
+          parts.push("I need more data to explain the causes. Try asking about weather or vegetation conditions.");
+        }
+      }
+
+      return parts.join("\n\n");
+    }
+  }
+
+  // ─── Non-causal: standard data summary
+  // Fire
+  const fireMatch = report.match(/FIRE:\s*(\d+)\s*cells.*?(\d+)\s*days.*?(\d+)%\s*high/);
+  if (fireMatch) {
+    parts.push(`I found fire activity${locStr} across ${fireMatch[1]} areas over ${fireMatch[2]} days. ${fireMatch[3]}% were high-confidence detections.`);
+    const peak = report.match(/Peak:?\s*(\S+)\s*\((\d+)/);
+    if (peak) parts.push(`Peak day was ${peak[1]} with ${peak[2]} active cells.`);
+    const trend = report.match(/(increasing|decreasing|Steady|stable)/i);
+    if (trend) {
+      const t = trend[1].toLowerCase();
+      if (t === "increasing") parts.push("Activity is increasing — this needs monitoring.");
+      else if (t === "decreasing") parts.push("Activity is declining.");
+    }
+  } else if (/fire/i.test(q) && /0 cells|No fire/i.test(report)) {
+    parts.push(`No fire activity detected${locStr} during this period.`);
+  }
+
+  // Weather
+  const tempMatch2 = report.match(/TEMPERATURE:.*?(\d+\.?\d*)\s*°C.*?max\s*(\d+\.?\d*)/i);
+  if (tempMatch2) {
+    parts.push(`Land surface temperatures${locStr} averaged ${tempMatch2[1]}°C, peaking at ${tempMatch2[2]}°C.`);
+  }
+
+  // Vegetation
+  const ndviMatch = report.match(/NDVI\s*(\d+\.\d+)/i);
+  if (ndviMatch) {
+    const v = parseFloat(ndviMatch[1]);
+    const health = v > 0.6 ? "healthy" : v > 0.4 ? "moderate" : v > 0.25 ? "stressed" : "very stressed";
+    parts.push(`Vegetation${locStr} is ${health} (NDVI: ${v.toFixed(2)}).`);
+  }
+
+  if (parts.length > 0) return parts.join(" ");
+
+  // Generic cleanup
   return report
     .replace(/^REPORT:.*\n/m, "")
     .replace(/^Area:.*\n/m, "")
+    .replace(/^Location:.*\n/m, "")
     .replace(/---\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-function generateInsight(question) {
+function generateInsight(question, placeName) {
   // Use all loaded datasets for analysis, not just checked ones
   const allLoaded = Object.keys(datasetResults).filter(ds => datasetResults[ds]?.total_hexagons > 0);
   const checked = [...new Set([...getCheckedDatasets(), ...allLoaded])];
@@ -1000,6 +1162,8 @@ function generateInsight(question) {
 
   // Always lead with a direct summary of what the data shows
   r += `REPORT: ${period}\n`;
+  const locationStr = placeName ? `Location: ${placeName}\n` : "";
+  r += locationStr;
   r += `Area: ${activeBbox().map(v => v.toFixed(2)).join(", ")} | H3 res ${currentH3Res}\n\n`;
 
   // Fire section
@@ -1049,8 +1213,8 @@ function generateInsight(question) {
     r += `\n\n`;
   }
 
-  // ─── Explanation / Why section (always included if enough data)
-  if (hasFire && (hasWeather || hasVeg || hasLanduse)) {
+  // ─── Explanation / Why section
+  if (hasFire) {
     r += `---\nWHY: `;
     const reasons = [];
 
@@ -1068,6 +1232,28 @@ function generateInsight(question) {
     }
     if (fireTrend === "increasing") {
       reasons.push(`fire is spreading (escalating ${Math.round((fireSecondHalf/Math.max(fireFirstHalf,0.1)-1)*100)}% over the period)`);
+    }
+
+    // If no supporting datasets loaded, provide general fire causes based on season/location
+    if (!hasWeather && !hasVeg && !hasLanduse) {
+      const period = queryDateRange || {};
+      const startMonth = period.start ? new Date(period.start + "T00:00:00Z").getMonth() : -1;
+      if (startMonth >= 5 && startMonth <= 8) {
+        reasons.push("summer heat and drought create ideal conditions for fire ignition and spread");
+        reasons.push("dry vegetation acts as fuel — lower NDVI values correlate with higher fire risk");
+      } else if (startMonth >= 2 && startMonth <= 4) {
+        reasons.push("spring conditions with dry grassland from winter can carry fire, especially with agricultural burns");
+      } else {
+        reasons.push("fires in this season may be related to land clearing, agricultural burns, or unusual drought");
+      }
+      reasons.push("common ignition sources include human activity (arson, equipment), lightning, and agricultural burning");
+      if (placeName && /portugal|spain|mediterranean|greece|italy/i.test(placeName)) {
+        reasons.push("Mediterranean landscapes with eucalyptus and maquis shrubland are particularly fire-prone");
+      }
+    }
+
+    if (reasons.length > 0) {
+      r += reasons.join("; ") + `. `;
     }
 
     if (reasons.length > 0) {
@@ -1169,7 +1355,6 @@ async function runQuery() {
     if (askHint) askHint.classList.add("hidden");
     const totalHex = Object.values(datasetResults).reduce((s, d) => s + (d.total_hexagons || 0), 0);
     updateStatus(`${totalHex} hexagons · ${datasets.join(", ")} · H3 res ${currentH3Res} (cached)`);
-    addTyping();
     const report = generateInsight(currentQuery);
     const response = await getAIResponse(currentQuery, report);
     await streamText(response);
@@ -1251,15 +1436,19 @@ async function runQuery() {
     const totalHex = Object.values(datasetResults).reduce((s, d) => s + (d.total_hexagons || 0), 0);
     updateStatus(`${totalHex} hexagons · ${datasets.join(", ")} · H3 res ${currentH3Res}`);
 
-    // Generate AI response
-    addTyping();
+    // Generate instant response
     const report = generateInsight(currentQuery);
     const response = await getAIResponse(currentQuery, report);
     await streamText(response);
     updateTimelineUI();
 
   } catch (err) {
-    if (err.name === "AbortError") return;
+    if (err.name === "AbortError") {
+      isFetching = false;
+      setFetching(false);
+      hideLoading();
+      return;
+    }
     isFetching = false;
     setFetching(false);
     hideLoading();
@@ -1284,62 +1473,132 @@ if (chatForm) chatForm.addEventListener("submit", (e) => {
 });
 
 // Determine which datasets the agent needs to answer a question
+// Returns ONLY the primary datasets the user is asking about (for plotting)
 function inferNeededDatasets(question) {
   const q = question.toLowerCase();
   const needed = new Set();
 
-  // Always include fire if asking about fire or cause/risk
+  // Match only explicitly mentioned categories
   if (/fire|burn|blaze|wildfire|ignit/.test(q)) needed.add("fire");
   if (/flood|water|rain|river|inundat/.test(q)) needed.add("flood");
   if (/veget|ndvi|plant|green|dry|drought|fuel|biomass/.test(q)) needed.add("vegetation");
   if (/temp|heat|hot|cold|weather|climate|lst|thermal/.test(q)) needed.add("weather");
   if (/land.?use|urban|crop|forest|built|city|agriculture/.test(q)) needed.add("landuse");
 
-  // Causal/risk/why questions need multiple datasets for explanation
-  if (/why|cause|reason|explain|because|led to|trigger|risk|danger|threat/.test(q)) {
-    // If asking about fire causes, pull supporting datasets
-    if (needed.has("fire") || datasetResults.fire?.total_hexagons > 0) {
-      needed.add("fire");
-      needed.add("weather");
-      needed.add("vegetation");
-      needed.add("landuse");
-    }
-    // If asking about floods
-    if (needed.has("flood") || datasetResults.flood?.total_hexagons > 0) {
-      needed.add("flood");
-      needed.add("weather");
-      needed.add("vegetation");
-    }
-  }
-
-  // Trend / temporal questions — keep what's already loaded + add context
-  if (/trend|increas|decreas|spread|chang|over time|compar/.test(q)) {
-    for (const ds of Object.keys(datasetResults)) {
-      if (datasetResults[ds]?.total_hexagons > 0) needed.add(ds);
-    }
-    if (needed.has("fire")) { needed.add("weather"); needed.add("vegetation"); }
-  }
-
-  // Generic "what happened" / "analyze" — use all relevant context
-  if (/what.*(happen|going|see)|analyz|summar|overview|assess/.test(q)) {
+  // Generic "what happened" / "analyze" / "show everything" — use all
+  if (/what.*(happen|going|see)|analyz|summar|overview|assess|everything|all/.test(q)) {
     needed.add("fire");
     needed.add("weather");
     needed.add("vegetation");
   }
 
-  // If nothing inferred, at least use whatever is already loaded
+  // If nothing inferred, default to fire only (most common use case)
   if (needed.size === 0) {
-    for (const ds of Object.keys(datasetResults)) {
-      if (datasetResults[ds]?.total_hexagons > 0) needed.add(ds);
+    // Check if we already have data loaded — show that
+    const loaded = Object.keys(datasetResults).filter(ds => datasetResults[ds]?.total_hexagons > 0);
+    if (loaded.length > 0) {
+      for (const ds of loaded) needed.add(ds);
+    } else {
+      needed.add("fire");
     }
   }
 
   return [...needed];
 }
 
+// Infer CONTEXT categories (loaded for reasoning but not plotted)
+function inferContextDatasets(question, plotDatasets) {
+  const q = question.toLowerCase();
+  const context = new Set();
+
+  // Causal/risk/why questions need supporting data
+  if (/why|cause|reason|explain|because|led to|trigger|risk|danger|threat|prevent/.test(q)) {
+    if (plotDatasets.includes("fire")) {
+      context.add("weather");
+      context.add("vegetation");
+    }
+    if (plotDatasets.includes("flood")) {
+      context.add("weather");
+      context.add("landuse");
+    }
+    if (plotDatasets.includes("vegetation")) {
+      context.add("weather");
+    }
+  }
+
+  // Remove anything already in plot
+  for (const ds of plotDatasets) context.delete(ds);
+  return [...context];
+}
+
 // Auto-fetch missing datasets needed to answer a question
 async function handleAgentQuestion(question) {
-  // Run LLM classification and geocoding in parallel for speed
+  _agentActive = true;
+
+  // ─── Follow-up detection: if we already have data and this looks like
+  //     a follow-up question (no new place, no new date), just answer from
+  //     existing data without re-fetching or moving the map.
+  const hasLoadedData = Object.values(datasetResults).some(d => d?.total_hexagons > 0);
+  const placeQuery = extractPlaceName(question);
+  const extractedRange = extractDateRange(question);
+  const isFollowUp = hasLoadedData && !placeQuery && !extractedRange;
+
+  if (isFollowUp) {
+    // Answer directly from already-loaded data
+    removeTyping();
+
+    // For causal/why questions, load context datasets BEFORE answering
+    const isCausalQuestion = /why|cause|reason|explain|prevent|risk|trigger|what.*(led|start|happen)/i.test(question);
+    const classifyResult = await Promise.race([
+      fetch(`${API_BASE}/datasets/classify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      }).then(r => r.ok ? r.json() : null).catch(() => null),
+      new Promise(r => setTimeout(() => r(null), 2000)),
+    ]);
+
+    const contextCats = classifyResult?.context_categories || inferContextDatasets(question, Object.keys(datasetResults));
+    // Fetch missing context datasets — WAIT for them on causal questions
+    if (contextCats.length > 0 && queryDateRange) {
+      const bbox = activeBbox();
+      const res = currentH3Res || getEffectiveResolution(bbox);
+      const { missing } = cacheLookupDatasets(bbox, res, queryDateRange, contextCats);
+      if (missing.length > 0) {
+        if (isCausalQuestion) {
+          // Wait for context data so we can explain causes properly (max 10s)
+          addTyping();
+          updateStatus(`Loading ${missing.join(", ")} for analysis...`);
+          const ctxController = new AbortController();
+          const ctxTimeout = setTimeout(() => ctxController.abort(), 10000);
+          try {
+            await fetchDatasetsH3Stream(
+              bbox, queryDateRange.start, queryDateRange.end, res, missing, ctxController.signal,
+              (dsKey, dsData) => { datasetResults[dsKey] = dsData; }
+            );
+          } catch (e) { /* best effort — answer with whatever we have */ }
+          clearTimeout(ctxTimeout);
+          removeTyping();
+        } else {
+          // Non-causal follow-up: background load
+          fetchDatasetsH3Stream(
+            bbox, queryDateRange.start, queryDateRange.end, res, missing, new AbortController().signal,
+            (dsKey, dsData) => { datasetResults[dsKey] = dsData; }
+          ).catch(() => {});
+        }
+      }
+    }
+
+    const report = generateInsight(question, _cachedPlaceName);
+    const response = await getAIResponse(question, report);
+    await streamText(response);
+    _agentActive = false;
+    _updatePlaceNameCache();
+    return;
+  }
+
+  // ─── New query: full flow with geocoding + data fetch ───
+  // Run LLM classification in parallel for speed
   const classifyPromise = fetch(`${API_BASE}/datasets/classify`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1347,7 +1606,6 @@ async function handleAgentQuestion(question) {
   }).then(r => r.ok ? r.json() : null).catch(() => null);
 
   // ─── Extract date range from question (client-side fallback, AI may override) ───
-  const extractedRange = extractDateRange(question);
   if (extractedRange) {
     queryDateRange = extractedRange;
     if (startDate) startDate.value = extractedRange.start;
@@ -1361,7 +1619,6 @@ async function handleAgentQuestion(question) {
 
   // ─── Step 1: Geocode — extract place name and center the map there
   let bbox = activeBbox();
-  const placeQuery = extractPlaceName(question);
   if (placeQuery) {
     try {
       updateStatus(`Locating "${placeQuery}"...`);
@@ -1374,9 +1631,17 @@ async function handleAgentQuestion(question) {
         const geo = await geoRes.json();
         if (geo.bbox && geo.lat && geo.lon) {
           bbox = geo.bbox;
-          resolvedBbox = [...bbox];
+          // Cap bbox size for performance — if geocode returns a huge area
+          // (e.g., a whole country), shrink to ~1° around the center
           const [w, s, e, n] = bbox;
-          map.fitBounds([[s, w], [n, e]], { padding: [40, 40], animate: true });
+          const span = Math.max(e - w, n - s);
+          if (span > 2.0) {
+            const maxSpan = 1.5; // ~150km — good for regional analysis
+            const cx = (w + e) / 2, cy = (s + n) / 2;
+            bbox = [cx - maxSpan / 2, cy - maxSpan / 2, cx + maxSpan / 2, cy + maxSpan / 2];
+          }
+          resolvedBbox = [...bbox];
+          map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [40, 40], animate: true });
           currentH3Res = getEffectiveResolution(bbox);
           updateStatus(`Centered on ${geo.name?.split(",")[0] || placeQuery}`);
           // Small delay to let map animate
@@ -1431,13 +1696,20 @@ async function handleAgentQuestion(question) {
     if (endDate) endDate.value = classifyResult.date_end;
   }
 
-  const needed = classifyResult?.categories?.length
+  // Separate "plot" categories (shown on map) from "context" categories (loaded for reasoning)
+  const plotCategories = classifyResult?.categories?.length
     ? classifyResult.categories
     : inferNeededDatasets(question); // fallback to keyword-based (instant)
 
-  // Update UI checkboxes to match AI selection
+  const contextCategories = classifyResult?.context_categories?.length
+    ? classifyResult.context_categories
+    : inferContextDatasets(question, plotCategories); // fallback
+  // All datasets to fetch = plot + context (but only plot ones are shown)
+  const needed = [...new Set([...plotCategories, ...contextCategories])];
+
+  // Update UI checkboxes — only check the PLOT categories (what user sees)
   for (const cb of $$("#dataset-grid input[type='checkbox']")) {
-    cb.checked = needed.includes(cb.value);
+    cb.checked = plotCategories.includes(cb.value);
   }
 
   // If no categories determined, just respond with current data
@@ -1446,6 +1718,7 @@ async function handleAgentQuestion(question) {
     const report = generateInsight(question);
     const response = await getAIResponse(question, report);
     await streamText(response);
+    _agentActive = false;
     return;
   }
 
@@ -1453,6 +1726,7 @@ async function handleAgentQuestion(question) {
   if (!queryDateRange) {
     removeTyping();
     await streamText("I need a date range to look at. Set the 'From' and 'To' dates on the left, then ask me again.");
+    _agentActive = false;
     return;
   }
 
@@ -1483,11 +1757,14 @@ async function handleAgentQuestion(question) {
   if (Object.keys(agentCached).length > 0) {
     for (const [ds, data] of Object.entries(agentCached)) {
       datasetResults[ds] = data;
-      const cb = $(`#dataset-grid input[value="${ds}"]`);
-      if (cb && !cb.checked) cb.checked = true;
-      const layer = datasetLayers[ds];
-      if (layer && !map.hasLayer(layer)) layer.addTo(map);
-      renderDatasetHexagons(ds, data.hexagons || []);
+      // Only render on map if it's a plot category
+      if (plotCategories.includes(ds)) {
+        const cb = $(`#dataset-grid input[value="${ds}"]`);
+        if (cb && !cb.checked) cb.checked = true;
+        const layer = datasetLayers[ds];
+        if (layer && !map.hasLayer(layer)) layer.addTo(map);
+        renderDatasetHexagons(ds, data.hexagons || []);
+      }
     }
     if (agentCachedTimeline.length > fullTimeline.length) {
       fullTimeline = agentCachedTimeline;
@@ -1508,10 +1785,10 @@ async function handleAgentQuestion(question) {
     updateTimelineUI();
     updateStatus(`${Object.values(datasetResults).reduce((s, d) => s + (d.total_hexagons || 0), 0)} hexagons (cached)`);
     removeTyping();
-    addTyping();
     const report = generateInsight(question);
     const response = await getAIResponse(question, report);
     await streamText(response);
+    _agentActive = false;
     return;
   }
 
@@ -1530,10 +1807,13 @@ async function handleAgentQuestion(question) {
           loadedDs++;
         }
         setProgress(Math.round((loadedDs / totalDs) * 85) + 5);
-        const cb = $(`#dataset-grid input[value="${dsKey}"]`);
-        if (cb && !cb.checked) cb.checked = true;
-        const layer = datasetLayers[dsKey];
-        if (layer && !map.hasLayer(layer)) layer.addTo(map);
+        // Only show on map if it's a PLOT category (not context-only)
+        if (plotCategories.includes(dsKey)) {
+          const cb = $(`#dataset-grid input[value="${dsKey}"]`);
+          if (cb && !cb.checked) cb.checked = true;
+          const layer = datasetLayers[dsKey];
+          if (layer && !map.hasLayer(layer)) layer.addTo(map);
+        }
         viewMode = "timeline";
         if (currentFrameIdx >= timeline.length) currentFrameIdx = 0;
         renderAllDatasets();
@@ -1565,6 +1845,7 @@ async function handleAgentQuestion(question) {
       isFetching = false;
       setFetching(false);
       hideLoading();
+      _agentActive = false;
       return;
     }
     console.warn("Agent fetch failed:", err);
@@ -1573,6 +1854,7 @@ async function handleAgentQuestion(question) {
     isFetching = false;
     setFetching(false);
     hideLoading();
+    _agentActive = false;
     return;
   }
 
@@ -1581,12 +1863,37 @@ async function handleAgentQuestion(question) {
   hideLoading();
   if (askHint) askHint.classList.add("hidden");
 
-  // Generate natural AI response
+  // Generate response instantly using local data — don't wait for network
   removeTyping();
-  addTyping();
-  const agentReport = generateInsight(question);
+  _agentActive = false;
+
+  // Use cached place name or fire-and-forget reverse geocode for next time
+  const agentReport = generateInsight(question, _cachedPlaceName);
   const response = await getAIResponse(question, agentReport);
   await streamText(response);
+
+  // Update place name cache in background (for next question)
+  _updatePlaceNameCache();
+}
+
+// Cached place name (updated in background, never blocks)
+let _cachedPlaceName = "";
+let _placeNameBbox = "";
+
+function _updatePlaceNameCache() {
+  const bbox = activeBbox();
+  const key = bbox.map(v => v.toFixed(1)).join(",");
+  if (key === _placeNameBbox) return; // already have it for this area
+  _placeNameBbox = key;
+  const [w, s, e, n] = bbox;
+  const lat = (s + n) / 2, lon = (w + e) / 2;
+  fetch(`${API_BASE}/datasets/reverse-geocode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lat, lon }),
+  }).then(r => r.ok ? r.json() : null).then(d => {
+    if (d?.name) _cachedPlaceName = d.name;
+  }).catch(() => {});
 }
 
 // Extract date range from a natural language query
@@ -1660,6 +1967,17 @@ function extractDateRange(question) {
 function extractPlaceName(question) {
   const q = question.trim();
 
+  // ─── Follow-up detection: skip geocoding for conversational follow-ups
+  // These are questions that reference the current context, not a new place
+  if (/^(why|what|how|when|who|can you|could you|tell me|explain|is there|are there|show me more|go deeper|more detail)/i.test(q)) {
+    // Only geocode if there's an explicit "in [place]" pattern
+    const explicitPlace = q.match(/\b(?:in|at|near|around)\s+([A-Z][a-zA-Z\s]{2,}?)(?:\s+(?:last|next|past|from|between|for|during)\b|[?!.]|$)/);
+    if (explicitPlace && explicitPlace[1].trim().length >= 2) {
+      return explicitPlace[1].trim();
+    }
+    return null; // follow-up — stay where we are
+  }
+
   // Try to find "in/at/near/around [place]" patterns first (most reliable)
   const inMatch = q.match(/\b(?:in|at|near|around|over|of)\s+(.+?)(?:\s+(?:last|next|past|from|between|for|during)\b|[?!.]|$)/i);
   if (inMatch && inMatch[1].trim().length >= 2) {
@@ -1677,17 +1995,21 @@ function extractPlaceName(question) {
     return beforeDs[1].trim();
   }
 
-  // Last resort: strip all action/dataset/time words and see if a place remains
-  const stripped = q
-    .replace(/\b(show|find|search|analyze|get|fetch|plot|display|check|look|tell|me|about|what|where|why|how|is|are|the|any|some|this|that)\b/gi, "")
-    .replace(/\b(fire|flood|vegetation|weather|land\s*use|temperature|heat|ndvi|risk|danger|activity|data|detections?|conditions?|status|report|trends?|history)\b/gi, "")
-    .replace(/\b(last|next|past|from|to|over|between|during)\b/gi, "")
-    .replace(/\b\d+\s*(km|min|minutes?|hours?|days?|weeks?|months?|years?)\b/gi, "")
-    .replace(/[?!.,;:]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  // Only use the "strip everything" fallback for short, command-like queries
+  // (e.g., "Portugal fires") — NOT for conversational questions
+  if (q.split(/\s+/).length <= 4) {
+    const stripped = q
+      .replace(/\b(show|find|search|analyze|get|fetch|plot|display|check|look|tell|me|about|the|any|some|this|that)\b/gi, "")
+      .replace(/\b(fire|flood|vegetation|weather|land\s*use|temperature|heat|ndvi|risk|danger|activity|data|detections?|conditions?|status)\b/gi, "")
+      .replace(/\b(last|next|past|from|to|over|between|during)\b/gi, "")
+      .replace(/\b\d+\s*(km|min|minutes?|hours?|days?|weeks?|months?|years?)\b/gi, "")
+      .replace(/[?!.,;:]+/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (stripped.length >= 3) return stripped;
+  }
 
-  return stripped.length >= 3 ? stripped : null;
+  return null;
 }
 
 // Drawing
@@ -1789,6 +2111,8 @@ map.on("zoomend", () => {
 map.on("moveend", () => {
   if (!queryDateRange) return;
   scheduleRefetch();
+  // Pre-cache place name for instant agent responses
+  _updatePlaceNameCache();
 });
 
 // Resolution slider
