@@ -497,6 +497,94 @@ button[type="submit"]:hover {
   align-self: flex-start;
 }
 
+.chat-msg.agent.rich {
+  background: transparent;
+  border: none;
+  padding: 4px 0;
+}
+
+/* Insight cards */
+.insight-intro {
+  font-size: 0.82rem;
+  color: #2c3e50;
+  margin-bottom: 8px;
+  line-height: 1.5;
+}
+
+.insight-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.insight-card {
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  border-left: 3px solid;
+}
+
+.insight-card .card-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-bottom: 4px;
+}
+
+.insight-card .card-body {
+  color: #3d4f5f;
+}
+
+.insight-card .card-body .metric {
+  font-weight: 600;
+  color: inherit;
+}
+
+.insight-card.fire { background: rgba(227,26,28,0.06); border-color: #e31a1c; }
+.insight-card.fire .card-header { color: #b71c1c; }
+.insight-card.weather { background: rgba(230,81,0,0.06); border-color: #e65100; }
+.insight-card.weather .card-header { color: #bf360c; }
+.insight-card.vegetation { background: rgba(46,125,50,0.06); border-color: #2e7d32; }
+.insight-card.vegetation .card-header { color: #1b5e20; }
+.insight-card.water { background: rgba(21,101,192,0.06); border-color: #1565c0; }
+.insight-card.water .card-header { color: #0d47a1; }
+.insight-card.landuse { background: rgba(109,76,65,0.06); border-color: #6d4c41; }
+.insight-card.landuse .card-header { color: #3e2723; }
+
+.insight-card.why {
+  background: rgba(103,58,183,0.06);
+  border-color: #7c4dff;
+  margin-top: 4px;
+}
+.insight-card.why .card-header { color: #4527a0; }
+
+.insight-card.hotspots {
+  background: rgba(0,0,0,0.03);
+  border-color: #78909c;
+}
+.insight-card.hotspots .card-header { color: #455a64; }
+
+.hotspot-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+.hotspot-chip {
+  background: rgba(0,0,0,0.05);
+  border-radius: 6px;
+  padding: 2px 7px;
+  font-size: 0.72rem;
+  font-family: 'Space Grotesk', monospace;
+  color: #546e7a;
+}
+
 .chat-msg .typing-dots {
   display: inline-flex;
   gap: 3px;
