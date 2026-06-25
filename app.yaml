@@ -3,3 +3,19 @@ command:
   - sh
   - -lc
   - uv lock --project backend && uv sync --project backend --frozen && uv run --project backend uvicorn backend.app.main:app --host 0.0.0.0 --port "$DATABRICKS_APP_PORT"
+env:
+  - name: LLM_API_KEY
+  - name: LLM_API_URL
+    value: "https://openrouter.ai/api/v1/chat/completions"
+  - name: LLM_MODEL
+    value: "qwen/qwen3-235b-a22b:free"
+  - name: ESRI_API_KEY
+  - name: OSM_ORS_API_KEY
+  - name: PLANET_API_KEY
+  - name: DB_NAME
+  - name: DB_USER
+  - name: DB_TOKEN
+  - name: DB_HOST
+  - name: DB_PORT
+    value: "5432"
+  - name: IMAGECUBES_TOKEN

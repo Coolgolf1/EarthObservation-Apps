@@ -39,11 +39,10 @@ repo_root = Path(__file__).resolve().parents[2]
 earthsearch_frontend_dir = repo_root / "EarthSearch" / "frontend"
 earthanalyser_frontend_dir = repo_root / "EarthAnalyser" / "frontend"
 
-if earthanalyser_frontend_dir.exists():
-	# Serve the fire visualizer without replacing the default EarthSearch root UI.
-	app.mount("/fireapp", StaticFiles(directory=earthanalyser_frontend_dir, html=True), name="earthanalyser_frontend")
-
 if earthsearch_frontend_dir.exists():
-	# Serve EarthSearch UI from root while preserving API routes.
-	app.mount("/", StaticFiles(directory=earthsearch_frontend_dir, html=True), name="earthsearch_frontend")
+	app.mount("/search", StaticFiles(directory=earthsearch_frontend_dir, html=True), name="earthsearch_frontend")
+
+if earthanalyser_frontend_dir.exists():
+	# Serve EarthAnalyser as the root UI.
+	app.mount("/", StaticFiles(directory=earthanalyser_frontend_dir, html=True), name="earthanalyser_frontend")
 

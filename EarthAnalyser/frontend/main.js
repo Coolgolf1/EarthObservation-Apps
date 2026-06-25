@@ -704,11 +704,29 @@ function updateTimelineUI() {
   drawTimelineChart();
 }
 
+function computeAnimationDelay() {
+  if (!timeline || timeline.length < 2) return 1000;
+  // Calculate time differences between consecutive timeline entries (in days)
+  const diffs = [];
+  for (let i = 1; i < timeline.length; i++) {
+    const prev = new Date(timeline[i - 1]).getTime();
+    const curr = new Date(timeline[i]).getTime();
+    const diffDays = Math.round((curr - prev) / DAY_MS);
+    diffs.push(diffDays);
+  }
+  // Check if all differences are the same (consistent)
+  const firstDiff = diffs[0];
+  const isConsistent = diffs.every(d => d === firstDiff);
+  // If consistent, use that step (in seconds); otherwise use 1 second
+  const stepSeconds = isConsistent ? firstDiff : 1;
+  return Math.max(100, stepSeconds * 1000);
+}
+
 function startPlayback() {
   stopPlayback();
   if (!timeline.length) return;
   viewMode = "timeline";
-  const speed = Math.max(300, Number(playSpeed?.value) || 700);
+  const speed = computeAnimationDelay();
   playbackTimer = setInterval(() => {
     currentFrameIdx = (currentFrameIdx + 1) % timeline.length;
     renderAllDatasets();
@@ -1328,8 +1346,7 @@ function generateInsight(question, placeName) {
   // Always lead with a direct summary of what the data shows
   r += `REPORT: ${period}\n`;
   const locationStr = placeName ? `Location: ${placeName}\n` : "";
-  r += locationStr;
-  r += `Area: ${activeBbox().map(v => v.toFixed(2)).join(", ")} | H3 res ${currentH3Res}\n\n`;
+  r += locationStr + "\n";
 
   // Fire section
   if (hasFire) {
