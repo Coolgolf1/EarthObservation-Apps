@@ -10,6 +10,7 @@ import asyncio
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -24,7 +25,7 @@ import pystac_client
 import rasterio
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window, from_bounds
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -37,6 +38,9 @@ MAX_CONCURRENT_RASTERS = 16          # max simultaneous raster reads
 MAX_WINDOW_PIXELS = 50_000_000      # cap raster window at ~50M pixels
 MAX_H3_INPUT_PIXELS = 10_000_000    # max pixels to convert to H3
 _RASTER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_RASTERS)
+
+# ─── Active task tracking (for cancellation) ─────────────────
+_active_tasks: set[asyncio.Task] = set()
 
 # ─── STAC Item Cache (avoid re-querying same collection/bbox/date range)
 _stac_cache: dict[str, list] = {}
@@ -719,8 +723,20 @@ async def query_datasets_h3(payload: DatasetH3Request):
 
 # ─── Streaming Endpoint (NDJSON — one line per dataset) ───────
 
+@router.post("/cancel")
+async def cancel_all_requests():
+    """Cancel all in-flight dataset processing tasks."""
+    cancelled = 0
+    for task in list(_active_tasks):
+        if not task.done():
+            task.cancel()
+            cancelled += 1
+    _active_tasks.clear()
+    return {"cancelled": cancelled}
+
+
 @router.post("/h3/stream")
-async def query_datasets_h3_stream(payload: DatasetH3Request):
+async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
     """
     Streaming version: sends each dataset result as a separate NDJSON line
     as soon as it's ready, so the frontend can render progressively.
@@ -967,19 +983,35 @@ async def query_datasets_h3_stream(payload: DatasetH3Request):
                 await queue.put(None)  # sentinel
 
             task = asyncio.ensure_future(run_all())
+            _active_tasks.add(task)
+            task.add_done_callback(_active_tasks.discard)
 
-            # Yield results as they arrive
+            # Yield results as they arrive, checking for client disconnect
             while True:
-                item = await queue.get()
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    task.cancel()
+                    break
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
                 if item is None:
                     break
                 yield item
 
-            await task  # ensure exceptions propagate
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
             # Send done signal
             yield json.dumps({"type": "done"}) + "\n"
 
+        except asyncio.CancelledError:
+            yield json.dumps({"type": "done"}) + "\n"
         except Exception as exc:
             yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
 
@@ -1159,21 +1191,149 @@ class GeocodeRequest(BaseModel):
     query: str = Field(min_length=1, max_length=200)
 
 
+async def _llm_fix_place_name(query: str) -> str:
+    """Use lightweight Gemma to correct typos in a place name before geocoding."""
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    if not api_key or len(query) <= 2:
+        return query
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You fix place names. Given a potentially misspelled place name or phrase, "
+                "return ONLY the corrected place name. No explanation, no quotes, no punctuation — "
+                "just the clean place name.\n"
+                "Examples:\n"
+                "- 'Spaen' → 'Spain'\n"
+                "- 'Lsibon' → 'Lisbon'\n"
+                "- 'the north of portugl' → 'northern Portugal'\n"
+                "- 'calfornia' → 'California'\n"
+                "- 'madird' → 'Madrid'\n"
+                "- 'southern frace' → 'southern France'\n"
+                "If the input is already correct, return it unchanged."
+            ),
+        },
+        {"role": "user", "content": query},
+    ]
+
+    body = json.dumps({
+        "model": TYPO_FIX_MODEL,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 60,
+        "provider": {"data_collection": "allow", "allow_fallbacks": True},
+    }).encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "EarthAnalyser",
+        "HTTP-Referer": "https://earthanalyser.app",
+    }
+
+    req = urlrequest.Request(OPENROUTER_URL, data=body, headers=headers, method="POST")
+
+    try:
+        raw = await asyncio.to_thread(_fetch_url_post, req)
+        result = json.loads(raw)
+        text = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+            .strip("\"'`")
+        )
+        if text and len(text) <= 100 and "\n" not in text:
+            return text
+    except Exception:
+        pass
+
+    return query
+
+
+async def _llm_fix_query(question: str) -> str:
+    """Use lightweight Gemma to read the user's entire phrase and fix all spelling errors."""
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    if not api_key or len(question) <= 2:
+        return question
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a spell-checker. Read the user's entire sentence and fix ALL "
+                "spelling errors — place names, category words, dates, everything. "
+                "Return ONLY the corrected sentence. Keep the same meaning and structure. "
+                "No explanation, no extra text.\n"
+                "Examples:\n"
+                "- 'frie in spaen last sumer' → 'fire in Spain last summer'\n"
+                "- 'flod in portugl 2023' → 'flood in Portugal 2023'\n"
+                "- 'vegitation helth in calfornia' → 'vegetation health in California'\n"
+                "- 'wether and temprature in madird' → 'weather and temperature in Madrid'\n"
+                "- 'show fiers near lsibon' → 'show fires near Lisbon'\n"
+                "- 'landuse in souther frace' → 'land use in southern France'\n"
+                "If the input is already correct, return it unchanged."
+            ),
+        },
+        {"role": "user", "content": question},
+    ]
+
+    body = json.dumps({
+        "model": TYPO_FIX_MODEL,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 120,
+        "provider": {"data_collection": "allow", "allow_fallbacks": True},
+    }).encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "EarthAnalyser",
+        "HTTP-Referer": "https://earthanalyser.app",
+    }
+
+    req = urlrequest.Request(OPENROUTER_URL, data=body, headers=headers, method="POST")
+
+    try:
+        raw = await asyncio.to_thread(_fetch_url_post, req)
+        result = json.loads(raw)
+        text = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+            .strip("\"'`")
+        )
+        if text and len(text) <= 500 and "\n" not in text:
+            return text
+    except Exception:
+        pass
+
+    return question
+
+
 @router.post("/geocode")
 async def geocode_place(payload: GeocodeRequest):
-    """Resolve a place name to coordinates and bbox using ESRI (primary) with Nominatim fallback."""
+    """Resolve a place name to coordinates and bbox using ESRI (primary) with Nominatim fallback.
+    For countries/regions, also returns a GeoJSON polygon for clipping."""
     query = payload.query.strip()
+
+    # --- LLM pre-processing: fix typos/misspellings before geocoding ---
+    query = await _llm_fix_place_name(query)
+
     cache_key = query.lower()
 
     if cache_key in _geocode_cache:
         return _geocode_cache[cache_key]
 
-    # --- Try ESRI first (fast, snappy) ---
-    result = await _geocode_esri(query)
+    # --- Try Nominatim first (returns polygon for countries/regions) ---
+    result = await _geocode_nominatim(query)
 
-    # --- Fallback to Nominatim ---
+    # --- Fallback to ESRI ---
     if result is None:
-        result = await _geocode_nominatim(query)
+        result = await _geocode_esri(query)
 
     if result is None:
         raise HTTPException(status_code=404, detail=f"Place not found: {query}")
@@ -1217,13 +1377,11 @@ async def _geocode_esri(query: str) -> dict[str, Any] | None:
     lat = float(loc["y"])
     name = cand.get("address") or query
 
-    # ESRI extent → bbox [west, south, east, north], shrunk to zoom in more
+    # ESRI extent → bbox [west, south, east, north]
     extent = cand.get("extent") or {}
     if extent.get("xmin") is not None:
         w, s, e, n = float(extent["xmin"]), float(extent["ymin"]), float(extent["xmax"]), float(extent["ymax"])
-        # Shrink bbox 40% toward center for tighter zoom
-        dx, dy = (e - w) * 0.2, (n - s) * 0.2
-        bbox = [w + dx, s + dy, e - dx, n - dy]
+        bbox = [w, s, e, n]
     else:
         bbox = [lon - 0.3, lat - 0.3, lon + 0.3, lat + 0.3]
 
@@ -1231,10 +1389,13 @@ async def _geocode_esri(query: str) -> dict[str, Any] | None:
 
 
 async def _geocode_nominatim(query: str) -> dict[str, Any] | None:
-    """Fallback to Nominatim."""
+    """Fallback to Nominatim. Returns polygon for countries/regions."""
     from urllib.parse import urlencode
 
-    params = urlencode({"q": query, "format": "jsonv2", "limit": "1", "addressdetails": "1"})
+    params = urlencode({
+        "q": query, "format": "jsonv2", "limit": "1",
+        "addressdetails": "1", "polygon_geojson": "1",
+    })
     url = f"{NOMINATIM_URL}?{params}"
     req = urlrequest.Request(url, headers={"User-Agent": "EarthAnalyser/1.0"})
 
@@ -1252,17 +1413,21 @@ async def _geocode_nominatim(query: str) -> dict[str, Any] | None:
     lon = float(row["lon"])
     name = row.get("display_name", query)
 
-    # Nominatim bbox: [south, north, west, east], shrunk to zoom in more
+    # Nominatim bbox: [south, north, west, east]
     raw_bbox = row.get("boundingbox")
     if raw_bbox and len(raw_bbox) == 4:
         s, n, w, e = [float(v) for v in raw_bbox]
-        # Shrink bbox 40% toward center for tighter zoom
-        dx, dy = (e - w) * 0.2, (n - s) * 0.2
-        bbox = [w + dx, s + dy, e - dx, n - dy]
+        bbox = [w, s, e, n]
     else:
         bbox = [lon - 0.3, lat - 0.3, lon + 0.3, lat + 0.3]
 
-    return {"name": name, "lat": lat, "lon": lon, "bbox": bbox}
+    # Include polygon for countries/regions (type: administrative, etc.)
+    geojson = row.get("geojson")
+    result: dict[str, Any] = {"name": name, "lat": lat, "lon": lon, "bbox": bbox}
+    if geojson and geojson.get("type") in ("Polygon", "MultiPolygon"):
+        result["polygon"] = geojson
+
+    return result
 
 
 def _fetch_url(req: urlrequest.Request) -> str:
@@ -1274,8 +1439,28 @@ def _fetch_url(req: urlrequest.Request) -> str:
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_ANALYSIS_MODEL = "qwen/qwen3-235b-a22b:free"
+TYPO_FIX_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
 
 VALID_CATEGORIES = {"fire", "flood", "vegetation", "weather", "landuse"}
+
+# Simple keyword fallback — only used when LLM is unavailable.
+# Includes common typos/misspellings so regex catches them even without LLM.
+_CATEGORY_KEYWORDS = {
+    "fire":       re.compile(r"fire|frie|fier|fyre|fir[ea]s|burn|wildfire|incendio|fuego", re.I),
+    "flood":      re.compile(r"flood|flod|flud|water|rain|river|inundaci", re.I),
+    "vegetation": re.compile(r"veget|vegitat|ndvi|plant|green|drought|plantas", re.I),
+    "weather":    re.compile(r"weather|wether|wheather|temp|heat|hot|cold|climate|calor", re.I),
+    "landuse":    re.compile(r"land.?use|urban|crop|forest|city|ciudad", re.I),
+}
+
+
+def _infer_categories(question: str) -> list[str]:
+    """Keyword fallback with typo support — used when LLM is unavailable."""
+    q = question.lower()
+    cats = [cat for cat, pat in _CATEGORY_KEYWORDS.items() if pat.search(q)]
+    if not cats and re.search(r"what.*(happen|going|see)|analyz|summar|overview|everything|all", q):
+        cats = ["fire", "flood", "weather", "vegetation", "landuse"]
+    return cats or ["fire"]  # if nothing matches, default to fire
 
 
 class ClassifyRequest(BaseModel):
@@ -1287,23 +1472,28 @@ async def classify_question(payload: ClassifyRequest):
     """Use LLM to determine which dataset categories and date range are needed."""
     api_key = os.getenv("LLM_API_KEY", "").strip()
     if not api_key:
-        return {"categories": list(VALID_CATEGORIES)}
+        return {"categories": _infer_categories(payload.question)}
+
+    # Step 1: Fix typos with fast Gemma before classifying
+    question = await _llm_fix_query(payload.question)
 
     system_prompt = (
         "You are a classifier for a geospatial analysis tool. "
-        "Given a user question, return ONLY a JSON object with:\n"
+        "Given a user question (which may contain typos or misspellings), "
+        "infer what they mean and return ONLY a JSON object with:\n"
         "  \"categories\": array of dataset categories needed\n"
         "  \"date_start\": start date (YYYY-MM-DD) if mentioned or implied, or null\n"
         "  \"date_end\": end date (YYYY-MM-DD) if mentioned or implied, or null\n"
         "Valid categories: fire, flood, vegetation, weather, landuse\n"
         "Rules:\n"
-        "- 'fire' = wildfires, burns, hotspots, ignition\n"
-        "- 'flood' = water, rivers, rainfall, inundation\n"
-        "- 'vegetation' = NDVI, plants, greenery, drought, biomass, fuel load\n"
-        "- 'weather' = temperature, heat, cold, LST, climate\n"
+        "- 'fire' = wildfires, burns, hotspots, ignition (also: fier, fyre, incendio, fuego)\n"
+        "- 'flood' = water, rivers, rainfall, inundation, tsunami (also: flod, inundacion)\n"
+        "- 'vegetation' = NDVI, plants, greenery, drought, biomass (also: vegitation, plantas)\n"
+        "- 'weather' = temperature, heat, cold, LST, climate (also: wether, wheather, temperatura)\n"
         "- 'landuse' = urban, crops, forest, built areas, land cover\n"
+        "- The user may misspell words — infer the correct meaning from context\n"
         "- For causal/risk questions (why, cause, risk), include supporting categories\n"
-        "- For general overview questions, include fire, weather, vegetation\n"
+        "- For general overview questions, include all relevant categories\n"
         "- 'last summer' = June 1 to Aug 31 of the previous year\n"
         "- 'summer 2024' = 2024-06-01 to 2024-08-31\n"
         "- 'in 2023' = 2023-01-01 to 2023-12-31\n"
@@ -1314,7 +1504,7 @@ async def classify_question(payload: ClassifyRequest):
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": payload.question},
+        {"role": "user", "content": question},
     ]
 
     body = json.dumps({
@@ -1350,14 +1540,13 @@ async def classify_question(payload: ClassifyRequest):
                 text = text[4:].strip()
 
         # Try to extract a JSON object first (new format)
-        import re
         obj_match = re.search(r'\{[^{}]+\}', text)
         if obj_match:
             parsed = json.loads(obj_match.group(0))
             if isinstance(parsed, dict):
                 cats = parsed.get("categories", [])
                 valid = [c for c in cats if c in VALID_CATEGORIES]
-                resp = {"categories": valid or ["fire", "weather", "vegetation"]}
+                resp = {"categories": valid or _infer_categories(question)}
                 ds = parsed.get("date_start")
                 de = parsed.get("date_end")
                 if ds and re.match(r'^\d{4}-\d{2}-\d{2}$', str(ds)):
@@ -1377,8 +1566,8 @@ async def classify_question(payload: ClassifyRequest):
     except Exception:
         pass
 
-    # Fallback: return common categories
-    return {"categories": ["fire", "weather", "vegetation"]}
+    # Fallback: keyword-based inference on corrected question
+    return {"categories": _infer_categories(question)}
 
 
 # ─── LLM Analysis ────────────────────────────────────────────
