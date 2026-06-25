@@ -352,6 +352,31 @@ button[type="submit"]:hover {
 
 .ask-hint.hidden { display: none; }
 
+/* Loading Warning Banner */
+
+.loading-warning {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  background: #f59e0b;
+  color: #1a1a1a;
+  text-align: center;
+  padding: 10px 16px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  animation: slideDown 0.3s ease-out;
+}
+
+.loading-warning.hidden { display: none; }
+
+@keyframes slideDown {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(0); }
+}
+
 /* Loading */
 
 .loading-bar-container {

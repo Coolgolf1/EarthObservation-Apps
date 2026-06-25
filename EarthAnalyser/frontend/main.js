@@ -134,6 +134,7 @@ const exportCsv = $("#export-csv");
 const askHint = $("#ask-hint");
 const loadingOverlay = $("#loading-overlay");
 const loadingText = $("#loading-text");
+const loadingWarning = $("#loading-warning");
 const progressBar = $("#progress-bar");
 const chatLog = $("#chat-log");
 const chatForm = $("#chat-form");
@@ -152,8 +153,10 @@ for (const ta of $$("textarea")) { ta.addEventListener("input", () => autoExpand
 
 function updateStatus(msg) { if (statusBox) statusBox.textContent = msg; }
 function setFetching(on) { if (statusBox) statusBox.classList.toggle("fetching", on); }
-function showLoading(msg) { if (loadingText) loadingText.textContent = msg || "Loading..."; if (loadingOverlay) loadingOverlay.classList.remove("hidden"); }
-function hideLoading() { if (loadingOverlay) loadingOverlay.classList.add("hidden"); }
+function showLoadingWarning() { if (loadingWarning) loadingWarning.classList.remove("hidden"); }
+function hideLoadingWarning() { if (loadingWarning) loadingWarning.classList.add("hidden"); }
+function showLoading(msg) { if (loadingText) loadingText.textContent = msg || "Loading..."; if (loadingOverlay) loadingOverlay.classList.remove("hidden"); showLoadingWarning(); }
+function hideLoading() { if (loadingOverlay) loadingOverlay.classList.add("hidden"); hideLoadingWarning(); }
 function setProgress(p) { if (progressBar) progressBar.style.width = `${Math.max(0, Math.min(100, p))}%`; }
 
 function parseDateRange() {
@@ -179,7 +182,22 @@ function mapBoundsBbox() {
 }
 
 function activeBbox() {
-  return resolvedBbox && resolvedBbox.length === 4 ? [...resolvedBbox] : mapBoundsBbox();
+  const viewport = mapBoundsBbox();
+  if (!resolvedBbox || resolvedBbox.length !== 4) return viewport;
+
+  const [rw, rs, re, rn] = resolvedBbox;
+  const [vw, vs, ve, vn] = viewport;
+
+  // Always use the intersection of viewport and resolvedBbox
+  const iw = Math.max(vw, rw);
+  const is_ = Math.max(vs, rs);
+  const ie = Math.min(ve, re);
+  const in_ = Math.min(vn, rn);
+
+  // If no valid intersection, fall back to resolvedBbox
+  if (iw >= ie || is_ >= in_) return [...resolvedBbox];
+
+  return [iw, is_, ie, in_];
 }
 
 function getCheckedDatasets() {
@@ -203,8 +221,17 @@ function makeDatasetCacheKey(bbox, res, dateRange, dsName) {
 
 // Get the effective resolution: slider override or auto
 function getEffectiveResolution(bbox) {
-  if (userResolutionOverride > 0) return userResolutionOverride;
-  return bboxToH3Res(bbox || activeBbox());
+  if (userResolutionOverride > 0) return Math.min(userResolutionOverride, 7);
+  return Math.min(bboxToH3Res(bbox || activeBbox()), 7);
+}
+
+function updateResolutionLabel() {
+  if (!resolutionValue) return;
+  if (userResolutionOverride > 0) {
+    resolutionValue.textContent = `${currentH3Res}`;
+  } else {
+    resolutionValue.textContent = `Auto (${currentH3Res})`;
+  }
 }
 
 function cancelActiveRequest() {
@@ -705,21 +732,10 @@ function updateTimelineUI() {
 }
 
 function computeAnimationDelay() {
-  if (!timeline || timeline.length < 2) return 1000;
-  // Calculate time differences between consecutive timeline entries (in days)
-  const diffs = [];
-  for (let i = 1; i < timeline.length; i++) {
-    const prev = new Date(timeline[i - 1]).getTime();
-    const curr = new Date(timeline[i]).getTime();
-    const diffDays = Math.round((curr - prev) / DAY_MS);
-    diffs.push(diffDays);
-  }
-  // Check if all differences are the same (consistent)
-  const firstDiff = diffs[0];
-  const isConsistent = diffs.every(d => d === firstDiff);
-  // If consistent, use that step (in seconds); otherwise use 1 second
-  const stepSeconds = isConsistent ? firstDiff : 1;
-  return Math.max(100, stepSeconds * 1000);
+  // Use the play-speed dropdown value (ms per frame)
+  const selected = parseInt(playSpeed?.value);
+  if (Number.isFinite(selected) && selected > 0) return selected;
+  return 700; // default: Normal
 }
 
 function startPlayback() {
@@ -1640,6 +1656,13 @@ if (chatForm) chatForm.addEventListener("submit", (e) => {
   handleAgentQuestion(msg);
 });
 
+if (chatInput) chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    if (chatForm) chatForm.requestSubmit();
+  }
+});
+
 // Determine which datasets the agent needs to answer a question
 // Simple keyword fallback — the LLM classifier handles typos/misspellings natively
 function inferNeededDatasets(question) {
@@ -1658,12 +1681,7 @@ function inferNeededDatasets(question) {
     for (const ds of ["fire", "flood", "weather", "vegetation", "landuse"]) needed.add(ds);
   }
 
-  // If nothing matched, default to fire
-  if (needed.size === 0) {
-    needed.add("fire");
-  }
-
-  return [...needed];
+  return [...needed]; // can be empty — that's fine now
 }
 
 // Infer CONTEXT categories (loaded for reasoning but not plotted)
@@ -1691,23 +1709,139 @@ function inferContextDatasets(question, plotDatasets) {
   return [...context];
 }
 
+/**
+ * Detect if a message is a data/geo query vs. general chat.
+ * Returns: "data_query" | "follow_up" | "chat"
+ */
+function classifyIntent(question) {
+  const q = question.toLowerCase().trim();
+
+  // Very short messages that are clearly just chat
+  if (q.length < 3) return "chat";
+
+  // Greetings, thanks, random stuff
+  if (/^(hi|hello|hey|hola|sup|yo|thanks|thank you|ok|okay|cool|nice|great|bye|goodbye|cheers|lol|haha|hmm|wow|damn|shit|fuck|wtf|what the)\b/i.test(q)) return "chat";
+
+  // Questions about the agent itself
+  if (/^(who are you|what are you|what can you do|how do you work|help|what is this|are you ai|are you real)/i.test(q)) return "chat";
+
+  // General knowledge questions not about earth data
+  if (/^(what is|what's|who is|who's|when was|where is)\s+(a |an |the )?(meaning|definition|capital|president|population|language)\b/i.test(q)) return "chat";
+
+  // Check if the message has earth/geo/data keywords FIRST — don't geocode random text
+  const hasEarthKeywords = /fire|flood|vegetation|weather|temp|heat|cold|burn|wildfire|water|rain|plant|ndvi|land.?use|urban|crop|drought|forest|green|dry|risk|danger/i.test(q);
+  const hasActionKeywords = /\b(show|analyz|check|find|get|fetch|plot|display|look at|explore|monitor|assess|compare)\b/i.test(q);
+  const hasDateRef = extractDateRange(question) !== null;
+  const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
+      || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
+
+  // Only try to extract a place if the message seems geo/data related
+  const looksLikeGeoQuery = hasEarthKeywords || hasActionKeywords || hasDateRef || usesDrawnArea;
+  const hasPlace = looksLikeGeoQuery ? extractPlaceName(question) : null;
+
+  // Has loaded data and no new place/date → follow-up
+  const hasData = Object.values(datasetResults).some(d => d?.total_hexagons > 0);
+
+  if (hasData && !hasPlace && !hasDateRef && !usesDrawnArea) {
+    // Check if it's asking about the loaded data
+    const isEarthRelated = /fire|flood|vegetation|weather|temp|heat|cold|burn|water|plant|green|dry|ndvi|rain|land|urban|crop|forest|risk|danger|why|cause|trend|increas|decreas|pattern|anomal|normal|compare|worse|better|change|tell me more|go deeper|more detail|what about|is (this|that|it)|should i|how (bad|good|much|many)|any concern|safe/i.test(q);
+    if (isEarthRelated) return "follow_up";
+
+    // Question-shaped while data is loaded → follow-up
+    if (/\?$/.test(q) || /^(why|what|how|when|where|is|are|do|does|can|could|should|will|would)\b/i.test(q)) return "follow_up";
+
+    // No earth keywords, no question shape → chat
+    return "chat";
+  }
+
+  // Has explicit geo/data signals → data query
+  if (looksLikeGeoQuery) return "data_query";
+
+  // Default: chat
+  return "chat";
+}
+
+/**
+ * Handle purely conversational messages (no data needed).
+ */
+async function handleChatMessage(question) {
+  const q = question.toLowerCase().trim();
+
+  // Try LLM for a natural response
+  const apiKey = await _checkLLMAvailable();
+  if (apiKey) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${API_BASE}/datasets/analyse`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          data_report: _buildChatContext(),
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.analysis && data.model !== "fallback") {
+          removeTyping();
+          await streamText(data.analysis);
+          return;
+        }
+      }
+    } catch (e) { /* fallback below */ }
+  }
+
+  // Local fallback for common patterns
+  removeTyping();
+  let response;
+  if (/^(hi|hello|hey|hola|sup|yo)\b/i.test(q)) {
+    response = "Hey! I'm Earth Analyst. Ask me about fires, vegetation, weather, or floods anywhere on the planet. Try something like \"show me fires in Portugal last summer\" or just pick a spot on the map and ask what's happening there.";
+  } else if (/^(thanks|thank you|cheers)\b/i.test(q)) {
+    response = "You're welcome! Let me know if you want to explore more.";
+  } else if (/^(who are you|what are you|what can you do|help)\b/i.test(q)) {
+    response = "I'm Earth Analyst — I help you explore satellite data about our planet. I can show you fire activity, vegetation health, surface temperatures, flood risk, and land use for any place and time range. Just tell me where and when you're interested in, or ask me to explain what the data means.";
+  } else if (/^(how do you work|what is this)\b/i.test(q)) {
+    response = "I pull satellite data from NASA MODIS, ESA WorldCover, and ERA5 weather archives, then crunch it into hexagonal cells you can see on the map. Ask me about a place and time, and I'll fetch the relevant data and explain what I find.";
+  } else {
+    response = "I'm not sure what you mean by that. I'm best at answering questions about Earth observation data — try asking about fires, vegetation, weather, or flooding in a specific area. For example: \"Any fires near Madrid last month?\" or \"How's the vegetation in the Amazon this year?\"";
+  }
+  await streamText(response);
+}
+
+function _buildChatContext() {
+  const hasData = Object.values(datasetResults).some(d => d?.total_hexagons > 0);
+  if (!hasData) {
+    return "No data is currently loaded on the map. The user hasn't queried any location yet.";
+  }
+  const loaded = Object.keys(datasetResults).filter(k => datasetResults[k]?.total_hexagons > 0);
+  const area = _cachedPlaceName || "the current map view";
+  const dates = queryDateRange ? `${queryDateRange.start} to ${queryDateRange.end}` : "unknown period";
+  return `Currently showing: ${loaded.join(", ")} data for ${area} (${dates}). The user is chatting casually — respond naturally without forcing a data analysis.`;
+}
+
+async function _checkLLMAvailable() {
+  if (_llmAvailable) return true;
+  return false;
+}
+
 // Auto-fetch missing datasets needed to answer a question
 async function handleAgentQuestion(question) {
   _agentActive = true;
 
-  // ─── Follow-up detection: if we already have data and this looks like
-  //     a follow-up question (no new place, no new date), just answer from
-  //     existing data without re-fetching or moving the map.
-  const hasLoadedData = Object.values(datasetResults).some(d => d?.total_hexagons > 0);
-  const placeQuery = extractPlaceName(question);
-  const extractedRange = extractDateRange(question);
-  // Detect explicit reference to the drawn area
-  const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
-      || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
-  const isFollowUp = hasLoadedData && !placeQuery && !extractedRange && !usesDrawnArea;
+  // ─── Step 0: Classify intent — is this a data query, follow-up, or just chat?
+  const intent = classifyIntent(question);
 
-  if (isFollowUp) {
-    // Answer directly from already-loaded data
+  if (intent === "chat") {
+    await handleChatMessage(question);
+    _agentActive = false;
+    return;
+  }
+
+  if (intent === "follow_up") {
+    // Answer directly from already-loaded data — no geocoding, no fetching new datasets
     removeTyping();
 
     // For causal/why questions, load context datasets BEFORE answering
@@ -1722,14 +1856,12 @@ async function handleAgentQuestion(question) {
     ]);
 
     const contextCats = classifyResult?.context_categories || inferContextDatasets(question, Object.keys(datasetResults));
-    // Fetch missing context datasets — WAIT for them on causal questions
     if (contextCats.length > 0 && queryDateRange) {
       const bbox = activeBbox();
       const res = currentH3Res || getEffectiveResolution(bbox);
       const { missing } = cacheLookupDatasets(bbox, res, queryDateRange, contextCats);
       if (missing.length > 0) {
         if (isCausalQuestion) {
-          // Wait for context data so we can explain causes properly (max 10s)
           addTyping();
           updateStatus(`Loading ${missing.join(", ")} for analysis...`);
           const ctxController = new AbortController();
@@ -1739,11 +1871,10 @@ async function handleAgentQuestion(question) {
               bbox, queryDateRange.start, queryDateRange.end, res, missing, ctxController.signal,
               (dsKey, dsData) => { datasetResults[dsKey] = dsData; }
             );
-          } catch (e) { /* best effort — answer with whatever we have */ }
+          } catch (e) { /* best effort */ }
           clearTimeout(ctxTimeout);
           removeTyping();
         } else {
-          // Non-causal follow-up: background load
           fetchDatasetsH3Stream(
             bbox, queryDateRange.start, queryDateRange.end, res, missing, new AbortController().signal,
             (dsKey, dsData) => { datasetResults[dsKey] = dsData; }
@@ -1760,7 +1891,12 @@ async function handleAgentQuestion(question) {
     return;
   }
 
-  // ─── New query: full flow with geocoding + data fetch ───
+  // ─── intent === "data_query": full flow with geocoding + data fetch ───
+  const placeQuery = extractPlaceName(question);
+  const extractedRange = extractDateRange(question);
+  const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
+      || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
+
   // Run LLM classification in parallel for speed
   const classifyPromise = fetch(`${API_BASE}/datasets/classify`, {
     method: "POST",
@@ -1887,20 +2023,25 @@ async function handleAgentQuestion(question) {
     cb.checked = plotCategories.includes(cb.value);
   }
 
-  // If no categories determined, just respond with current data
+  // If no categories determined and no data loaded, ask the user to be more specific
   if (needed.length === 0) {
     removeTyping();
-    const report = generateInsight(question);
-    const response = await getAIResponse(question, report);
-    await streamText(response);
+    const hasLoadedData = Object.values(datasetResults).some(d => d?.total_hexagons > 0);
+    if (hasLoadedData) {
+      const report = generateInsight(question, _cachedPlaceName);
+      const response = await getAIResponse(question, report);
+      await streamText(response);
+    } else {
+      await streamText("I'm not sure what data to look for. Could you be more specific? For example: \"Show me fires in Greece last summer\" or \"How's the vegetation near Barcelona?\"");
+    }
     _agentActive = false;
     return;
   }
 
-  // If still no date range, can't fetch
+  // If still no date range, ask naturally
   if (!queryDateRange) {
     removeTyping();
-    await streamText("I need a date range to look at. Set the 'From' and 'To' dates on the left, then ask me again.");
+    await streamText("When should I look? You can say things like \"last month\", \"summer 2024\", or set the dates on the left panel.");
     _agentActive = false;
     return;
   }
@@ -2085,6 +2226,15 @@ function extractDateRange(question) {
   const q = question.trim();
   const now = new Date();
   const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth(); // 0-indexed
+
+  // Helper: format date as YYYY-MM-DD
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  // Helper: last day of a month
+  const lastDay = (y, m) => new Date(y, m + 1, 0);
+  // Helper: month index from name
+  const monthNames = { jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2, apr: 3, april: 3, may: 4, jun: 5, june: 5, jul: 6, july: 6, aug: 7, august: 7, sep: 8, september: 8, oct: 9, october: 9, nov: 10, november: 10, dec: 11, december: 11 };
+  const monthPattern = Object.keys(monthNames).join("|");
 
   // "2023 to 2026", "from 2020 to 2024", "between 2021 and 2023"
   const yearRange = q.match(/(?:from\s+)?(\d{4})\s*(?:to|[-–]|and)\s*(\d{4})/i);
@@ -2093,6 +2243,28 @@ function extractDateRange(question) {
     const y2 = parseInt(yearRange[2]);
     if (y1 >= 1980 && y2 >= 1980 && y1 <= currentYear + 1 && y2 <= currentYear + 1) {
       return { start: `${y1}-01-01`, end: `${y2}-12-31` };
+    }
+  }
+
+  // "June 2024 to August 2024", "March to September 2023"
+  const monthRangeWithYear = q.match(new RegExp(`(${monthPattern})\\s*(\\d{4})?\\s*(?:to|[-–]|through|until|and)\\s*(${monthPattern})\\s*(\\d{4})`, "i"));
+  if (monthRangeWithYear) {
+    const m1 = monthNames[monthRangeWithYear[1].toLowerCase()];
+    const y1 = monthRangeWithYear[2] ? parseInt(monthRangeWithYear[2]) : (monthRangeWithYear[4] ? parseInt(monthRangeWithYear[4]) : currentYear);
+    const m2 = monthNames[monthRangeWithYear[3].toLowerCase()];
+    const y2 = parseInt(monthRangeWithYear[4]);
+    if (m1 != null && m2 != null) {
+      return { start: `${y1}-${String(m1 + 1).padStart(2, "0")}-01`, end: fmt(lastDay(y2, m2)) };
+    }
+  }
+
+  // "in June 2024", "during March 2023"
+  const monthWithYear = q.match(new RegExp(`(?:in|during|for)\\s+(${monthPattern})\\s+(\\d{4})`, "i"));
+  if (monthWithYear) {
+    const m = monthNames[monthWithYear[1].toLowerCase()];
+    const y = parseInt(monthWithYear[2]);
+    if (m != null && y >= 1980 && y <= currentYear + 1) {
+      return { start: `${y}-${String(m + 1).padStart(2, "0")}-01`, end: fmt(lastDay(y, m)) };
     }
   }
 
@@ -2105,34 +2277,114 @@ function extractDateRange(question) {
     }
   }
 
-  // "last 3 months", "past 6 months"
+  // "last month", "past month"
+  if (/(?:last|past|previous)\s+month\b/i.test(q)) {
+    const d = new Date(now);
+    d.setMonth(d.getMonth() - 1);
+    return { start: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`, end: fmt(lastDay(d.getFullYear(), d.getMonth())) };
+  }
+
+  // "this month"
+  if (/\bthis\s+month\b/i.test(q)) {
+    return { start: `${currentYear}-${String(currentMonth + 1).padStart(2, "0")}-01`, end: fmt(now) };
+  }
+
+  // "last N months", "past N months"
   const monthsAgo = q.match(/(?:last|past)\s+(\d+)\s*months?/i);
   if (monthsAgo) {
     const m = parseInt(monthsAgo[1]);
-    const end = now.toISOString().slice(0, 10);
     const startD = new Date(now);
     startD.setMonth(startD.getMonth() - m);
-    return { start: startD.toISOString().slice(0, 10), end };
+    return { start: fmt(startD), end: fmt(now) };
   }
 
-  // "last 2 years", "past year"
-  const yearsAgo = q.match(/(?:last|past)\s+(\d*)\s*years?/i);
+  // "last summer", "this summer", "last winter", etc.
+  const seasonMatch = q.match(/(?:last|past|previous|this)\s+(summer|winter|spring|autumn|fall)/i);
+  if (seasonMatch) {
+    const season = seasonMatch[0].toLowerCase();
+    const isThis = /\bthis\b/i.test(seasonMatch[0]);
+    const baseYear = isThis ? currentYear : currentYear - 1;
+    const seasons = {
+      spring: [`${baseYear}-03-01`, `${baseYear}-05-31`],
+      summer: [`${baseYear}-06-01`, `${baseYear}-08-31`],
+      autumn: [`${baseYear}-09-01`, `${baseYear}-11-30`],
+      fall:   [`${baseYear}-09-01`, `${baseYear}-11-30`],
+      winter: [`${baseYear - (isThis ? 0 : 0)}-12-01`, `${baseYear + 1}-02-28`],
+    };
+    const s = seasons[seasonMatch[1].toLowerCase()];
+    if (s) return { start: s[0], end: s[1] };
+  }
+
+  // "summer 2024", "winter 2023"
+  const seasonYear = q.match(/\b(spring|summer|autumn|fall|winter)\s+(\d{4})/i);
+  if (seasonYear) {
+    const y = parseInt(seasonYear[2]);
+    const seasons = {
+      spring: [`${y}-03-01`, `${y}-05-31`],
+      summer: [`${y}-06-01`, `${y}-08-31`],
+      autumn: [`${y}-09-01`, `${y}-11-30`],
+      fall:   [`${y}-09-01`, `${y}-11-30`],
+      winter: [`${y}-12-01`, `${y + 1}-02-28`],
+    };
+    const s = seasons[seasonYear[1].toLowerCase()];
+    if (s) return { start: s[0], end: s[1] };
+  }
+
+  // "last year", "past year", "past 2 years"
+  const yearsAgo = q.match(/(?:last|past|previous)\s+(\d*)\s*years?/i);
   if (yearsAgo) {
     const y = parseInt(yearsAgo[1]) || 1;
-    const end = now.toISOString().slice(0, 10);
     const startD = new Date(now);
     startD.setFullYear(startD.getFullYear() - y);
-    return { start: startD.toISOString().slice(0, 10), end };
+    return { start: fmt(startD), end: fmt(now) };
   }
 
-  // "last week", "past 2 weeks"
-  const weeksAgo = q.match(/(?:last|past)\s+(\d*)\s*weeks?/i);
+  // "this year"
+  if (/\bthis\s+year\b/i.test(q)) {
+    return { start: `${currentYear}-01-01`, end: fmt(now) };
+  }
+
+  // "last week", "past 2 weeks", "this week"
+  if (/\bthis\s+week\b/i.test(q)) {
+    const startD = new Date(now);
+    startD.setDate(startD.getDate() - startD.getDay()); // start of week (Sunday)
+    return { start: fmt(startD), end: fmt(now) };
+  }
+
+  const weeksAgo = q.match(/(?:last|past|previous)\s+(\d*)\s*weeks?/i);
   if (weeksAgo) {
     const w = parseInt(weeksAgo[1]) || 1;
-    const end = now.toISOString().slice(0, 10);
     const startD = new Date(now);
     startD.setDate(startD.getDate() - w * 7);
-    return { start: startD.toISOString().slice(0, 10), end };
+    return { start: fmt(startD), end: fmt(now) };
+  }
+
+  // "yesterday"
+  if (/\byesterday\b/i.test(q)) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    return { start: fmt(d), end: fmt(d) };
+  }
+
+  // "today"
+  if (/\btoday\b/i.test(q)) {
+    return { start: fmt(now), end: fmt(now) };
+  }
+
+  // "last N days", "past N days"
+  const daysAgo = q.match(/(?:last|past)\s+(\d+)\s*days?/i);
+  if (daysAgo) {
+    const d = parseInt(daysAgo[1]);
+    const startD = new Date(now);
+    startD.setDate(startD.getDate() - d);
+    return { start: fmt(startD), end: fmt(now) };
+  }
+
+  // "recently" → last 30 days
+  if (/\brecently\b/i.test(q)) {
+    const startD = new Date(now);
+    startD.setDate(startD.getDate() - 30);
+    return { start: fmt(startD), end: fmt(now) };
   }
 
   // "since 2022", "from 2023"
@@ -2140,7 +2392,17 @@ function extractDateRange(question) {
   if (since && !yearRange) {
     const y = parseInt(since[1]);
     if (y >= 1980 && y <= currentYear) {
-      return { start: `${y}-01-01`, end: now.toISOString().slice(0, 10) };
+      return { start: `${y}-01-01`, end: fmt(now) };
+    }
+  }
+
+  // "since March", "since June 2024"
+  const sinceMonth = q.match(new RegExp(`(?:since|from)\\s+(${monthPattern})(?:\\s+(\\d{4}))?`, "i"));
+  if (sinceMonth) {
+    const m = monthNames[sinceMonth[1].toLowerCase()];
+    const y = sinceMonth[2] ? parseInt(sinceMonth[2]) : (m <= currentMonth ? currentYear : currentYear - 1);
+    if (m != null) {
+      return { start: `${y}-${String(m + 1).padStart(2, "0")}-01`, end: fmt(now) };
     }
   }
 
@@ -2243,7 +2505,7 @@ if (timelineSlider) timelineSlider.addEventListener("input", () => {
 });
 if (timelinePlay) timelinePlay.addEventListener("click", startPlayback);
 if (timelinePause) timelinePause.addEventListener("click", () => { stopPlayback(); renderAllDatasets(); updateTimelineUI(); });
-if (playSpeed) playSpeed.addEventListener("input", () => { if (playbackTimer) startPlayback(); });
+if (playSpeed) playSpeed.addEventListener("change", () => { if (playbackTimer) startPlayback(); });
 
 // Frequency step change — re-filter timeline
 if (frequency) frequency.addEventListener("change", () => {
@@ -2291,11 +2553,12 @@ for (const chip of $$("#dataset-grid input[type='checkbox']")) {
 map.on("zoomstart", () => { cancelRefetch(); });
 map.on("movestart", () => { cancelRefetch(); });
 map.on("zoomend", () => {
-  if (!queryDateRange) return;
   if (userResolutionOverride === 0) {
     const newRes = getEffectiveResolution(activeBbox());
     if (newRes !== currentH3Res) { currentH3Res = newRes; }
+    updateResolutionLabel();
   }
+  if (!queryDateRange) return;
   scheduleRefetch();
 });
 map.on("moveend", () => {
@@ -2309,9 +2572,9 @@ map.on("moveend", () => {
 if (resolutionSlider) resolutionSlider.addEventListener("input", () => {
   const val = Number(resolutionSlider.value);
   userResolutionOverride = val;
-  if (resolutionValue) resolutionValue.textContent = val === 0 ? "Auto" : `${val}`;
   const bbox = activeBbox();
   currentH3Res = getEffectiveResolution(bbox);
+  updateResolutionLabel();
   updateStatus(`H3 resolution: ${currentH3Res}${val === 0 ? " (auto)" : " (manual)"}`);
   if (queryDateRange) {
     lastFetchKey = ""; // force refetch
@@ -2330,4 +2593,6 @@ document.addEventListener("keydown", (e) => {
 // ─── Init ────────────────────────────────────────────────────
 
 updateTimelineUI();
+currentH3Res = getEffectiveResolution(activeBbox());
+updateResolutionLabel();
 addChat("agent", "Hi! I'm your Earth observation analyst. I can help you understand fire activity, flooding, vegetation health, temperatures, and land use anywhere on the planet.\n\nJust ask me something like:\n• \"Show me fires in Portugal\"\n• \"Why is there so much fire activity here?\"\n• \"What's the vegetation health in California?\"\n• \"How hot has it been in southern Spain?\"\n\nOr set an area and dates on the left, click 'Run analysis', and I'll tell you what I find.");

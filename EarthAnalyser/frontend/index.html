@@ -17,6 +17,7 @@
       crossorigin=""
     />
     <link rel="stylesheet" href="styles.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   </head>
   <body>
     <div class="app-shell">
@@ -45,8 +46,8 @@
             <div>
               <label for="play-speed">Playback</label>
               <select id="play-speed">
-                <option value="1200" selected>Slow</option>
-                <option value="700">Normal</option>
+                <option value="1200">Slow</option>
+                <option value="700" selected>Normal</option>
                 <option value="350">Fast</option>
               </select>
             </div>
@@ -59,8 +60,8 @@
           </div>
 
           <label for="resolution-slider">Resolution level: <span id="resolution-value">Auto</span></label>
-          <input id="resolution-slider" type="range" min="0" max="10" value="0" step="1" />
-          <div class="resolution-hint">0 = Auto (from area size) · Higher = more detail</div>
+          <input id="resolution-slider" type="range" min="0" max="7" value="0" step="1" />
+          <div class="resolution-hint">0 = Auto (from area size) · Max 7</div>
 
           <label>Datasets</label>
           <div class="dataset-grid" id="dataset-grid">
@@ -83,6 +84,10 @@
           <div id="map"></div>
 
           <div id="ask-hint" class="ask-hint">Ask something to explore Earth data</div>
+
+          <div id="loading-warning" class="loading-warning hidden">
+            ⚠️ Large area or long time range — this may take a while to load
+          </div>
 
           <div id="loading-overlay" class="loading-bar-container hidden">
             <div class="loading-bar-track">
@@ -131,12 +136,7 @@
       </aside>
     </div>
 
-    <script
-      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-      crossorigin=""
-    ></script>
     <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
-    <script src="main.js?v=20260622-h3" type="module"></script>
+    <script src="js/main.js" type="module"></script>
   </body>
 </html>
