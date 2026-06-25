@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import http.server
+import os
 import re
 import secrets
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 import requests
 
@@ -82,6 +84,25 @@ if "access_token" not in tok:
 
 
 TOKEN = tok["access_token"]
+
+# Save token to .env file
+env_path = Path(__file__).resolve().parent.parent / ".env"
+if env_path.exists():
+    content = env_path.read_text()
+    if "IMAGECUBES_TOKEN=" in content:
+        # Replace existing token
+        import re as _re
+        content = _re.sub(r"IMAGECUBES_TOKEN=.*", f"IMAGECUBES_TOKEN={TOKEN}", content)
+    else:
+        # Append new token
+        if not content.endswith("\n"):
+            content += "\n"
+        content += f"\nIMAGECUBES_TOKEN={TOKEN}\n"
+    env_path.write_text(content)
+    print(f"\n✓ Token saved to {env_path}")
+else:
+    env_path.write_text(f"IMAGECUBES_TOKEN={TOKEN}\n")
+    print(f"\n✓ Token saved to new {env_path}")
 
 r = requests.get(f"{API_BASE}/api/v1/imagecubes",
                  headers={"Authorization": f"Bearer {TOKEN}"})

@@ -72,7 +72,7 @@ async def _find_or_create_cube(
             "bands": ["B04", "B08"],
             "cloud_cover_threshold": 20,
             "blend_method": "median",
-            "cloud_mask_mode": "auto",
+            "cloud_mask_mode": "cloud_masked",
             "name": f"ndvi_{west:.2f}_{south:.2f}_{date_start}",
             "description": "NDVI from B04/B08 for EarthAnalyser",
         }
