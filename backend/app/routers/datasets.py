@@ -31,7 +31,6 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from ..core.era5 import era5_to_h3
-from ..core.imagecubes import imagecubes_ndvi_to_h3
 
 # ─── Memory Safety Constants ─────────────────────────────────
 MAX_CONCURRENT_RASTERS = 16          # max simultaneous raster reads
@@ -533,44 +532,14 @@ async def query_datasets_h3(payload: DatasetH3Request):
 
         results: dict[str, Any] = {}
 
-        # ─── Zarr-backed datasets (vegetation via ImageCubes) ───
-        # NOTE: ERA5 Zarr requires Azure auth that's unavailable; weather uses STAC COG path instead
-        zarr_datasets = {"vegetation"}
-        zarr_requested = [d for d in valid_datasets if d in zarr_datasets]
-        stac_datasets = [d for d in valid_datasets if d not in zarr_datasets]
-
-        # Process Zarr datasets concurrently
-        async def _process_zarr(dataset_key: str) -> tuple[str, dict[str, Any]]:
-            if dataset_key == "vegetation":
-                try:
-                    return dataset_key, await imagecubes_ndvi_to_h3(
-                        bbox, payload.date_start, payload.date_end, h3_res
-                    )
-                except (RuntimeError, TimeoutError):
-                    # Fall back to STAC if ImageCubes token not set or job fails
-                    return dataset_key, None  # type: ignore
-            return dataset_key, None  # type: ignore
-
-        if zarr_requested:
-            zarr_results = await asyncio.gather(
-                *(_process_zarr(dk) for dk in zarr_requested),
-                return_exceptions=True,
-            )
-            for item in zarr_results:
-                if isinstance(item, Exception):
-                    continue
-                dk, data = item
-                if data is not None:
-                    results[dk] = data
-                else:
-                    # Push back to STAC fallback
-                    stac_datasets.append(dk)
+        # All datasets use STAC COG path
+        stac_datasets = valid_datasets
 
         for dataset_key in stac_datasets:
             config = DATASET_CONFIG[dataset_key]
             collection = config["collection"]
             asset_name = config["asset"]
-            is_static = dataset_key in ("landuse", "flood")  # No temporal dimension
+            is_static = dataset_key in ("landuse",)  # No temporal dimension
 
             # Cap resolution to what the source data can support
             ds_h3_res = min(h3_res, config.get("max_h3_res", h3_res))
@@ -778,46 +747,10 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
             queue: asyncio.Queue[str | None] = asyncio.Queue()
 
             async def process_one_dataset(dataset_key: str) -> None:
-                # ─── Zarr fast-path for vegetation (ImageCubes) ───
-                # NOTE: ERA5 Zarr requires Azure auth; weather uses STAC COG path
-                zarr_datasets = {"vegetation"}
-                if dataset_key in zarr_datasets:
-                    try:
-                        data = await imagecubes_ndvi_to_h3(
-                            bbox, payload.date_start, payload.date_end, h3_res
-                        )
-
-                        # Stream frames
-                        for frame in data.get("frames", []):
-                            frame_msg = {
-                                "type": "frame",
-                                "key": dataset_key,
-                                "frame": frame,
-                            }
-                            await queue.put(json.dumps(frame_msg) + "\n")
-
-                        # Signal dataset complete
-                        done_msg = {
-                            "type": "dataset_done",
-                            "key": dataset_key,
-                            "data": {
-                                "dataset": data["dataset"],
-                                "collection": data["collection"],
-                                "description": data["description"],
-                                "hexagons": data["hexagons"],
-                                "total_hexagons": data["total_hexagons"],
-                                "frames_with_data": data["frames_with_data"],
-                            },
-                        }
-                        await queue.put(json.dumps(done_msg) + "\n")
-                        return
-                    except (RuntimeError, TimeoutError):
-                        pass  # Fall through to STAC-based processing
-
                 config = DATASET_CONFIG[dataset_key]
                 collection = config["collection"]
                 asset_name = config["asset"]
-                is_static = dataset_key in ("landuse", "flood")
+                is_static = dataset_key in ("landuse",)
                 ds_h3_res = min(h3_res, config.get("max_h3_res", h3_res))
 
                 frames_count = 0
