@@ -65,6 +65,7 @@ const baseLight = L.tileLayer(
 );
 
 const drawingLayer = L.layerGroup().addTo(map);
+const boundaryLayer = L.layerGroup().addTo(map); // country/region polygon outline
 
 // One layer per dataset
 const datasetLayers = {
@@ -80,6 +81,7 @@ const datasetLayers = {
 let drawMode = false;
 let drawPoints = [];
 let resolvedBbox = null;
+let activePolygon = null; // GeoJSON polygon for country/region clipping
 
 // Multi-dataset state
 let datasetResults = {};   // {fire: {frames, hexagons, ...}, flood: {...}, ...}
@@ -164,15 +166,15 @@ function parseDateRange() {
 
 function mapBoundsBbox() {
   const b = map.getBounds();
-  // Add 20% buffer around viewport to pre-fetch nearby data
+  // Shrink 10% inward from viewport edges — only query/plot what's clearly visible
   const lngSpan = b.getEast() - b.getWest();
   const latSpan = b.getNorth() - b.getSouth();
-  const buf = 0.2;
+  const buf = 0.1;
   return [
-    b.getWest() - lngSpan * buf,
-    b.getSouth() - latSpan * buf,
-    b.getEast() + lngSpan * buf,
-    b.getNorth() + latSpan * buf,
+    b.getWest() + lngSpan * buf,
+    b.getSouth() + latSpan * buf,
+    b.getEast() - lngSpan * buf,
+    b.getNorth() - latSpan * buf,
   ];
 }
 
@@ -210,6 +212,65 @@ function cancelActiveRequest() {
     activeAbortController.abort();
     activeAbortController = null;
   }
+  // Tell backend to cancel all in-flight tasks
+  fetch(`${API_BASE}/datasets/cancel`, { method: "POST" }).catch(() => {});
+}
+
+// ─── Polygon Clipping (point-in-polygon) ─────────────────────
+
+/** Ray-casting point-in-polygon for a single ring */
+function _pointInRing(lat, lng, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i]; // GeoJSON: [lng, lat]
+    const [xj, yj] = ring[j];
+    if ((yi > lat) !== (yj > lat) && lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Check if a point [lat, lng] is inside a GeoJSON Polygon or MultiPolygon */
+function pointInPolygon(lat, lng, geojson) {
+  if (!geojson) return true; // no polygon = no filtering
+  if (geojson.type === "Polygon") {
+    const rings = geojson.coordinates;
+    if (!_pointInRing(lat, lng, rings[0])) return false;
+    // Check holes
+    for (let i = 1; i < rings.length; i++) {
+      if (_pointInRing(lat, lng, rings[i])) return false;
+    }
+    return true;
+  }
+  if (geojson.type === "MultiPolygon") {
+    for (const polygon of geojson.coordinates) {
+      if (_pointInRing(lat, lng, polygon[0])) {
+        let inHole = false;
+        for (let i = 1; i < polygon.length; i++) {
+          if (_pointInRing(lat, lng, polygon[i])) { inHole = true; break; }
+        }
+        if (!inHole) return true;
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+/** Draw country/region boundary on map */
+function drawBoundary(geojson) {
+  boundaryLayer.clearLayers();
+  if (!geojson) return;
+  const geoLayer = L.geoJSON(geojson, {
+    style: { color: "#007f5f", weight: 2, fillColor: "#007f5f", fillOpacity: 0.03, dashArray: "5,4" },
+  });
+  geoLayer.addTo(boundaryLayer);
+}
+
+function clearBoundary() {
+  boundaryLayer.clearLayers();
+  activePolygon = null;
 }
 
 // ─── Drawing ─────────────────────────────────────────────────
@@ -226,7 +287,7 @@ function convexHull(points) {
   return lower.concat(upper);
 }
 
-function clearDrawing() { drawPoints = []; drawingLayer.clearLayers(); resolvedBbox = null; hideDrawConfirm(); }
+function clearDrawing() { drawPoints = []; drawingLayer.clearLayers(); resolvedBbox = null; clearBoundary(); hideDrawConfirm(); }
 
 function hideDrawConfirm() {
   const bar = $("#draw-confirm-bar");
@@ -261,12 +322,7 @@ function confirmDrawing() {
   map.fitBounds([[s, w], [n, e]], { padding: [30, 30] });
   // Update resolution to match drawn bbox size (unless slider is set)
   currentH3Res = getEffectiveResolution(resolvedBbox);
-  updateStatus(`Area: ${resolvedBbox.map((v) => v.toFixed(2)).join(", ")} · H3 res ${currentH3Res}`);
-  // Auto-refetch if a query is active
-  if (queryDateRange) {
-    lastFetchKey = ""; // force refetch
-    scheduleRefetch();
-  }
+  updateStatus(`Area confirmed — select datasets and run analysis, or ask in chat`);
 }
 
 // ─── H3 Rendering (Multi-Dataset) ───────────────────────────
@@ -280,8 +336,8 @@ function hexTooltip(hex, dataset) {
     const c = hex.classes || {};
     lines.push(`High: ${c.high || 0} · Nom: ${c.nominal || 0} · Low: ${c.low || 0}`);
   } else if (dataset === "flood") {
-    lines.push(`Class: ${hex.dominant_class}`);
-    lines.push(`Occurrence: ${hex.value_mean}%`);
+    lines.push(`Water pixels: ${hex.pixel_count}`);
+    if (hex.days_active) lines.push(`Days detected: ${hex.days_active}`);
   } else if (dataset === "vegetation") {
     const ndvi = hex.value_mean / 10000;
     lines.push(`NDVI: ${ndvi.toFixed(3)}`);
@@ -339,10 +395,16 @@ function renderDatasetHexagons(dataset, hexagons) {
   layer.clearLayers();
   if (!hexagons || !hexagons.length) return;
 
-  const maxCount = Math.max(...hexagons.map((h) => h.pixel_count));
+  // Filter by active polygon (country/region boundary)
+  const filtered = activePolygon
+    ? hexagons.filter((h) => h.center && pointInPolygon(h.center[0], h.center[1], activePolygon))
+    : hexagons;
+  if (!filtered.length) return;
+
+  const maxCount = Math.max(...filtered.map((h) => h.pixel_count));
   const colors = DATASET_COLORS[dataset] || DATASET_COLORS.fire;
 
-  for (const hex of hexagons) {
+  for (const hex of filtered) {
     if (!hex.boundary || !hex.boundary.length) continue;
     const latlngs = hex.boundary.map((c) => [c[0], c[1]]);
     const fill = hexFillColor(hex, dataset, maxCount);
@@ -368,19 +430,26 @@ function renderAllDatasets() {
       continue;
     }
     const data = datasetResults[ds];
-    if (viewMode === "aggregate") {
-      renderDatasetHexagons(ds, data.hexagons || []);
-    } else {
-      // Timeline mode: find the frame matching the current date
+    const frames = data.frames || [];
+    const isStatic = frames.length > 0 && frames.every(f => f.acq_date === "static");
+
+    if (viewMode === "aggregate" || isStatic) {
+      // Prefer pre-aggregated hexagons; fall back to merging frames if unavailable
+      let hexes = data.hexagons;
+      if ((!hexes || !hexes.length) && frames.length > 0) {
+        const hexMap = new Map();
+        for (const f of frames) {
+          for (const h of (f.hexagons || [])) {
+            hexMap.set(h.h3, h);
+          }
+        }
+        hexes = [...hexMap.values()];
+      }
+      renderDatasetHexagons(ds, hexes || []);
+    } else if (frames.length > 0) {
+      // Timeline mode: show the frame matching the current date
       const currentDate = timeline[currentFrameIdx];
-      const frames = data.frames || [];
-      // Static datasets (flood, landuse) always show all frames
-      const isStatic = frames.length > 0 && frames.every(f => f.acq_date === "static");
-      if (isStatic) {
-        // Merge all static frames
-        const allHexes = frames.flatMap(f => f.hexagons || []);
-        renderDatasetHexagons(ds, allHexes);
-      } else if (frames.length > 0 && currentDate) {
+      if (currentDate) {
         // Carry-forward: show the most recent frame at or before the current date
         let best = null;
         for (const f of frames) {
@@ -388,12 +457,19 @@ function renderAllDatasets() {
             if (!best || f.acq_date > best.acq_date) best = f;
           }
         }
-        // If no frame at-or-before (current date is before first observation), show first frame
+        // If no frame at-or-before, show first frame
         if (!best) best = frames[0];
         renderDatasetHexagons(ds, best.hexagons || []);
       } else {
-        datasetLayers[ds].clearLayers();
+        // Timeline not ready yet — show latest available frame rather than nothing
+        const last = frames[frames.length - 1];
+        renderDatasetHexagons(ds, last.hexagons || []);
       }
+    } else if (data.hexagons && data.hexagons.length > 0) {
+      // No frames but we have aggregate hexagons — render them directly
+      renderDatasetHexagons(ds, data.hexagons);
+    } else {
+      datasetLayers[ds].clearLayers();
     }
   }
 }
@@ -411,6 +487,74 @@ function applyFrequencyStep(full) {
 }
 
 function stopPlayback() { if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; } }
+
+/**
+ * Compute a bar color for the timeline histogram based on the mean value of hexagons.
+ * - fire: light orange (few pixels) → deep red (many pixels)
+ * - weather: blue (cold) → orange → red (hot), based on mean surface temperature
+ * - vegetation: brown (low NDVI) → green (high NDVI)
+ * - flood: light blue (low occurrence) → deep blue (high occurrence)
+ * - landuse: base brown
+ */
+function _timelineBarColor(ds, hexagons) {
+  if (!hexagons || hexagons.length === 0) return DATASET_COLORS[ds]?.base || "#888";
+
+  if (ds === "fire") {
+    // Color by mean pixel count intensity: light peach → deep red
+    const meanPx = hexagons.reduce((s, h) => s + (h.pixel_count || 0), 0) / hexagons.length;
+    const t = Math.min(1, meanPx / 50); // normalize: 50px = max intensity
+    const r = Math.round(255);
+    const g = Math.round(200 - t * 180); // 200→20
+    const b = Math.round(150 - t * 140); // 150→10
+    return `rgb(${r},${g},${b})`;
+  }
+
+  if (ds === "weather") {
+    // Color by mean temperature: blue (cold <10°C) → orange (warm) → red (hot >40°C)
+    const meanRaw = hexagons.reduce((s, h) => s + (h.value_mean || 0), 0) / hexagons.length;
+    const tempC = meanRaw * 0.02 - 273.15;
+    // Map -10°C..45°C to 0..1
+    const t = Math.max(0, Math.min(1, (tempC + 10) / 55));
+    if (t < 0.5) {
+      // cold: blue → yellow
+      const s = t * 2; // 0..1
+      const r = Math.round(30 + s * 225);
+      const g = Math.round(100 + s * 155);
+      const b = Math.round(220 - s * 190);
+      return `rgb(${r},${g},${b})`;
+    } else {
+      // warm: yellow → red
+      const s = (t - 0.5) * 2; // 0..1
+      const r = Math.round(255);
+      const g = Math.round(200 - s * 180);
+      const b = Math.round(30 - s * 20);
+      return `rgb(${r},${g},${b})`;
+    }
+  }
+
+  if (ds === "vegetation") {
+    // Color by mean NDVI: brown (0) → green (1)
+    const meanRaw = hexagons.reduce((s, h) => s + (h.value_mean || 0), 0) / hexagons.length;
+    const ndvi = Math.max(0, Math.min(1, meanRaw / 10000));
+    const r = Math.round(160 - ndvi * 120); // 160→40
+    const g = Math.round(100 + ndvi * 130); // 100→230
+    const b = Math.round(40 + ndvi * 20);   // 40→60
+    return `rgb(${r},${g},${b})`;
+  }
+
+  if (ds === "flood") {
+    // Color by mean water pixel count: light sky blue (few) → deep blue (many)
+    const meanPx = hexagons.reduce((s, h) => s + (h.pixel_count || 0), 0) / hexagons.length;
+    const t = Math.min(1, meanPx / 30); // normalize: 30px = max intensity
+    const r = Math.round(150 - t * 130);  // 150→20
+    const g = Math.round(210 - t * 130);  // 210→80
+    const b = Math.round(255 - t * 50);   // 255→205
+    return `rgb(${r},${g},${b})`;
+  }
+
+  // landuse: use base color
+  return DATASET_COLORS[ds]?.base || "#6d4c41";
+}
 
 function drawTimelineChart() {
   if (!timelineChart) return;
@@ -443,10 +587,30 @@ function drawTimelineChart() {
     const data = datasetResults[ds];
     if (!data) return;
     const frames = data.frames || [];
+    const isStatic = frames.length > 0 && frames.every(f => f.acq_date === "static");
     const frameByDate = new Map(frames.map((f) => [f.acq_date, f]));
 
     const y0 = pad + bandIdx * bandH;
-    const colors = DATASET_COLORS[ds] || DATASET_COLORS.fire;
+
+    // For static datasets, compute total hex count once (shown uniformly)
+    if (isStatic) {
+      const totalHex = frames.reduce((s, f) => s + (f.hexagons || []).length, 0);
+      const allHexes = frames.flatMap(f => f.hexagons || []);
+      const color = _timelineBarColor(ds, allHexes);
+      const intensity = totalHex > 0 ? 0.6 + 0.4 * Math.min(1, totalHex / 200) : 0;
+      for (let i = 0; i < timeline.length; i++) {
+        if (totalHex > 0) {
+          ctx.fillStyle = color;
+          ctx.globalAlpha = intensity;
+        } else {
+          ctx.fillStyle = "#e0e0e0";
+          ctx.globalAlpha = 0.08;
+        }
+        ctx.fillRect(Math.round(pad + i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
+      }
+      ctx.globalAlpha = 1;
+      return;
+    }
 
     // Find max hexagon count across all frames for relative intensity scaling
     let maxHex = 0;
@@ -456,17 +620,39 @@ function drawTimelineChart() {
     }
     if (maxHex < 1) maxHex = 1;
 
+    // Bin frames into timeline slots with mean values
+    const slotCounts = new Array(timeline.length).fill(0);
+    const slotHexes = new Array(timeline.length).fill(null); // store hexagons for color calc
+    for (const f of frames) {
+      const d = f.acq_date;
+      if (!d || d === "static") continue;
+      const hexes = f.hexagons || [];
+      if (hexes.length === 0) continue;
+      // Find the timeline slot this frame belongs to (binary search for nearest <=)
+      let lo = 0, hi = timeline.length - 1, slot = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (timeline[mid] <= d) { slot = mid; lo = mid + 1; }
+        else { hi = mid - 1; }
+      }
+      if (slot >= 0) {
+        if (hexes.length > slotCounts[slot]) {
+          slotCounts[slot] = hexes.length;
+          slotHexes[slot] = hexes;
+        }
+      }
+    }
+
     for (let i = 0; i < timeline.length; i++) {
-      const frame = frameByDate.get(timeline[i]);
-      const hexCount = frame ? (frame.hexagons || []).length : 0;
+      const hexCount = slotCounts[i];
       if (hexCount > 0) {
-        // Color intensity scales from 0.35 (1 detection) to 1.0 (max detections)
-        const intensity = 0.35 + 0.65 * (hexCount / maxHex);
-        ctx.fillStyle = colors.base;
+        // Intensity: 0.5 (few hexagons) to 1.0 (max hexagons)
+        const intensity = 0.5 + 0.5 * (hexCount / maxHex);
+        ctx.fillStyle = _timelineBarColor(ds, slotHexes[i]);
         ctx.globalAlpha = intensity;
       } else {
         ctx.fillStyle = "#e0e0e0";
-        ctx.globalAlpha = 0.15;
+        ctx.globalAlpha = 0.08;
       }
       ctx.fillRect(Math.round(pad + i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
     }
@@ -581,7 +767,7 @@ async function fetchDatasetsH3Stream(bbox, start, end, resolution, datasets, sig
           header = msg;
           result.timeline = msg.timeline || [];
           // Set global timeline immediately from header so UI shows full date range
-          if (result.timeline.length > fullTimeline.length) {
+          if (result.timeline.length > 0 && (result.timeline.length > fullTimeline.length || timeline.length === 0)) {
             fullTimeline = result.timeline;
             timeline = applyFrequencyStep(fullTimeline);
             viewMode = "timeline";
@@ -602,15 +788,23 @@ async function fetchDatasetsH3Stream(bbox, start, end, resolution, datasets, sig
           }
           result.datasets[key].frames.push(msg.frame);
           result.datasets[key].frames_with_data++;
+          console.log(`[FRAME] ${key}: frame ${result.datasets[key].frames_with_data}, ${msg.frame?.hexagons?.length ?? 0} hexagons`);
           // Notify callback with current accumulated data
           if (onDataset) onDataset(key, result.datasets[key]);
         } else if (msg.type === "dataset_done") {
           // Final aggregate data for this dataset
+          console.log(`[DATA RECEIVED] ${msg.key}:`, msg.data?.total_hexagons ?? 0, "hexagons,", (result.datasets[msg.key]?.frames?.length ?? 0), "frames");
           if (result.datasets[msg.key]) {
             result.datasets[msg.key].hexagons = msg.data.hexagons || [];
             result.datasets[msg.key].total_hexagons = msg.data.total_hexagons || 0;
           } else {
-            result.datasets[msg.key] = msg.data;
+            // No frames arrived before dataset_done — build a synthetic frame so rendering works
+            const hexagons = msg.data.hexagons || [];
+            result.datasets[msg.key] = {
+              ...msg.data,
+              frames: hexagons.length > 0 ? [{ acq_date: "static", hexagons }] : [],
+              frames_with_data: hexagons.length > 0 ? 1 : 0,
+            };
           }
           if (onDataset) onDataset(msg.key, result.datasets[msg.key]);
         } else if (msg.type === "dataset") {
@@ -816,7 +1010,7 @@ async function refetchForCurrentView() {
       for (const [ds, data] of Object.entries(result.datasets)) {
         datasetResults[ds] = data;
       }
-      if (result.timeline && result.timeline.length > fullTimeline.length) {
+      if (result.timeline && result.timeline.length > 0 && (result.timeline.length > fullTimeline.length || timeline.length === 0)) {
         fullTimeline = result.timeline;
         timeline = applyFrequencyStep(fullTimeline);
       }
@@ -874,25 +1068,104 @@ function streamText(text) {
     const el = document.createElement("div");
     el.className = "chat-msg agent";
     chatLog.appendChild(el);
-    // Fast reveal: show text in large chunks (near-instant for short texts)
-    const chars = text.split("");
-    if (chars.length < 200) {
-      // Short text: show immediately
-      el.textContent = text;
+
+    // Try to render as rich insight cards
+    const html = formatInsightHTML(text);
+    if (html) {
+      el.classList.add("rich");
+      el.innerHTML = html;
       chatLog.scrollTop = chatLog.scrollHeight;
       resolve();
       return;
     }
-    // Longer text: rapid chunked reveal
-    let i = 0;
-    const chunkSize = Math.max(10, Math.ceil(chars.length / 30));
-    const iv = setInterval(() => {
-      el.textContent += chars.slice(i, i + chunkSize).join("");
-      i += chunkSize;
-      chatLog.scrollTop = chatLog.scrollHeight;
-      if (i >= chars.length) { clearInterval(iv); resolve(); }
-    }, 16); // ~60fps
+
+    // Fallback: plain text
+    el.textContent = text;
+    chatLog.scrollTop = chatLog.scrollHeight;
+    resolve();
   });
+}
+
+/** Convert a plain-text insight report into rich HTML cards */
+function formatInsightHTML(text) {
+  if (!text) return null;
+
+  // Detect if this is a structured report (has dataset section headers)
+  const hasStructure = /\b(FIRE|TEMPERATURE|VEGETATION|WATER|LAND USE|WHY):/i.test(text);
+  if (!hasStructure) return null;
+
+  let html = '<div class="insight-cards">';
+
+  // Extract intro (everything before first section keyword)
+  const introMatch = text.match(/^([\s\S]*?)(?=(?:FIRE|TEMPERATURE|VEGETATION|WATER|LAND USE|WHY):)/i);
+  const intro = introMatch ? introMatch[1].replace(/REPORT:.*\n?/i, "").replace(/Area:.*\n?/i, "").replace(/Location:.*\n?/i, "").replace(/---\n?/g, "").trim() : "";
+  if (intro) {
+    html += `<div class="insight-intro">${_esc(intro)}</div>`;
+  }
+
+  // Fire
+  const fireMatch = text.match(/FIRE:\s*([\s\S]*?)(?=\n\n|\nTEMPERATURE:|\nVEGETATION:|\nWATER:|\nLAND USE:|\nWHY:|\n---|$)/i);
+  if (fireMatch) {
+    html += _makeCard("fire", "🔥", "Fire Activity", _highlightMetrics(fireMatch[1].trim()));
+  }
+
+  // Temperature
+  const tempMatch = text.match(/TEMPERATURE:\s*([\s\S]*?)(?=\n\n|\nFIRE:|\nVEGETATION:|\nWATER:|\nLAND USE:|\nWHY:|\n---|$)/i);
+  if (tempMatch) {
+    html += _makeCard("weather", "🌡️", "Temperature", _highlightMetrics(tempMatch[1].trim()));
+  }
+
+  // Vegetation
+  const vegMatch = text.match(/VEGETATION:\s*([\s\S]*?)(?=\n\n|\nFIRE:|\nTEMPERATURE:|\nWATER:|\nLAND USE:|\nWHY:|\n---|$)/i);
+  if (vegMatch) {
+    html += _makeCard("vegetation", "🌱", "Vegetation", _highlightMetrics(vegMatch[1].trim()));
+  }
+
+  // Water/Flood
+  const waterMatch = text.match(/WATER:\s*([\s\S]*?)(?=\n\n|\nFIRE:|\nTEMPERATURE:|\nVEGETATION:|\nLAND USE:|\nWHY:|\n---|$)/i);
+  if (waterMatch) {
+    html += _makeCard("water", "🌊", "Water / Flood", _highlightMetrics(waterMatch[1].trim()));
+  }
+
+  // Land Use
+  const landMatch = text.match(/LAND USE:\s*([\s\S]*?)(?=\n\n|\nFIRE:|\nTEMPERATURE:|\nVEGETATION:|\nWATER:|\nWHY:|\n---|$)/i);
+  if (landMatch) {
+    html += _makeCard("landuse", "🏙️", "Land Use", _highlightMetrics(landMatch[1].trim()));
+  }
+
+  // Why
+  const whyMatch = text.match(/WHY:\s*([\s\S]*?)(?=\n---|$)/i);
+  if (whyMatch) {
+    html += _makeCard("why", "💡", "Analysis", _highlightMetrics(whyMatch[1].trim()));
+  }
+
+  html += "</div>";
+  return html;
+}
+
+function _makeCard(cls, icon, title, bodyHTML) {
+  return `<div class="insight-card ${cls}"><div class="card-header">${icon} ${_esc(title)}</div><div class="card-body">${bodyHTML}</div></div>`;
+}
+
+function _esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function _highlightMetrics(text) {
+  // Escape first, then highlight numbers/metrics
+  let s = _esc(text);
+  // Bold numbers with units
+  s = s.replace(/(\d+\.?\d*)\s*°C/g, '<span class="metric">$1°C</span>');
+  s = s.replace(/(\d+\.?\d*)%/g, '<span class="metric">$1%</span>');
+  s = s.replace(/NDVI\s*(\d+\.\d+)/g, 'NDVI <span class="metric">$1</span>');
+  s = s.replace(/(\d+)\s*cells/g, '<span class="metric">$1</span> cells');
+  s = s.replace(/(\d+)\s*days/g, '<span class="metric">$1</span> days');
+  s = s.replace(/(\d[\d,]*)\s*(?:total\s)?pixels/g, '<span class="metric">$1</span> pixels');
+  // Replace — with an em-dash that doesn't break
+  s = s.replace(/\n/g, "<br>");
+  return s;
 }
 
 /**
@@ -966,116 +1239,8 @@ async function getAIResponse(question, dataReport) {
 
 function buildFallbackResponse(question, report) {
   if (!report || report.length < 20) return "I don't have enough data yet. Try running an analysis first.";
-
-  const q = (question || "").toLowerCase();
-  const parts = [];
-
-  // Extract location
-  const locMatch = report.match(/Location:\s*(.+)/);
-  const loc = locMatch ? locMatch[1].trim() : "";
-  const locStr = loc ? ` near ${loc}` : "";
-
-  // ─── "Why" / causal questions: focus on the WHY section of the report
-  const isCausal = /why|cause|reason|explain|prevent|risk|trigger|what.*(led|start)/i.test(q);
-  if (isCausal) {
-    // Extract the WHY section from the report
-    const whyMatch = report.match(/WHY:\s*([\s\S]*?)(?:\n\n|\n---|\Z)/);
-    const tempMatch = report.match(/TEMPERATURE:.*?(\d+\.?\d*)\s*°C.*?max\s*(\d+\.?\d*)/i);
-    const vegMatch = report.match(/VEGETATION:.*?NDVI\s*(\d+\.\d+).*?(\d+)%.*?(?:dry|stressed)/i);
-    const fireMatch = report.match(/FIRE:\s*(\d+)\s*cells.*?(\d+)\s*days/);
-    const landMatch = report.match(/LAND USE:\s*(.+?)(?:\n|$)/);
-
-    if (whyMatch || tempMatch || vegMatch) {
-      // Build a causal explanation
-      if (fireMatch) {
-        parts.push(`The fires${locStr} (${fireMatch[1]} active cells over ${fireMatch[2]} days) are likely driven by several factors:`);
-      } else {
-        parts.push(`Here's what's contributing to fire risk${locStr}:`);
-      }
-
-      if (tempMatch) {
-        const avg = parseFloat(tempMatch[1]), max = parseFloat(tempMatch[2]);
-        if (avg > 35) parts.push(`Extreme heat — surface temperatures averaged ${avg.toFixed(0)}°C and peaked at ${max.toFixed(0)}°C. At these temperatures, vegetation dries rapidly, making ignition easy and spread fast.`);
-        else if (avg > 28) parts.push(`Warm conditions — surface temperatures averaged ${avg.toFixed(0)}°C (max ${max.toFixed(0)}°C), drying out fuels.`);
-        else parts.push(`Moderate temperatures (avg ${avg.toFixed(0)}°C) — heat alone isn't the main driver here.`);
-      }
-
-      if (vegMatch) {
-        const ndvi = parseFloat(vegMatch[1]), dryPct = parseInt(vegMatch[2]);
-        if (ndvi < 0.25) parts.push(`Vegetation is very dry (NDVI ${ndvi.toFixed(2)}) with ${dryPct}% of the area stressed or dormant. This creates abundant dry fuel that burns easily.`);
-        else if (ndvi < 0.4) parts.push(`Mixed vegetation conditions (NDVI ${ndvi.toFixed(2)}). ${dryPct}% of the area has dry/stressed vegetation that can carry fire.`);
-        else parts.push(`Vegetation is relatively green (NDVI ${ndvi.toFixed(2)}), so these fires are more likely human-caused (agricultural burns, arson, or equipment) rather than drought-driven.`);
-      }
-
-      if (landMatch) {
-        const landInfo = landMatch[1];
-        if (/shrub.*\d{2}%|grass.*\d{2}%/.test(landInfo)) parts.push(`The landscape has significant shrubland/grassland which burns easily, especially when dry.`);
-        if (/crop.*\d{2}%/.test(landInfo)) parts.push(`Cropland in the area suggests some fires may be agricultural burns.`);
-      }
-
-      if (whyMatch && whyMatch[1].trim()) {
-        // Use the WHY section from the report
-        const whyText = whyMatch[1].trim();
-        if (whyText.length > 10) {
-          parts.push(whyText);
-        }
-      }
-
-      // If we still only have the intro and no details from data, add general reasoning
-      if (parts.length <= 1) {
-        if (fireMatch) {
-          parts.push("Fires in this region are typically caused by a combination of high temperatures, dry vegetation, and human activity (agricultural burns, arson, power line faults). Mediterranean landscapes with eucalyptus and shrubland are especially fire-prone during summer.");
-          parts.push("To understand the specific drivers better, try asking about weather or vegetation in this area — I'll load the temperature and NDVI data to give you a more detailed picture.");
-        } else {
-          parts.push("I need more data to explain the causes. Try asking about weather or vegetation conditions.");
-        }
-      }
-
-      return parts.join("\n\n");
-    }
-  }
-
-  // ─── Non-causal: standard data summary
-  // Fire
-  const fireMatch = report.match(/FIRE:\s*(\d+)\s*cells.*?(\d+)\s*days.*?(\d+)%\s*high/);
-  if (fireMatch) {
-    parts.push(`I found fire activity${locStr} across ${fireMatch[1]} areas over ${fireMatch[2]} days. ${fireMatch[3]}% were high-confidence detections.`);
-    const peak = report.match(/Peak:?\s*(\S+)\s*\((\d+)/);
-    if (peak) parts.push(`Peak day was ${peak[1]} with ${peak[2]} active cells.`);
-    const trend = report.match(/(increasing|decreasing|Steady|stable)/i);
-    if (trend) {
-      const t = trend[1].toLowerCase();
-      if (t === "increasing") parts.push("Activity is increasing — this needs monitoring.");
-      else if (t === "decreasing") parts.push("Activity is declining.");
-    }
-  } else if (/fire/i.test(q) && /0 cells|No fire/i.test(report)) {
-    parts.push(`No fire activity detected${locStr} during this period.`);
-  }
-
-  // Weather
-  const tempMatch2 = report.match(/TEMPERATURE:.*?(\d+\.?\d*)\s*°C.*?max\s*(\d+\.?\d*)/i);
-  if (tempMatch2) {
-    parts.push(`Land surface temperatures${locStr} averaged ${tempMatch2[1]}°C, peaking at ${tempMatch2[2]}°C.`);
-  }
-
-  // Vegetation
-  const ndviMatch = report.match(/NDVI\s*(\d+\.\d+)/i);
-  if (ndviMatch) {
-    const v = parseFloat(ndviMatch[1]);
-    const health = v > 0.6 ? "healthy" : v > 0.4 ? "moderate" : v > 0.25 ? "stressed" : "very stressed";
-    parts.push(`Vegetation${locStr} is ${health} (NDVI: ${v.toFixed(2)}).`);
-  }
-
-  if (parts.length > 0) return parts.join(" ");
-
-  // Generic cleanup
-  return report
-    .replace(/^REPORT:.*\n/m, "")
-    .replace(/^Area:.*\n/m, "")
-    .replace(/^Location:.*\n/m, "")
-    .replace(/---\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  // Return the structured report directly — the rich card formatter will handle display
+  return report;
 }
 
 function generateInsight(question, placeName) {
@@ -1205,11 +1370,11 @@ function generateInsight(question, placeName) {
   // Flood section
   if (hasFlood) {
     const data = datasetResults.flood;
-    let perm = 0, seas = 0;
-    for (const h of (data.hexagons || [])) { perm += (h.classes?.permanent || 0); seas += (h.classes?.seasonal || 0); }
-    const wtotal = perm + seas;
-    r += `WATER: ${data.total_hexagons} cells with water. `;
-    if (wtotal > 0) r += `${Math.round(perm/wtotal*100)}% permanent, ${Math.round(seas/wtotal*100)}% seasonal.`;
+    const hexes = data.hexagons || [];
+    const totalPx = hexes.reduce((s, h) => s + (h.pixel_count || 0), 0);
+    const daysActive = hexes.length > 0 ? Math.max(...hexes.map(h => h.days_active || 0)) : 0;
+    r += `WATER: ${data.total_hexagons} cells with water detected, ${totalPx} total water pixels. `;
+    if (daysActive > 0) r += `Active up to ${daysActive} days in period.`;
     r += `\n\n`;
   }
 
@@ -1256,10 +1421,6 @@ function generateInsight(question, placeName) {
       r += reasons.join("; ") + `. `;
     }
 
-    if (reasons.length > 0) {
-      r += reasons.join("; ") + `. `;
-    }
-
     // Context-specific for well-known fire-prone areas
     if (hasVeg && avgNdvi > 0.4 && fireHexCount > 5) {
       r += `Note: vegetation is relatively green, so these fires are likely human-ignited (arson, equipment, power lines) or from dry wind events rather than drought.`;
@@ -1269,16 +1430,6 @@ function generateInsight(question, placeName) {
       r += `Low number of detections — could be small/contained burns or early-stage ignitions.`;
     }
     r += `\n`;
-  }
-
-  // Hotspots
-  if (hasFire) {
-    const fireHexes = datasetResults.fire.hexagons || [];
-    if (fireHexes.length > 0) {
-      const top = [...fireHexes].sort((a, b) => (b.pixel_count || 0) - (a.pixel_count || 0)).slice(0, 3);
-      r += `\nHOTSPOTS: ` + top.map(h => `(${h.center[0].toFixed(3)}, ${h.center[1].toFixed(3)}) ${h.pixel_count}px`).join(" | ");
-      r += `\n`;
-    }
   }
 
   return r;
@@ -1413,7 +1564,7 @@ async function runQuery() {
       for (const [ds, data] of Object.entries(result.datasets)) {
         datasetResults[ds] = data;
       }
-      if (result.timeline && result.timeline.length > fullTimeline.length) {
+      if (result.timeline && result.timeline.length > 0 && (result.timeline.length > fullTimeline.length || timeline.length === 0)) {
         fullTimeline = result.timeline;
         timeline = applyFrequencyStep(fullTimeline);
       }
@@ -1473,34 +1624,26 @@ if (chatForm) chatForm.addEventListener("submit", (e) => {
 });
 
 // Determine which datasets the agent needs to answer a question
-// Returns ONLY the primary datasets the user is asking about (for plotting)
+// Simple keyword fallback — the LLM classifier handles typos/misspellings natively
 function inferNeededDatasets(question) {
   const q = question.toLowerCase();
   const needed = new Set();
 
-  // Match only explicitly mentioned categories
-  if (/fire|burn|blaze|wildfire|ignit/.test(q)) needed.add("fire");
-  if (/flood|water|rain|river|inundat/.test(q)) needed.add("flood");
-  if (/veget|ndvi|plant|green|dry|drought|fuel|biomass/.test(q)) needed.add("vegetation");
-  if (/temp|heat|hot|cold|weather|climate|lst|thermal/.test(q)) needed.add("weather");
-  if (/land.?use|urban|crop|forest|built|city|agriculture/.test(q)) needed.add("landuse");
+  // Keyword matching with common typos/misspellings (LLM handles this better; fallback only)
+  if (/fire|frie|fier|fyre|burn|wildfire|incendio|fuego/.test(q)) needed.add("fire");
+  if (/flo[ou]d|flod|water|rain|river|inundaci/.test(q)) needed.add("flood");
+  if (/veget|vegitat|ndvi|plant|green|drought|plantas/.test(q)) needed.add("vegetation");
+  if (/weather|wether|wheather|temp|heat|hot|cold|climate|calor/.test(q)) needed.add("weather");
+  if (/land.?use|urban|crop|forest|city|ciudad/.test(q)) needed.add("landuse");
 
   // Generic "what happened" / "analyze" / "show everything" — use all
   if (/what.*(happen|going|see)|analyz|summar|overview|assess|everything|all/.test(q)) {
-    needed.add("fire");
-    needed.add("weather");
-    needed.add("vegetation");
+    for (const ds of ["fire", "flood", "weather", "vegetation", "landuse"]) needed.add(ds);
   }
 
-  // If nothing inferred, default to fire only (most common use case)
+  // If nothing matched, default to fire
   if (needed.size === 0) {
-    // Check if we already have data loaded — show that
-    const loaded = Object.keys(datasetResults).filter(ds => datasetResults[ds]?.total_hexagons > 0);
-    if (loaded.length > 0) {
-      for (const ds of loaded) needed.add(ds);
-    } else {
-      needed.add("fire");
-    }
+    needed.add("fire");
   }
 
   return [...needed];
@@ -1541,7 +1684,10 @@ async function handleAgentQuestion(question) {
   const hasLoadedData = Object.values(datasetResults).some(d => d?.total_hexagons > 0);
   const placeQuery = extractPlaceName(question);
   const extractedRange = extractDateRange(question);
-  const isFollowUp = hasLoadedData && !placeQuery && !extractedRange;
+  // Detect explicit reference to the drawn area
+  const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
+      || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
+  const isFollowUp = hasLoadedData && !placeQuery && !extractedRange && !usesDrawnArea;
 
   if (isFollowUp) {
     // Answer directly from already-loaded data
@@ -1619,7 +1765,19 @@ async function handleAgentQuestion(question) {
 
   // ─── Step 1: Geocode — extract place name and center the map there
   let bbox = activeBbox();
-  if (placeQuery) {
+  if (usesDrawnArea && resolvedBbox) {
+    // User explicitly referenced the drawn area — use it as-is
+    bbox = [...resolvedBbox];
+    map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [30, 30], animate: true });
+    currentH3Res = getEffectiveResolution(bbox);
+    updateStatus("Using drawn area");
+    await new Promise(r => setTimeout(r, 300));
+  } else if (usesDrawnArea && !resolvedBbox) {
+    removeTyping();
+    await streamText("Draw an area on the map first using the **Draw polygon** button, then ask me again.");
+    _agentActive = false;
+    return;
+  } else if (placeQuery) {
     try {
       updateStatus(`Locating "${placeQuery}"...`);
       const geoRes = await fetch(`${API_BASE}/datasets/geocode`, {
@@ -1631,16 +1789,16 @@ async function handleAgentQuestion(question) {
         const geo = await geoRes.json();
         if (geo.bbox && geo.lat && geo.lon) {
           bbox = geo.bbox;
-          // Cap bbox size for performance — if geocode returns a huge area
-          // (e.g., a whole country), shrink to ~1° around the center
-          const [w, s, e, n] = bbox;
-          const span = Math.max(e - w, n - s);
-          if (span > 2.0) {
-            const maxSpan = 1.5; // ~150km — good for regional analysis
-            const cx = (w + e) / 2, cy = (s + n) / 2;
-            bbox = [cx - maxSpan / 2, cy - maxSpan / 2, cx + maxSpan / 2, cy + maxSpan / 2];
-          }
           resolvedBbox = [...bbox];
+
+          // If a polygon is returned (country/region), use it for clipping
+          if (geo.polygon) {
+            activePolygon = geo.polygon;
+            drawBoundary(geo.polygon);
+          } else {
+            clearBoundary();
+          }
+
           map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [40, 40], animate: true });
           currentH3Res = getEffectiveResolution(bbox);
           updateStatus(`Centered on ${geo.name?.split(",")[0] || placeQuery}`);
@@ -1685,8 +1843,8 @@ async function handleAgentQuestion(question) {
     } catch (e) { /* fallback */ }
   }
 
-  // Await LLM classification with a fast timeout — don't let it block
-  const classifyTimeout = new Promise(r => setTimeout(() => r(null), 4000));
+  // Await LLM classification — this is essential for handling typos/misspellings
+  const classifyTimeout = new Promise(r => setTimeout(() => r(null), 8000));
   const classifyResult = await Promise.race([classifyPromise, classifyTimeout]);
 
   // Apply AI-determined date range (overrides client-side extraction)
@@ -1746,8 +1904,6 @@ async function handleAgentQuestion(question) {
   setFetching(true);
   showLoading(`Analyzing...`);
   setProgress(5);
-
-  // Check per-dataset cache — only fetch what's actually missing
 
   // Check per-dataset cache — only fetch what's actually missing
   const { cached: agentCached, missing: agentMissing, cachedTimeline: agentCachedTimeline } =
@@ -1826,7 +1982,7 @@ async function handleAgentQuestion(question) {
       for (const [ds, data] of Object.entries(result.datasets)) {
         datasetResults[ds] = data;
       }
-      if (result.timeline && result.timeline.length > fullTimeline.length) {
+      if (result.timeline && result.timeline.length > 0 && (result.timeline.length > fullTimeline.length || timeline.length === 0)) {
         fullTimeline = result.timeline;
         timeline = applyFrequencyStep(fullTimeline);
       }
@@ -1862,6 +2018,17 @@ async function handleAgentQuestion(question) {
   setFetching(false);
   hideLoading();
   if (askHint) askHint.classList.add("hidden");
+
+  // Check if any data was actually found
+  const totalFound = Object.values(datasetResults).reduce((s, d) => s + (d.total_hexagons || 0), 0);
+  if (totalFound === 0) {
+    removeTyping();
+    const dsNames = plotCategories.join(", ");
+    await streamText(`Data was not found for: ${dsNames} in this area and time period. Try a different location, broader date range, or different datasets.`);
+    _agentActive = false;
+    _updatePlaceNameCache();
+    return;
+  }
 
   // Generate response instantly using local data — don't wait for network
   removeTyping();
@@ -1967,6 +2134,12 @@ function extractDateRange(question) {
 function extractPlaceName(question) {
   const q = question.trim();
 
+  // ─── Drawn-area reference: user wants to query the bbox they drew on the map
+  if (/\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(q)
+      || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(q)) {
+    return null; // no geocoding — use existing resolvedBbox
+  }
+
   // ─── Follow-up detection: skip geocoding for conversational follow-ups
   // These are questions that reference the current context, not a new place
   if (/^(why|what|how|when|who|can you|could you|tell me|explain|is there|are there|show me more|go deeper|more detail)/i.test(q)) {
@@ -1995,19 +2168,18 @@ function extractPlaceName(question) {
     return beforeDs[1].trim();
   }
 
-  // Only use the "strip everything" fallback for short, command-like queries
-  // (e.g., "Portugal fires") — NOT for conversational questions
-  if (q.split(/\s+/).length <= 4) {
-    const stripped = q
-      .replace(/\b(show|find|search|analyze|get|fetch|plot|display|check|look|tell|me|about|the|any|some|this|that)\b/gi, "")
-      .replace(/\b(fire|flood|vegetation|weather|land\s*use|temperature|heat|ndvi|risk|danger|activity|data|detections?|conditions?|status)\b/gi, "")
-      .replace(/\b(last|next|past|from|to|over|between|during)\b/gi, "")
-      .replace(/\b\d+\s*(km|min|minutes?|hours?|days?|weeks?|months?|years?)\b/gi, "")
-      .replace(/[?!.,;:]+/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (stripped.length >= 3) return stripped;
-  }
+  // Strip-and-extract fallback: remove known non-place words, whatever remains is likely a place
+  const stripped = q
+    .replace(/\b(show|find|search|analyze|get|fetch|plot|display|check|look|tell|me|about|the|any|some|this|that|a|an|for|and|or|with|its)\b/gi, "")
+    .replace(/\b(fire|fires|flood|floods|vegetation|weather|land\s*use|temperature|heat|ndvi|risk|danger|activity|data|detections?|conditions?|status|wildfire|burn|blaze)\b/gi, "")
+    .replace(/\b(last|next|past|from|to|over|between|during|since|until|ago)\b/gi, "")
+    .replace(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b/gi, "")
+    .replace(/\b(year|years|month|months|week|weeks|day|days|summer|winter|spring|autumn)\b/gi, "")
+    .replace(/\b\d+\s*(km|min|minutes?|hours?|days?|weeks?|months?|years?)?\b/gi, "")
+    .replace(/[?!.,;:]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (stripped.length >= 2) return stripped;
 
   return null;
 }
@@ -2054,6 +2226,7 @@ if (timelineSlider) timelineSlider.addEventListener("input", () => {
 });
 if (timelinePlay) timelinePlay.addEventListener("click", startPlayback);
 if (timelinePause) timelinePause.addEventListener("click", () => { stopPlayback(); renderAllDatasets(); updateTimelineUI(); });
+if (playSpeed) playSpeed.addEventListener("input", () => { if (playbackTimer) startPlayback(); });
 
 // Frequency step change — re-filter timeline
 if (frequency) frequency.addEventListener("change", () => {
@@ -2087,7 +2260,7 @@ for (const chip of $$("#dataset-grid input[type='checkbox']")) {
       if (queryDateRange && !datasetResults[ds]) {
         scheduleRefetch();
       } else if (datasetResults[ds]) {
-        renderDatasetHexagons(ds, datasetResults[ds].hexagons || []);
+        renderAllDatasets();
       }
     } else {
       layer.clearLayers();
