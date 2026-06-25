@@ -25,10 +25,16 @@ def window_for_bbox(
         "EPSG:4326", ds.crs, west, south, east, north, densify_pts=21
     )
     candidate = from_bounds(minx, miny, maxx, maxy, transform=ds.transform)
-    bounded = candidate.intersection(Window(0, 0, ds.width, ds.height))
+    try:
+        bounded = candidate.intersection(Window(0, 0, ds.width, ds.height))
+    except Exception:
+        # Intersection is empty — bbox doesn't overlap this raster tile
+        return None
     if bounded.width <= 0 or bounded.height <= 0:
         return None
     bounded = bounded.round_offsets().round_lengths()
+    if bounded.width <= 0 or bounded.height <= 0:
+        return None
     total_px = bounded.width * bounded.height
     if total_px > max_pixels:
         scale = math.sqrt(max_pixels / total_px)

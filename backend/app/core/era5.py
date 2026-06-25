@@ -23,6 +23,10 @@ import xarray as xr
 ERA5_STORAGE_OPTIONS = {"account_name": "cpdataeuwest"}
 ERA5_VAR = "air_temperature_at_2_metres"
 
+# ─── Memory Safety ────────────────────────────────────────────
+# Machine has ~6.6 GB total RAM (~5.9 GB usable). Reserve headroom for OS + app.
+MAX_ERA5_BYTES = 1_000_000_000  # 1 GB max per ERA5 load
+
 # Cache open datasets per month to avoid re-opening
 _month_cache: dict[str, xr.Dataset] = {}
 
@@ -110,6 +114,15 @@ def era5_to_h3(
     time_slice = slice(str(date_start), str(date_end))
 
     subset = da.sel(lon=lon_slice, lat=lat_slice, time=time_slice)
+
+    # ─── Memory guard: refuse to load arrays that would exhaust RAM ───
+    estimated_bytes = subset.nbytes
+    if estimated_bytes > MAX_ERA5_BYTES:
+        raise MemoryError(
+            f"ERA5 request too large: {estimated_bytes / 1e9:.2f} GB estimated "
+            f"(limit {MAX_ERA5_BYTES / 1e9:.1f} GB). "
+            f"Reduce bbox or date range."
+        )
 
     # Resample to daily mean (ERA5 is hourly)
     daily = subset.resample(time="1D").mean()

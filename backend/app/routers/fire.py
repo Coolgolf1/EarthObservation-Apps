@@ -6,57 +6,33 @@ import os
 import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
 import h3
 import numpy as np
-import planetary_computer
-import pystac_client
 import rasterio
-from rasterio.warp import transform_bounds
-from rasterio.windows import Window, from_bounds
+from rasterio.windows import Window
 from fastapi import APIRouter, HTTPException
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from ..core.config import CATALOG_URL, ORS_ISOCHRONE_URL, VEHICLE_TO_ORS_PROFILE, VEHICLE_SPEED_KMH
+from ..core.geo import validate_bbox, circle_polygon, bbox_from_geometry
+from ..core.raster import window_for_bbox
+from ..core.stac import open_catalog
+
 # ─── Memory Safety Constants ─────────────────────────────────
-MAX_CONCURRENT_RASTERS = 8          # max simultaneous raster reads
-MAX_WINDOW_PIXELS = 20_000_000      # cap raster window at ~20M pixels
-MAX_H3_INPUT_PIXELS = 5_000_000     # max fire pixels to convert to H3
+MAX_CONCURRENT_RASTERS = 8
+MAX_WINDOW_PIXELS = 20_000_000
+MAX_H3_INPUT_PIXELS = 5_000_000
 _RASTER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_RASTERS)
 
 
 router = APIRouter(prefix="/fire", tags=["fire"])
 
-env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
-load_dotenv(env_path)
-
-CATALOG_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 PRIMARY_FIRE_COLLECTION = "modis-14A1-061"
-FIRE_COLLECTION_PRIORITY = [
-    # Daily MODIS fire product.
-    "modis-14A1-061",
-]
-
-ORS_ISOCHRONE_URL = os.getenv(
-    "OSM_ORS_ISOCHRONE_URL",
-    "https://api.openrouteservice.org/v2/isochrones",
-)
-VEHICLE_TO_ORS_PROFILE = {
-    "walking": "foot-walking",
-    "cycling": "cycling-regular",
-    "driving": "driving-car",
-    "driving-hgv": "driving-hgv",
-}
-VEHICLE_SPEED_KMH = {
-    "walking": 5.0,
-    "cycling": 15.0,
-    "driving": 60.0,
-    "driving-hgv": 45.0,
-}
+FIRE_COLLECTION_PRIORITY = ["modis-14A1-061"]
 
 
 class ModisFireQueryRequest(BaseModel):
@@ -77,12 +53,7 @@ class ReachAreaPreviewRequest(BaseModel):
 
 
 def _validate_bbox(bbox: list[float]) -> tuple[float, float, float, float]:
-    west, south, east, north = [float(v) for v in bbox]
-    if west >= east or south >= north:
-        raise HTTPException(status_code=400, detail="Invalid bbox coordinates")
-    if west < -180 or east > 180 or south < -90 or north > 90:
-        raise HTTPException(status_code=400, detail="bbox out of WGS84 range")
-    return west, south, east, north
+    return validate_bbox(bbox)
 
 
 def _build_datetime_steps(start: date, end: date, step_days: int, max_items: int) -> list[date]:
@@ -184,53 +155,11 @@ def _item_acq_date(item: Any) -> date | None:
 
 
 def _circle_polygon_geometry(lon: float, lat: float, radius_km: float, segments: int = 48) -> dict[str, Any]:
-    lon_f = float(lon)
-    lat_f = float(lat)
-    radius = max(0.1, float(radius_km))
-
-    lat_delta = radius / 111.0
-    cos_lat = max(0.1, abs(math.cos(math.radians(lat_f))))
-    lon_delta = radius / (111.0 * cos_lat)
-
-    ring: list[list[float]] = []
-    for idx in range(segments):
-        angle = (2.0 * math.pi * idx) / segments
-        ring.append([
-            lon_f + (lon_delta * math.cos(angle)),
-            lat_f + (lat_delta * math.sin(angle)),
-        ])
-    if ring:
-        ring.append(ring[0])
-
-    return {
-        "type": "Polygon",
-        "coordinates": [ring],
-    }
+    return circle_polygon(lon, lat, radius_km, segments)
 
 
 def _bbox_from_geometry(geometry: dict[str, Any]) -> list[float] | None:
-    coords = geometry.get("coordinates")
-    if not isinstance(coords, list):
-        return None
-
-    lons: list[float] = []
-    lats: list[float] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, list):
-            if len(node) == 2 and all(isinstance(v, (int, float)) for v in node):
-                lons.append(float(node[0]))
-                lats.append(float(node[1]))
-                return
-            for child in node:
-                walk(child)
-
-    walk(coords)
-
-    if not lons or not lats:
-        return None
-
-    return [min(lons), min(lats), max(lons), max(lats)]
+    return bbox_from_geometry(geometry)
 
 
 def _post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
@@ -329,10 +258,7 @@ async def query_modis_fire(payload: ModisFireQueryRequest):
         raise HTTPException(status_code=400, detail="date_start must be before date_end")
 
     try:
-        catalog = pystac_client.Client.open(
-            CATALOG_URL,
-            modifier=planetary_computer.sign_inplace,
-        )
+        catalog = open_catalog()
 
         datetime_steps = _build_datetime_steps(
             payload.date_start,
@@ -434,29 +360,7 @@ class RasterAnalysisRequest(BaseModel):
 
 
 def _window_for_bbox(ds, bbox_wgs84: list[float]) -> Window | None:
-    """Compute the rasterio Window for a WGS84 bbox, like the notebook."""
-    west, south, east, north = bbox_wgs84
-    minx, miny, maxx, maxy = transform_bounds(
-        "EPSG:4326", ds.crs, west, south, east, north, densify_pts=21
-    )
-    candidate = from_bounds(minx, miny, maxx, maxy, transform=ds.transform)
-    bounded = candidate.intersection(Window(0, 0, ds.width, ds.height))
-    if bounded.width <= 0 or bounded.height <= 0:
-        return None
-    bounded = bounded.round_offsets().round_lengths()
-    # Cap window size to avoid loading huge arrays into memory
-    total_px = bounded.width * bounded.height
-    if total_px > MAX_WINDOW_PIXELS:
-        scale = math.sqrt(MAX_WINDOW_PIXELS / total_px)
-        new_w = max(1, int(bounded.width * scale))
-        new_h = max(1, int(bounded.height * scale))
-        bounded = Window(
-            col_off=bounded.col_off,
-            row_off=bounded.row_off,
-            width=new_w,
-            height=new_h,
-        )
-    return bounded
+    return window_for_bbox(ds, bbox_wgs84, MAX_WINDOW_PIXELS)
 
 
 def _analyze_single_raster(href: str, bbox: list[float]) -> dict[str, Any] | None:
@@ -561,10 +465,7 @@ async def analyze_modis_fire(payload: RasterAnalysisRequest):
     bbox = [west, south, east, north]
 
     try:
-        catalog = pystac_client.Client.open(
-            CATALOG_URL,
-            modifier=planetary_computer.sign_inplace,
-        )
+        catalog = open_catalog()
 
         datetime_steps = _build_datetime_steps(
             payload.date_start,
@@ -880,10 +781,7 @@ async def query_modis_fire_h3(payload: H3FireRequest):
     h3_res = payload.resolution if payload.resolution is not None else _auto_h3_resolution(bbox)
 
     try:
-        catalog = pystac_client.Client.open(
-            CATALOG_URL,
-            modifier=planetary_computer.sign_inplace,
-        )
+        catalog = open_catalog()
 
         datetime_steps = _build_datetime_steps(
             payload.date_start,

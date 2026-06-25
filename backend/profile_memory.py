@@ -1,18 +1,15 @@
 """
 Memory profiling script for EarthAnalyser backend.
 
-Progressively increases data load sizes to find the threshold at which
-memory is exhausted. Tests:
+SAFE version — stops BEFORE crashing. Checks available memory before each
+allocation and maintains a 500 MB safety margin at all times.
+
+Tests:
   1. Raw numpy array allocation (baseline)
-  2. ERA5 Zarr loads (xarray .compute())
-  3. Raster reads via rasterio (COG from Planetary Computer)
-  4. H3 hexagon dict build-up
+  2. H3 hexagon dict build-up
 
 Usage:
-    python profile_memory.py [--test {numpy,era5,raster,h3,all}] [--max-gb 8]
-
-The script logs RSS (resident set size) after each step and stops
-when allocation fails or RSS exceeds --max-gb.
+    python3 profile_memory.py [--test {numpy,h3,all}] [--headroom-mb 500]
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ import gc
 import os
 import sys
 import time
-import traceback
+from collections import defaultdict
 from datetime import date, timedelta
 
 import psutil
@@ -36,6 +33,9 @@ import numpy as np
 _PROCESS = psutil.Process(os.getpid())
 _MB = 1024 ** 2
 _GB = 1024 ** 3
+
+# Minimum available system memory we MUST keep free at all times
+HEADROOM_MB = 500
 
 
 def rss_mb() -> float:
@@ -53,296 +53,77 @@ def log(msg: str) -> None:
           flush=True)
 
 
-def check_limit(max_gb: float) -> bool:
-    """Return True if RSS exceeds the safety ceiling."""
-    return rss_mb() > max_gb * 1024
+def is_safe(next_alloc_mb: float = 0) -> bool:
+    """Return True if it's safe to allocate next_alloc_mb more."""
+    avail = available_mb()
+    # Must keep HEADROOM_MB free AFTER the allocation
+    return avail - next_alloc_mb > HEADROOM_MB
+
+
+def would_exceed(next_alloc_mb: float) -> bool:
+    """Return True if the next allocation would breach the safety margin."""
+    return not is_safe(next_alloc_mb)
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — raw numpy allocations
+# Test 1 — raw numpy allocations (SAFE)
 # ---------------------------------------------------------------------------
 
-def test_numpy_allocation(max_gb: float) -> None:
-    """Allocate increasingly large float32 arrays until OOM or limit."""
+def test_numpy_allocation(headroom: float) -> dict:
+    """Allocate float32 arrays in 128 MB steps, stopping BEFORE memory runs out."""
     print("\n" + "=" * 60)
     print("TEST: Raw numpy allocation (float32)")
     print("=" * 60)
 
     arrays: list[np.ndarray] = []
-    step_mb = 256  # allocate in 256 MB increments
+    step_mb = 128  # smaller steps for precision
     step_pixels = int(step_mb * _MB / 4)  # float32 = 4 bytes
 
+    baseline_rss = rss_mb()
     iteration = 0
+
     while True:
         iteration += 1
-        target_mb = step_mb * iteration
-        log(f"Allocating {step_mb} MB chunk (total target: {target_mb} MB)...")
-        try:
-            arr = np.empty(step_pixels, dtype=np.float32)
-            arr[:] = 1.0  # force physical allocation
-            arrays.append(arr)
-            log(f"Allocated chunk #{iteration} OK")
-        except MemoryError:
-            log(f"MemoryError at chunk #{iteration} ({target_mb} MB target)")
+        # CHECK BEFORE allocating
+        if would_exceed(step_mb):
+            log(f"STOP: next {step_mb} MB chunk would breach {HEADROOM_MB} MB headroom "
+                f"(avail={available_mb():.0f} MB)")
             break
 
-        if check_limit(max_gb):
-            log(f"RSS exceeded {max_gb} GB ceiling — stopping")
-            break
+        log(f"Allocating {step_mb} MB chunk #{iteration}...")
+        arr = np.empty(step_pixels, dtype=np.float32)
+        arr[:] = 1.0  # force physical pages
+        arrays.append(arr)
+        log(f"Chunk #{iteration} OK")
 
-    total_allocated = sum(a.nbytes for a in arrays) / _MB
-    log(f"Total numpy allocated: {total_allocated:,.0f} MB in {len(arrays)} chunks")
+    total_allocated_mb = sum(a.nbytes for a in arrays) / _MB
+    peak_rss = rss_mb()
+    result = {
+        "test": "numpy",
+        "chunks": len(arrays),
+        "step_mb": step_mb,
+        "total_allocated_mb": total_allocated_mb,
+        "peak_rss_mb": peak_rss,
+        "baseline_rss_mb": baseline_rss,
+        "available_at_stop_mb": available_mb(),
+    }
+
+    log(f"RESULT: {total_allocated_mb:,.0f} MB allocated in {len(arrays)} chunks")
+    log(f"Peak RSS: {peak_rss:,.0f} MB | Available at stop: {available_mb():,.0f} MB")
 
     # Cleanup
     del arrays
     gc.collect()
-    log("Cleaned up numpy arrays")
+    log("Cleaned up")
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — ERA5 Zarr loads
+# Test 2 — H3 hexagon dict build-up (SAFE)
 # ---------------------------------------------------------------------------
 
-def test_era5_loads(max_gb: float) -> None:
-    """Load ERA5 data with increasing bbox / date ranges."""
-    print("\n" + "=" * 60)
-    print("TEST: ERA5 Zarr loads (.compute())")
-    print("=" * 60)
-
-    try:
-        import xarray as xr
-    except ImportError:
-        log("xarray not installed — skipping ERA5 test")
-        return
-
-    ERA5_STORAGE_OPTIONS = {"account_name": "cpdataeuwest"}
-    ERA5_VAR = "air_temperature_at_2_metres"
-
-    # Define increasingly large loads:
-    # (label, bbox [west, south, east, north], days)
-    scenarios = [
-        ("tiny",     [-3.70, 40.40, -3.68, 40.42],  7),
-        ("small",    [-3.80, 40.30, -3.60, 40.50], 14),
-        ("medium",   [-4.00, 40.00, -3.00, 41.00], 30),
-        ("large",    [-6.00, 38.00, -2.00, 42.00], 30),
-        ("xlarge",   [-10.0, 36.00,  4.00, 44.00], 30),
-        ("xxlarge",  [-10.0, 36.00,  4.00, 44.00], 90),
-        ("huge",     [-20.0, 30.00, 20.00, 60.00], 30),
-        ("massive",  [-20.0, 30.00, 20.00, 60.00], 90),
-        ("extreme",  [-180, -90, 180, 90],          30),
-    ]
-
-    results: list[dict] = []
-
-    for label, bbox, days in scenarios:
-        west, south, east, north = bbox
-        dt_start = date(2023, 6, 1)
-        dt_end = dt_start + timedelta(days=days - 1)
-
-        log(f"ERA5 scenario '{label}': bbox={bbox}, days={days}")
-
-        try:
-            # Determine months needed
-            months_needed = []
-            cur = dt_start.replace(day=1)
-            while cur <= dt_end:
-                months_needed.append((cur.year, cur.month))
-                if cur.month == 12:
-                    cur = cur.replace(year=cur.year + 1, month=1)
-                else:
-                    cur = cur.replace(month=cur.month + 1)
-
-            # Open zarr stores
-            arrays = []
-            for year, month in months_needed:
-                url = f"abfs://era5/ERA5/{year}/{month:02d}/{ERA5_VAR}.zarr"
-                ds = xr.open_zarr(url, storage_options=ERA5_STORAGE_OPTIONS,
-                                  consolidated=True, chunks={})
-                arrays.append(ds[ERA5_VAR])
-
-            if len(arrays) == 1:
-                da = arrays[0]
-            else:
-                da = xr.concat(arrays, dim="time")
-
-            lon_west = west % 360
-            lon_east = east % 360
-            if lon_west <= lon_east:
-                lon_slice = slice(lon_west, lon_east)
-            else:
-                lon_slice = slice(0, 360)
-            lat_slice = slice(north, south)
-            time_slice = slice(str(dt_start), str(dt_end))
-
-            subset = da.sel(lon=lon_slice, lat=lat_slice, time=time_slice)
-
-            # Check size before loading
-            nbytes_est = subset.nbytes
-            log(f"  Estimated array size: {nbytes_est / _MB:,.0f} MB")
-
-            if nbytes_est / _GB > max_gb:
-                log(f"  Would exceed {max_gb} GB ceiling — skipping compute()")
-                results.append({"scenario": label, "est_mb": nbytes_est / _MB,
-                                "status": "skipped"})
-                del subset, da, arrays
-                gc.collect()
-                continue
-
-            t0 = time.time()
-            daily = subset.resample(time="1D").mean()
-            data = daily.compute()
-            elapsed = time.time() - t0
-
-            actual_mb = data.nbytes / _MB
-            log(f"  Loaded {actual_mb:,.0f} MB in {elapsed:.1f}s — shape {data.shape}")
-            results.append({"scenario": label, "est_mb": nbytes_est / _MB,
-                            "actual_mb": actual_mb, "elapsed_s": elapsed,
-                            "status": "ok"})
-
-            del data, daily, subset, da, arrays
-            gc.collect()
-
-        except MemoryError:
-            log(f"  MemoryError on scenario '{label}'")
-            results.append({"scenario": label, "status": "oom"})
-            gc.collect()
-            break
-        except Exception as exc:
-            log(f"  Error on scenario '{label}': {exc}")
-            results.append({"scenario": label, "status": f"error: {exc}"})
-            gc.collect()
-
-        if check_limit(max_gb):
-            log(f"RSS exceeded {max_gb} GB ceiling — stopping ERA5 tests")
-            break
-
-    print("\n--- ERA5 summary ---")
-    for r in results:
-        print(f"  {r['scenario']:>10s}  est={r.get('est_mb', '?'):>8}  "
-              f"actual={r.get('actual_mb', '?'):>8}  {r['status']}")
-
-
-# ---------------------------------------------------------------------------
-# Test 3 — Raster reads (Planetary Computer COGs)
-# ---------------------------------------------------------------------------
-
-def test_raster_reads(max_gb: float) -> None:
-    """Read rasters with increasing window sizes."""
-    print("\n" + "=" * 60)
-    print("TEST: Raster reads (COG via rasterio)")
-    print("=" * 60)
-
-    try:
-        import rasterio
-        from rasterio.windows import Window, from_bounds
-        from rasterio.warp import transform_bounds
-        import planetary_computer
-        import pystac_client
-    except ImportError as e:
-        log(f"Missing dependency ({e}) — skipping raster test")
-        return
-
-    CATALOG_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
-
-    # We'll query a MODIS fire item and read increasingly large windows
-    scenarios = [
-        ("small",   [-3.80, 40.30, -3.60, 40.50]),
-        ("medium",  [-5.00, 39.00, -2.00, 42.00]),
-        ("large",   [-10.0, 35.00,  5.00, 45.00]),
-        ("xlarge",  [-20.0, 25.00, 40.00, 60.00]),
-        ("global",  [-180, -60, 180, 75]),
-    ]
-
-    results: list[dict] = []
-    test_date = date(2023, 7, 15)
-
-    catalog = pystac_client.Client.open(CATALOG_URL)
-
-    for label, bbox in scenarios:
-        log(f"Raster scenario '{label}': bbox={bbox}")
-
-        try:
-            search = catalog.search(
-                collections=["modis-14A1-061"],
-                bbox=bbox,
-                datetime=test_date.isoformat(),
-                limit=1,
-            )
-            items = list(search.item_collection())
-            if not items:
-                log(f"  No items found for bbox={bbox}")
-                results.append({"scenario": label, "status": "no items"})
-                continue
-
-            item = items[0]
-            href = planetary_computer.sign(item.assets["FireMask"].href)
-
-            with rasterio.open(href) as ds:
-                west, south, east, north = bbox
-                minx, miny, maxx, maxy = transform_bounds(
-                    "EPSG:4326", ds.crs, west, south, east, north, densify_pts=21)
-
-                candidate = from_bounds(minx, miny, maxx, maxy, transform=ds.transform)
-                bounded = candidate.intersection(Window(0, 0, ds.width, ds.height))
-                bounded = bounded.round_offsets().round_lengths()
-
-                if bounded.width <= 0 or bounded.height <= 0:
-                    log(f"  Empty window")
-                    results.append({"scenario": label, "status": "empty window"})
-                    continue
-
-                total_px = bounded.width * bounded.height
-                est_mb = total_px * 4 / _MB  # float32
-                log(f"  Window: {bounded.width}x{bounded.height} = {total_px:,} px "
-                    f"(~{est_mb:,.0f} MB)")
-
-                if est_mb > max_gb * 1024:
-                    log(f"  Would exceed ceiling — skipping read")
-                    results.append({"scenario": label, "pixels": total_px,
-                                    "est_mb": est_mb, "status": "skipped"})
-                    continue
-
-                t0 = time.time()
-                band = ds.read(1, window=bounded, masked=True).astype("float32")
-                elapsed = time.time() - t0
-                actual_mb = band.nbytes / _MB
-
-                log(f"  Read {actual_mb:,.0f} MB in {elapsed:.1f}s — "
-                    f"shape {band.shape}")
-                results.append({"scenario": label, "pixels": total_px,
-                                "actual_mb": actual_mb, "elapsed_s": elapsed,
-                                "status": "ok"})
-
-                del band
-                gc.collect()
-
-        except MemoryError:
-            log(f"  MemoryError on scenario '{label}'")
-            results.append({"scenario": label, "status": "oom"})
-            gc.collect()
-            break
-        except Exception as exc:
-            log(f"  Error on scenario '{label}': {exc}")
-            traceback.print_exc()
-            results.append({"scenario": label, "status": f"error: {exc}"})
-            gc.collect()
-
-        if check_limit(max_gb):
-            log(f"RSS exceeded {max_gb} GB ceiling — stopping raster tests")
-            break
-
-    print("\n--- Raster summary ---")
-    for r in results:
-        print(f"  {r['scenario']:>10s}  px={r.get('pixels', '?'):>12}  "
-              f"mb={r.get('actual_mb', '?'):>8}  {r['status']}")
-
-
-# ---------------------------------------------------------------------------
-# Test 4 — H3 hexagon dict build-up
-# ---------------------------------------------------------------------------
-
-def test_h3_buildup(max_gb: float) -> None:
-    """Build H3 hexagon dicts with increasing pixel counts."""
+def test_h3_buildup(headroom: float) -> dict:
+    """Build H3 dicts with increasing grids, stopping before memory runs out."""
     print("\n" + "=" * 60)
     print("TEST: H3 hexagon dictionary build-up")
     print("=" * 60)
@@ -350,27 +131,46 @@ def test_h3_buildup(max_gb: float) -> None:
     try:
         import h3
     except ImportError:
-        log("h3 not installed — skipping H3 test")
-        return
+        log("h3 not installed — skipping")
+        return {"test": "h3", "status": "skipped"}
 
-    from collections import defaultdict
-
-    # Simulate grid→H3 conversion with increasing pixel grids
+    # Incremental scenarios — each one is independent (cleaned up after)
     scenarios = [
         ("100x100",       100,   100, 5),
+        ("300x300",       300,   300, 5),
         ("500x500",       500,   500, 5),
         ("1000x1000",    1000,  1000, 5),
+        ("1500x1500",    1500,  1500, 5),
         ("2000x2000",    2000,  2000, 5),
+        ("3000x3000",    3000,  3000, 5),
         ("4000x4000",    4000,  4000, 5),
+        ("5000x5000",    5000,  5000, 5),
+        ("6000x6000",    6000,  6000, 5),
         ("8000x8000",    8000,  8000, 5),
-        ("10000x10000", 10000, 10000, 5),
     ]
 
     results: list[dict] = []
+    last_safe_pixels = 0
 
     for label, rows, cols, h3_res in scenarios:
         total_px = rows * cols
-        log(f"H3 scenario '{label}': {total_px:,} pixels → H3 res {h3_res}")
+        # Estimate memory needed: grid (float32) + hex dict overhead
+        # Grid = rows*cols*4 bytes; dict ≈ ~200 bytes per hex cell
+        est_grid_mb = (rows * cols * 4) / _MB
+        # Rough estimate for hex count at res 5: about 1 hex per 100 pixels
+        est_hex_count = total_px // 50
+        est_dict_mb = (est_hex_count * 200) / _MB
+        est_total_mb = est_grid_mb + est_dict_mb
+
+        log(f"H3 scenario '{label}': {total_px:,} px | est ~{est_total_mb:,.0f} MB needed")
+
+        # Safety check BEFORE starting
+        if would_exceed(est_total_mb):
+            log(f"STOP: estimated {est_total_mb:.0f} MB would breach headroom "
+                f"(avail={available_mb():.0f} MB)")
+            results.append({"scenario": label, "pixels": total_px,
+                            "est_mb": est_total_mb, "status": "stopped_safe"})
+            break
 
         try:
             lats = np.linspace(40.0, 41.0, rows)
@@ -381,6 +181,12 @@ def test_h3_buildup(max_gb: float) -> None:
 
             t0 = time.time()
             for lat_idx in range(rows):
+                # Check every 500 rows during processing
+                if lat_idx > 0 and lat_idx % 500 == 0:
+                    if available_mb() < HEADROOM_MB:
+                        log(f"  MID-RUN STOP at row {lat_idx}/{rows} — "
+                            f"avail dropped to {available_mb():.0f} MB")
+                        break
                 for lon_idx in range(cols):
                     val = float(values[lat_idx, lon_idx])
                     cell = h3.latlng_to_cell(float(lats[lat_idx]),
@@ -404,31 +210,82 @@ def test_h3_buildup(max_gb: float) -> None:
             log(f"  {n_hex:,} hexagons in {elapsed:.1f}s")
             results.append({"scenario": label, "pixels": total_px,
                             "hexagons": n_hex, "elapsed_s": elapsed,
-                            "status": "ok"})
+                            "rss_mb": rss_mb(), "status": "ok"})
+            last_safe_pixels = total_px
 
-            del hexagons, values
+            del hexagons, values, lats, lons
             gc.collect()
 
-        except MemoryError:
-            log(f"  MemoryError on scenario '{label}'")
-            results.append({"scenario": label, "pixels": total_px, "status": "oom"})
-            gc.collect()
-            break
         except Exception as exc:
             log(f"  Error: {exc}")
             results.append({"scenario": label, "pixels": total_px,
                             "status": f"error: {exc}"})
             gc.collect()
-
-        if check_limit(max_gb):
-            log(f"RSS exceeded {max_gb} GB ceiling — stopping H3 tests")
             break
 
-    print("\n--- H3 summary ---")
+    return {
+        "test": "h3",
+        "scenarios": results,
+        "last_safe_pixels": last_safe_pixels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Final Report
+# ---------------------------------------------------------------------------
+
+def print_report(results: list[dict]) -> None:
+    """Print a final summary report."""
+    print("\n")
+    print("=" * 60)
+    print("  MEMORY PROFILING REPORT")
+    print("=" * 60)
+    total_ram = psutil.virtual_memory().total / _MB
+    print(f"\n  System total RAM:  {total_ram:,.0f} MB ({total_ram / 1024:.1f} GB)")
+    print(f"  Safety headroom:   {HEADROOM_MB} MB")
+    print(f"  Usable for data:   {total_ram - HEADROOM_MB:,.0f} MB")
+    print()
+
     for r in results:
-        print(f"  {r['scenario']:>12s}  px={r.get('pixels', '?'):>12,}  "
-              f"hex={r.get('hexagons', '?'):>8}  "
-              f"time={r.get('elapsed_s', '?'):>6}  {r['status']}")
+        test_name = r.get("test", "?")
+        if test_name == "numpy":
+            safe_mb = r["total_allocated_mb"]
+            print(f"  [{test_name.upper()}]")
+            print(f"    Max safe allocation:  {safe_mb:,.0f} MB ({safe_mb / 1024:.1f} GB)")
+            print(f"    Peak RSS:             {r['peak_rss_mb']:,.0f} MB")
+            print(f"    Available at stop:    {r['available_at_stop_mb']:,.0f} MB")
+            print(f"    Recommended limit:    {safe_mb * 0.8:,.0f} MB (80% safety factor)")
+            print()
+        elif test_name == "h3":
+            last_px = r.get("last_safe_pixels", 0)
+            print(f"  [{test_name.upper()}]")
+            print(f"    Last safe grid:       {last_px:,} pixels")
+            scenarios = r.get("scenarios", [])
+            if scenarios:
+                print(f"    Scenarios completed:  {sum(1 for s in scenarios if s['status'] == 'ok')}/{len(scenarios)}")
+                for s in scenarios:
+                    status_mark = "OK" if s["status"] == "ok" else "STOP"
+                    extra = ""
+                    if s["status"] == "ok":
+                        extra = f"  ({s.get('hexagons', '?')} hex, {s.get('elapsed_s', 0):.1f}s)"
+                    print(f"      {s['scenario']:>12s}  {s['pixels']:>12,} px  [{status_mark}]{extra}")
+            print(f"    Recommended MAX_H3_INPUT_PIXELS:  {int(last_px * 0.7):,} (70% safety)")
+            print()
+
+    print("  " + "-" * 56)
+    print("  RECOMMENDED CONSTANTS:")
+    for r in results:
+        if r.get("test") == "numpy":
+            rec = int(r["total_allocated_mb"] * 0.8)
+            print(f"    MAX_ERA5_BYTES        = {int(rec * _MB):_}  # ~{rec} MB")
+            print(f"    MAX_IMAGECUBES_BYTES  = {int(rec * _MB):_}  # ~{rec} MB")
+            print(f"    MAX_RASTER_BYTES_TOTAL= {int(rec * _MB):_}  # ~{rec} MB")
+        if r.get("test") == "h3":
+            last_px = r.get("last_safe_pixels", 10_000_000)
+            rec_px = int(last_px * 0.7)
+            print(f"    MAX_H3_INPUT_PIXELS   = {rec_px:_}  # {rec_px:,} pixels")
+    print("  " + "-" * 56)
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -436,39 +293,39 @@ def test_h3_buildup(max_gb: float) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Memory profiling for EarthAnalyser backend")
-    parser.add_argument("--test", choices=["numpy", "era5", "raster", "h3", "all"],
+    global HEADROOM_MB
+
+    parser = argparse.ArgumentParser(description="SAFE memory profiling for EarthAnalyser")
+    parser.add_argument("--test", choices=["numpy", "h3", "all"],
                         default="all", help="Which test to run (default: all)")
-    parser.add_argument("--max-gb", type=float, default=8.0,
-                        help="Safety ceiling in GB — stop tests if RSS exceeds this (default: 8)")
+    parser.add_argument("--headroom-mb", type=float, default=500,
+                        help="Minimum available MB to keep free (default: 500)")
     args = parser.parse_args()
+    HEADROOM_MB = args.headroom_mb
 
     print("=" * 60)
-    print("EarthAnalyser Memory Profiler")
+    print("EarthAnalyser SAFE Memory Profiler")
     print("=" * 60)
     log(f"PID: {os.getpid()}")
     log(f"System RAM: {psutil.virtual_memory().total / _GB:.1f} GB")
     log(f"Available:  {psutil.virtual_memory().available / _GB:.1f} GB")
-    log(f"Safety ceiling: {args.max_gb} GB")
+    log(f"Headroom:   {HEADROOM_MB} MB (will NOT go below this)")
     print()
 
-    tests = {
-        "numpy":  test_numpy_allocation,
-        "era5":   test_era5_loads,
-        "raster": test_raster_reads,
-        "h3":     test_h3_buildup,
-    }
+    all_results: list[dict] = []
 
-    if args.test == "all":
-        for name, fn in tests.items():
-            fn(args.max_gb)
-            gc.collect()
-    else:
-        tests[args.test](args.max_gb)
+    if args.test in ("numpy", "all"):
+        r = test_numpy_allocation(HEADROOM_MB)
+        all_results.append(r)
+        gc.collect()
 
-    print("\n" + "=" * 60)
-    log("Profiling complete")
-    print("=" * 60)
+    if args.test in ("h3", "all"):
+        r = test_h3_buildup(HEADROOM_MB)
+        all_results.append(r)
+        gc.collect()
+
+    print_report(all_results)
+    log("Done — process still alive!")
 
 
 if __name__ == "__main__":

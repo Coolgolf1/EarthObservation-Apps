@@ -23,6 +23,10 @@ import xarray as xr
 
 IMAGECUBES_API = "https://imagecube-toucan-api.jollyground-fbd4d1eb.eastus.azurecontainerapps.io"
 
+# ─── Memory Safety ────────────────────────────────────────────
+# Machine has ~6.6 GB total RAM (~5.9 GB usable). Cap per-request loads.
+MAX_IMAGECUBES_BYTES = 1_000_000_000  # 1 GB max per ImageCubes load
+
 
 def _get_token() -> str:
     token = os.environ.get("IMAGECUBES_TOKEN", "")
@@ -143,9 +147,20 @@ async def imagecubes_ndvi_to_h3(
         xr.open_zarr, artifact_url, consolidated=True, chunks={}
     )
 
+    # ─── Memory guard: check band sizes before loading ───
+    b04_da = ds["B04"]
+    b08_da = ds["B08"]
+    total_bytes = b04_da.nbytes + b08_da.nbytes
+    if total_bytes > MAX_IMAGECUBES_BYTES:
+        raise MemoryError(
+            f"ImageCubes request too large: {total_bytes / 1e9:.2f} GB estimated "
+            f"(limit {MAX_IMAGECUBES_BYTES / 1e9:.1f} GB). "
+            f"Reduce bbox or date range."
+        )
+
     # Read B04 (Red) and B08 (NIR) bands
-    b04 = ds["B04"].compute()
-    b08 = ds["B08"].compute()
+    b04 = b04_da.compute()
+    b08 = b08_da.compute()
 
     # Compute NDVI = (B08 - B04) / (B08 + B04)
     with np.errstate(divide="ignore", invalid="ignore"):

@@ -31,15 +31,30 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from ..core.era5 import era5_to_h3
+from ..core.config import DATASET_CONFIG
 
 # ─── Memory Safety Constants ─────────────────────────────────
-MAX_CONCURRENT_RASTERS = 16          # max simultaneous raster reads
-MAX_WINDOW_PIXELS = 50_000_000      # cap raster window at ~50M pixels
+# Machine has ~7.5 GB total RAM (~5 GB usable). Budget conservatively.
+MAX_CONCURRENT_RASTERS = 4           # max simultaneous raster reads (global)
+MAX_WINDOW_PIXELS = 20_000_000      # cap raster window at ~20M pixels (~80 MB float32)
 MAX_H3_INPUT_PIXELS = 10_000_000    # max pixels to convert to H3
+MAX_ITEMS_PER_DATASET = 50           # max STAC items processed per dataset request
+MAX_CONCURRENT_DATES = 4            # max dates processed in parallel per dataset
+MEMORY_HEADROOM_MB = 500            # stop spawning work if available RAM drops below this
 _RASTER_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_RASTERS)
 
 # ─── Active task tracking (for cancellation) ─────────────────
 _active_tasks: set[asyncio.Task] = set()
+
+
+def _check_memory_pressure() -> bool:
+    """Return True if system is under memory pressure (should stop loading)."""
+    try:
+        import psutil
+        avail_mb = psutil.virtual_memory().available / (1024 ** 2)
+        return avail_mb < MEMORY_HEADROOM_MB
+    except ImportError:
+        return False
 
 # ─── STAC Item Cache (avoid re-querying same collection/bbox/date range)
 _stac_cache: dict[str, list] = {}
@@ -70,79 +85,6 @@ env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
 load_dotenv(env_path)
 
 CATALOG_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
-
-# ─── Dataset Configurations ───────────────────────────────────
-
-DATASET_CONFIG = {
-    "fire": {
-        "collection": "modis-14A1-061",
-        "asset": "FireMask",
-        "description": "MODIS Daily Fire (14A1)",
-        "value_type": "classification",
-        # Fire classes: 7=low, 8=nominal, 9=high confidence
-        "filter": lambda arr: (arr >= 7) & (arr <= 9),
-        "classify": lambda val: (
-            "high" if val >= 9 else "nominal" if val >= 8 else "low"
-        ),
-        "scale": None,
-        "max_h3_res": 7,  # MODIS ~1km pixels
-    },
-    "flood": {
-        "collection": "jrc-gsw",
-        "asset": "occurrence",
-        "description": "JRC Global Surface Water",
-        "value_type": "continuous",
-        # Water occurrence 0-100 (% of time water present)
-        "filter": lambda arr: arr > 0,
-        "classify": lambda val: (
-            "permanent" if val >= 80 else "seasonal" if val >= 30 else "ephemeral"
-        ),
-        "scale": None,
-        "max_h3_res": 7,  # cap to match MODIS for speed
-    },
-    "vegetation": {
-        "collection": "modis-13A1-061",
-        "asset": "500m_16_days_NDVI",
-        "description": "MODIS NDVI (16-day)",
-        "value_type": "continuous",
-        # NDVI raw values; scale by /10000 to get -1 to 1
-        "filter": lambda arr: arr > 0,
-        "classify": lambda val: (
-            "dense" if val > 6000 else "moderate" if val > 3000 else "sparse" if val > 1000 else "bare"
-        ),
-        "scale": 10000.0,  # divide by this to get real NDVI
-        "max_h3_res": 7,  # MODIS ~500m pixels
-    },
-    "weather": {
-        "collection": "modis-11A1-061",
-        "asset": "LST_Day_1km",
-        "description": "MODIS Daily Land Surface Temperature",
-        "value_type": "continuous",
-        # LST scale: raw * 0.02 = Kelvin
-        "filter": lambda arr: arr > 0,
-        "classify": lambda val: (
-            "extreme" if val > 16000 else "hot" if val > 15000 else "warm" if val > 14000 else "cool"
-        ),
-        "scale": None,  # Will convert: raw * 0.02 - 273.15 = °C
-        "max_h3_res": 7,  # MODIS ~1km pixels
-    },
-    "landuse": {
-        "collection": "esa-worldcover",
-        "asset": "map",
-        "description": "ESA WorldCover (10m)",
-        "value_type": "classification",
-        # Classes: 10=tree, 20=shrub, 30=grass, 40=crop, 50=built, 60=bare, 80=water
-        "filter": lambda arr: arr > 0,
-        "classify": lambda val: (
-            "tree" if val == 10 else "shrub" if val == 20 else "grass" if val == 30
-            else "crop" if val == 40 else "built" if val == 50 else "bare" if val == 60
-            else "water" if val == 80 else "other"
-        ),
-        "scale": None,
-        "max_h3_res": 7,  # cap to match MODIS for speed
-    },
-}
-
 
 # ─── Request Model ────────────────────────────────────────────
 
@@ -598,20 +540,26 @@ async def query_datasets_h3(payload: DatasetH3Request):
                 # Single STAC query for the entire date range (instead of per-day)
                 all_items = await asyncio.to_thread(
                     _query_items_bbox_daterange, catalog, collection, bbox,
-                    payload.date_start, payload.date_end, 200
+                    payload.date_start, payload.date_end, MAX_ITEMS_PER_DATASET
                 )
 
                 # Group items by date for frame organization
                 items_by_date: dict[str, list] = {}
+                item_count = 0
                 for item in all_items:
                     if item.id in seen_items:
                         continue
                     seen_items.add(item.id)
                     acq_date = _item_acq_date(item, payload.date_start)
                     items_by_date.setdefault(acq_date, []).append(item)
+                    item_count += 1
+                    if item_count >= MAX_ITEMS_PER_DATASET:
+                        break
 
-                # Process all items concurrently (semaphore limits raster I/O)
+                # Process dates in batches to limit concurrent memory usage
                 async def process_item(item, acq_date: str) -> dict[str, Any] | None:
+                    if _check_memory_pressure():
+                        return None
                     asset = _get_asset(item)
                     if not asset or not asset.href:
                         return None
@@ -623,12 +571,19 @@ async def query_datasets_h3(payload: DatasetH3Request):
                         return {"acq_date": acq_date, "hexagons": hexes}
                     return None
 
-                tasks = []
-                for acq_date, items in items_by_date.items():
-                    for item in items:
-                        tasks.append(process_item(item, acq_date))
-
-                results_list = await asyncio.gather(*tasks)
+                # Process dates in batches of MAX_CONCURRENT_DATES
+                date_keys = list(items_by_date.keys())
+                results_list = []
+                for batch_start in range(0, len(date_keys), MAX_CONCURRENT_DATES):
+                    if _check_memory_pressure():
+                        break
+                    batch_dates = date_keys[batch_start:batch_start + MAX_CONCURRENT_DATES]
+                    batch_tasks = []
+                    for acq_date in batch_dates:
+                        for item in items_by_date[acq_date]:
+                            batch_tasks.append(process_item(item, acq_date))
+                    batch_results = await asyncio.gather(*batch_tasks)
+                    results_list.extend(batch_results)
 
                 for frame in results_list:
                     if frame and frame["hexagons"]:
@@ -833,21 +788,27 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
                     # Single STAC query for the entire date range
                     all_items = await asyncio.to_thread(
                         _query_items_bbox_daterange, catalog, collection, bbox,
-                        payload.date_start, payload.date_end, 200
+                        payload.date_start, payload.date_end, MAX_ITEMS_PER_DATASET
                     )
 
                     # Group items by date for frame organization
                     items_by_date: dict[str, list] = {}
+                    item_count = 0
                     for item in all_items:
                         if item.id in seen_items:
                             continue
                         seen_items.add(item.id)
                         acq_date = _item_acq_date(item, payload.date_start)
                         items_by_date.setdefault(acq_date, []).append(item)
+                        item_count += 1
+                        if item_count >= MAX_ITEMS_PER_DATASET:
+                            break
 
-                    # Process ALL dates concurrently, stream frames as they arrive
+                    # Process dates in batches to control memory
                     async def process_date(acq_date: str, date_items: list):
                         async def process_item(item) -> list[dict[str, Any]]:
+                            if _check_memory_pressure():
+                                return []
                             asset = _get_asset(item)
                             if not asset or not asset.href:
                                 return []
@@ -877,9 +838,17 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
                             return merged_hexes
                         return []
 
-                    date_results = await asyncio.gather(
-                        *(process_date(ad, items_by_date[ad]) for ad in items_by_date)
-                    )
+                    # Process dates in batches of MAX_CONCURRENT_DATES
+                    date_keys = list(items_by_date.keys())
+                    date_results = []
+                    for batch_start in range(0, len(date_keys), MAX_CONCURRENT_DATES):
+                        if _check_memory_pressure():
+                            break
+                        batch_dates = date_keys[batch_start:batch_start + MAX_CONCURRENT_DATES]
+                        batch_results = await asyncio.gather(
+                            *(process_date(ad, items_by_date[ad]) for ad in batch_dates)
+                        )
+                        date_results.extend(batch_results)
                     for merged_hexes in date_results:
                         if merged_hexes:
                             frames_count += 1
@@ -1412,9 +1381,10 @@ async def classify_question(payload: ClassifyRequest):
 
     system_prompt = (
         "You are a classifier for a geospatial analysis tool. "
-        "Given a user question (which may contain typos or misspellings), "
+        "Given a user question in natural language (which may contain typos, slang, or casual phrasing), "
         "infer what they mean and return ONLY a JSON object with:\n"
         "  \"categories\": array of dataset categories needed\n"
+        "  \"context_categories\": array of supporting datasets for analysis (loaded but not displayed)\n"
         "  \"date_start\": start date (YYYY-MM-DD) if mentioned or implied, or null\n"
         "  \"date_end\": end date (YYYY-MM-DD) if mentioned or implied, or null\n"
         "Valid categories: fire, flood, vegetation, weather, landuse\n"
@@ -1425,14 +1395,24 @@ async def classify_question(payload: ClassifyRequest):
         "- 'weather' = temperature, heat, cold, LST, climate (also: wether, wheather, temperatura)\n"
         "- 'landuse' = urban, crops, forest, built areas, land cover\n"
         "- The user may misspell words — infer the correct meaning from context\n"
-        "- For causal/risk questions (why, cause, risk), include supporting categories\n"
+        "- For causal/why questions, add supporting categories to context_categories\n"
         "- For general overview questions, include all relevant categories\n"
-        "- 'last summer' = June 1 to Aug 31 of the previous year\n"
-        "- 'summer 2024' = 2024-06-01 to 2024-08-31\n"
-        "- 'in 2023' = 2023-01-01 to 2023-12-31\n"
-        "- If no date is mentioned, set both to null\n"
+        f"- TODAY is {date.today().isoformat()}. Use this to resolve relative dates:\n"
+        "  - 'last month' = first to last day of the previous calendar month\n"
+        "  - 'this month' = first day of current month to today\n"
+        "  - 'recently' = last 30 days\n"
+        "  - 'last summer' = June 1 to Aug 31 of the previous year\n"
+        "  - 'summer 2024' = 2024-06-01 to 2024-08-31\n"
+        "  - 'last year' = Jan 1 to Dec 31 of the previous year\n"
+        "  - 'this year' = Jan 1 of current year to today\n"
+        "  - 'in 2023' = 2023-01-01 to 2023-12-31\n"
+        "  - 'yesterday' = the day before today\n"
+        "  - 'last week' = 7 days before today to today\n"
+        "  - 'in June' = June 1 to June 30 of the current or most recent June\n"
+        "  - 'since March' = March 1 of the most recent March to today\n"
+        "- If no date is mentioned at all, set both to null\n"
         "Return ONLY the JSON object. No explanation.\n"
-        "Example: {\"categories\":[\"fire\",\"weather\"],\"date_start\":\"2024-06-01\",\"date_end\":\"2024-08-31\"}"
+        "Example: {\"categories\":[\"fire\",\"weather\"],\"context_categories\":[\"vegetation\"],\"date_start\":\"2024-06-01\",\"date_end\":\"2024-08-31\"}"
     )
 
     messages = [
@@ -1479,7 +1459,12 @@ async def classify_question(payload: ClassifyRequest):
             if isinstance(parsed, dict):
                 cats = parsed.get("categories", [])
                 valid = [c for c in cats if c in VALID_CATEGORIES]
-                resp = {"categories": valid or _infer_categories(question)}
+                ctx_cats = parsed.get("context_categories", [])
+                valid_ctx = [c for c in ctx_cats if c in VALID_CATEGORIES]
+                resp = {
+                    "categories": valid or _infer_categories(question),
+                    "context_categories": valid_ctx,
+                }
                 ds = parsed.get("date_start")
                 de = parsed.get("date_end")
                 if ds and re.match(r'^\d{4}-\d{2}-\d{2}$', str(ds)):
@@ -1508,7 +1493,7 @@ async def classify_question(payload: ClassifyRequest):
 
 class AnalyseRequest(BaseModel):
     question: str = Field(min_length=1, max_length=500)
-    data_report: str = Field(min_length=1, max_length=5000)
+    data_report: str = Field(default="", max_length=5000)
     model: str = Field(default=DEFAULT_ANALYSIS_MODEL)
 
 
@@ -1521,18 +1506,28 @@ async def analyse_with_llm(payload: AnalyseRequest):
 
     system_prompt = (
         "You are Earth Analyst — a friendly, knowledgeable geospatial AI assistant. "
-        "You answer questions about Earth observation data the way a helpful colleague would: "
-        "clear, conversational, and insightful.\n\n"
-        "The user asked a question and the system gathered satellite data for their area. "
-        "Below is the raw data report. Your job:\n"
-        "1. Answer their question directly and naturally — as if talking to them\n"
-        "2. Explain causes, risks, and patterns in plain language\n"
-        "3. Add relevant real-world context when it helps understanding\n"
-        "4. If interesting, mention what to watch or do next\n\n"
-        "Style: conversational, concise (100-200 words), no markdown headers, no bullet lists. "
-        "Write in flowing paragraphs like a knowledgeable friend explaining something. "
-        "Start directly with your answer — no preamble like 'Based on the data...' or 'Looking at...'. "
-        "If there's genuinely interesting or concerning data, say so clearly."
+        "You have a natural, conversational style. You talk like a smart colleague "
+        "who genuinely enjoys explaining things about our planet.\n\n"
+        "The user is chatting with you while looking at a map with satellite data overlaid. "
+        "Below is the raw data the system gathered for their area and time range.\n\n"
+        "Your job:\n"
+        "1. Answer their question directly — don't repeat what they asked\n"
+        "2. Be specific: use actual numbers from the data (temperatures, percentages, counts)\n"
+        "3. Explain WHY things happen, not just WHAT happened\n"
+        "4. Connect different datasets when relevant (e.g., high temps + low NDVI = fire risk)\n"
+        "5. Add real-world context when helpful (regional climate, land use patterns, seasonal norms)\n"
+        "6. If the data reveals something interesting or concerning, highlight it\n"
+        "7. If data is missing or insufficient, say so honestly rather than guessing\n\n"
+        "Style rules:\n"
+        "- Be concise: 80-200 words unless the question needs more\n"
+        "- No markdown headers or bullet lists — write in flowing, natural paragraphs\n"
+        "- Start directly with your answer. Never start with 'Based on the data...',  "
+        "'Looking at...', or 'According to...'\n"
+        "- Use plain language: '35°C is scorching' not 'the temperature anomaly is significant'\n"
+        "- You can use light formatting: bold a key number, use an emoji if it fits naturally\n"
+        "- If the user's question is casual ('what's up with the fires?'), match that tone\n"
+        "- If they ask a technical question, be precise\n"
+        "- You can suggest what to look at next if relevant"
     )
 
     messages = [
@@ -1590,15 +1585,7 @@ async def analyse_with_llm(payload: AnalyseRequest):
 
 def _fallback_analysis(question: str, data_report: str) -> str:
     """Generate a simple analysis when LLM is unavailable."""
-    # Extract key numbers from the report
-    lines = data_report.strip().split("\n")
-    summary_lines = [l.strip() for l in lines if l.strip() and ":" in l][:8]
-    summary = "\n".join(f"• {l}" for l in summary_lines)
-    return (
-        f"Based on the available satellite data for your area:\n\n"
-        f"{summary}\n\n"
-        f"(AI analysis temporarily unavailable — showing raw data summary)"
-    )
+    return data_report
 
 
 def _fetch_url_post(req: urlrequest.Request) -> str:
