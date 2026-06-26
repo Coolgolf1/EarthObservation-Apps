@@ -263,16 +263,103 @@ async function runQuery() {
 
 // ─── Agent question handler ─────────────────────────────────
 
-async function handleAgentQuestion(question) {
-  state._agentActive = true;
-  const hasLoadedData = Object.values(state.datasetResults).some(d => d?.total_hexagons > 0);
-  const placeQuery = extractPlaceName(question);
-  const extractedRange = extractDateRange(question);
+// ─── Intent classification ───────────────────────────────────
+
+function classifyIntent(question) {
+  const q = question.toLowerCase().trim();
+  if (q.length < 3) return "chat";
+
+  // Greetings, thanks, random
+  if (/^(hi|hello|hey|hola|sup|yo|thanks|thank you|ok|okay|cool|nice|great|bye|goodbye|cheers|lol|haha|hmm|wow|damn|wtf|what the)\b/i.test(q)) return "chat";
+  // About the agent
+  if (/^(who are you|what are you|what can you do|how do you work|help|what is this|are you ai|are you real)/i.test(q)) return "chat";
+
+  // Does it have earth/data keywords?
+  const hasEarthKeywords = /fire|flood|vegetation|weather|temp|heat|cold|burn|wildfire|water|rain|plant|ndvi|land.?use|urban|crop|drought|forest|green|dry|risk|danger/i.test(q);
+  const hasActionKeywords = /\b(show|analyz|check|find|get|fetch|plot|display|look at|explore|monitor|assess|compare)\b/i.test(q);
+  const hasDateRef = extractDateRange(question) !== null;
   const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
       || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
-  const isFollowUp = hasLoadedData && !placeQuery && !extractedRange && !usesDrawnArea;
 
-  if (isFollowUp) {
+  const looksLikeGeoQuery = hasEarthKeywords || hasActionKeywords || hasDateRef || usesDrawnArea;
+
+  // Check for place-like patterns (e.g. "in Portugal", "near Madrid")
+  const hasPlacePattern = /\b(in|at|near|around|over|of)\s+[A-Z]/i.test(question);
+
+  // Has loaded data and no geo signals → follow-up
+  const hasData = Object.values(state.datasetResults).some(d => d?.total_hexagons > 0);
+  if (hasData && !looksLikeGeoQuery && !hasPlacePattern) {
+    // Earth-related follow-up
+    if (/why|cause|trend|pattern|normal|compare|worse|better|change|tell me more|what about|is (this|that|it)|should i|how (bad|good|much|many)|safe/i.test(q)) return "follow_up";
+    // Question while data is loaded
+    if (/\?$/.test(q) || /^(why|what|how|when|where|is|are|do|does|can|could|should|will|would)\b/i.test(q)) return "follow_up";
+    return "chat";
+  }
+
+  if (looksLikeGeoQuery || hasPlacePattern) return "data_query";
+  return "chat";
+}
+
+function handleChatMessage(question) {
+  const q = question.toLowerCase().trim();
+  removeTyping();
+  let response;
+  if (/^(hi|hello|hey|hola|sup|yo)\b/i.test(q)) {
+    response = "Hey! I'm Earth Analyst. Ask me about fires, vegetation, weather, or floods anywhere on the planet. Try something like \"show me fires in Portugal last summer\" or just pick a spot on the map and ask what's happening there.";
+  } else if (/^(thanks|thank you|cheers)\b/i.test(q)) {
+    response = "You're welcome! Let me know if you want to explore more.";
+  } else if (/^(who are you|what are you|what can you do|help)\b/i.test(q)) {
+    response = "I'm Earth Analyst — I help you explore satellite data about our planet. I can show you fire activity, vegetation health, surface temperatures, flood risk, and land use for any place and time range. Just tell me where and when you're interested in, or ask me to explain what the data means.";
+  } else if (/^(how do you work|what is this)\b/i.test(q)) {
+    response = "I pull satellite data from NASA MODIS, ESA WorldCover, and ERA5 weather archives, then crunch it into hexagonal cells you can see on the map. Ask me about a place and time, and I'll fetch the relevant data and explain what I find.";
+  } else {
+    response = "I'm not sure what you mean by that. I'm best at answering questions about Earth observation data — try asking about fires, vegetation, weather, or flooding in a specific area. For example: \"Any fires near Madrid last month?\" or \"How's the vegetation in the Amazon this year?\"";
+  }
+  streamText(response);
+}
+
+// ─── Agent Question Handler ──────────────────────────────────
+
+async function handleAgentQuestion(question) {
+  state._agentActive = true;
+
+  // ─── Intent classification: chat, follow-up, or data query?
+  const intent = classifyIntent(question);
+
+  if (intent === "chat") {
+    handleChatMessage(question);
+    state._agentActive = false;
+    return;
+  }
+
+  if (intent === "follow_up") {
+    // Check if the question asks about datasets we haven't loaded yet
+    const asked = inferNeededDatasets(question);
+    const loaded = Object.keys(state.datasetResults).filter(k => state.datasetResults[k]?.total_hexagons > 0);
+    const missing = asked.filter(ds => !loaded.includes(ds));
+
+    if (missing.length > 0 && state.queryDateRange) {
+      // Fetch the missing data before answering
+      addTyping();
+      updateStatus(`Loading ${missing.join(", ")} for analysis...`);
+      const bbox = activeBbox(map);
+      const res = state.currentH3Res || getEffectiveResolution(bbox, map);
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        await fetchDatasetsH3Stream(
+          bbox, state.queryDateRange.start, state.queryDateRange.end, res, missing, controller.signal,
+          (dsKey, dsData) => {
+            state.datasetResults[dsKey] = dsData;
+            renderDatasetHexagons(dsKey, dsData.hexagons || []);
+            updateTimelineUI();
+          }
+        );
+        clearTimeout(timeout);
+      } catch (e) { /* answer with whatever we have */ }
+      removeTyping();
+    }
+
     removeTyping();
     const report = generateInsight(question, state._cachedPlaceName);
     const response = await getAIResponse(question, report);
@@ -282,13 +369,27 @@ async function handleAgentQuestion(question) {
     return;
   }
 
-  // New query flow
-  const classifyPromise = fetch(`${API_BASE}/datasets/classify`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question }),
-  }).then(r => r.ok ? r.json() : null).catch(() => null);
+  // ─── intent === "data_query": geocode + fetch data
+  const placeQuery = extractPlaceName(question);
+  const extractedRange = extractDateRange(question);
+  const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
+      || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
 
-  if (extractedRange) {
+  // Run LLM classification (may also provide corrected place/date)
+  const classifyResult = await Promise.race([
+    fetch(`${API_BASE}/datasets/classify`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    }).then(r => r.ok ? r.json() : null).catch(() => null),
+    new Promise(r => setTimeout(() => r(null), 8000)),
+  ]);
+
+  // Apply date range: prefer LLM result, then client-side extraction, then existing
+  if (classifyResult?.date_start && classifyResult?.date_end) {
+    state.queryDateRange = { start: classifyResult.date_start, end: classifyResult.date_end };
+    if (startDate) startDate.value = classifyResult.date_start;
+    if (endDate) endDate.value = classifyResult.date_end;
+  } else if (extractedRange) {
     state.queryDateRange = extractedRange;
     if (startDate) startDate.value = extractedRange.start;
     if (endDate) endDate.value = extractedRange.end;
@@ -297,37 +398,51 @@ async function handleAgentQuestion(question) {
     if (range) state.queryDateRange = range;
   }
 
-  let bbox = activeBbox(map);
-  if (placeQuery) {
+  // Geocode: use extracted place name, or the full question as fallback if it has a place pattern
+  let bbox = null;
+  const geocodeQuery = placeQuery || ((/\b(in|at|near|around)\s+\w/i.test(question)) ? question : null);
+
+  if (usesDrawnArea && state.resolvedBbox) {
+    bbox = [...state.resolvedBbox];
+    map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [30, 30], animate: true });
+    state.currentH3Res = getEffectiveResolution(bbox, map);
+  } else if (geocodeQuery) {
     try {
-      updateStatus(`Locating "${placeQuery}"...`);
+      updateStatus(`Locating "${placeQuery || geocodeQuery}"...`);
       const geoRes = await fetch(`${API_BASE}/datasets/geocode`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: placeQuery }),
+        body: JSON.stringify({ query: geocodeQuery }),
       });
       if (geoRes.ok) {
         const geo = await geoRes.json();
         if (geo.bbox && geo.lat && geo.lon) {
           bbox = geo.bbox;
+          // "near" implies a wider area — expand bbox by 50%
+          if (/\bnear\b/i.test(question)) {
+            const [w, s, e, n] = bbox;
+            const lngExpand = (e - w) * 0.25;
+            const latExpand = (n - s) * 0.25;
+            bbox = [w - lngExpand, s - latExpand, e + lngExpand, n + latExpand];
+          }
           state.resolvedBbox = [...bbox];
           if (geo.polygon) { state.activePolygon = geo.polygon; drawBoundary(geo.polygon); } else { clearBoundary(); }
           map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [40, 40], animate: true });
           state.currentH3Res = getEffectiveResolution(bbox, map);
-          updateStatus(`Centered on ${geo.name?.split(",")[0] || placeQuery}`);
+          updateStatus(`Centered on ${geo.name?.split(",")[0] || placeQuery || geocodeQuery}`);
           await new Promise(r => setTimeout(r, 300));
         }
       }
-    } catch (e) { /* fallback */ }
+    } catch (e) { /* fallback to viewport */ }
   }
 
-  const classifyResult = await Promise.race([classifyPromise, new Promise(r => setTimeout(() => r(null), 8000))]);
-  if (classifyResult?.date_start && classifyResult?.date_end) {
-    state.queryDateRange = { start: classifyResult.date_start, end: classifyResult.date_end };
-    if (startDate) startDate.value = classifyResult.date_start;
-    if (endDate) endDate.value = classifyResult.date_end;
+  // Fallback: if no bbox from geocode/drawn area, use viewport
+  if (!bbox) {
+    bbox = activeBbox(map);
   }
 
-  const plotCategories = classifyResult?.categories?.length ? classifyResult.categories : inferNeededDatasets(question);
+  let plotCategories = classifyResult?.categories?.length ? classifyResult.categories : inferNeededDatasets(question);
+  // For initial data queries, default to fire if nothing was inferred
+  if (plotCategories.length === 0) plotCategories = ["fire"];
   const contextCategories = classifyResult?.context_categories?.length ? classifyResult.context_categories : inferContextDatasets(question, plotCategories);
   const needed = [...new Set([...plotCategories, ...contextCategories])];
 

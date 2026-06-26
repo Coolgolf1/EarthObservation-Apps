@@ -1,6 +1,9 @@
 const API_BASE = "http://127.0.0.1:8080";
-const MAPBOX_TOKEN =
-  "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
+let MAPBOX_TOKEN = "";
+try {
+  const cfgRes = await fetch("http://127.0.0.1:8000/health/config");
+  if (cfgRes.ok) { const cfg = await cfgRes.json(); MAPBOX_TOKEN = cfg.mapbox_token || ""; }
+} catch (e) { console.warn("Could not fetch config:", e); }
 
 const map = L.map("map", {
   zoomControl: true,

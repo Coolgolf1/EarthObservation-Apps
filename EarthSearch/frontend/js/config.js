@@ -7,8 +7,11 @@ export const API_BASE = (() => {
   return window.location.protocol === "file:" || isLocal ? "http://127.0.0.1:8000" : window.location.origin;
 })();
 
-export const MAPBOX_TOKEN =
-  "pk.eyJ1IjoiYWx2YXJvcG94b29wbGUiLCJhIjoiY21xZXo3NjVyMDc2ejMycjFkeXZ6ZDRkYiJ9.uKcKNDOsSr3vgkz62RZNSw";
+export let MAPBOX_TOKEN = "";
+try {
+  const res = await fetch(`${API_BASE}/health/config`);
+  if (res.ok) { const cfg = await res.json(); MAPBOX_TOKEN = cfg.mapbox_token || ""; }
+} catch (e) { console.warn("Could not fetch mapbox token:", e); }
 
 export const STREAMING_LIMIT = 0;
 export const LOW_ZOOM_NAMED_PLACES_THRESHOLD = 6;

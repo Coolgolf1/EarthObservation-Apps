@@ -230,7 +230,6 @@ export function inferNeededDatasets(question) {
   if (/what.*(happen|going|see)|analyz|summar|overview|assess|everything|all/.test(q)) {
     for (const ds of ["fire", "flood", "weather", "vegetation", "landuse"]) needed.add(ds);
   }
-  if (needed.size === 0) needed.add("fire");
   return [...needed];
 }
 
