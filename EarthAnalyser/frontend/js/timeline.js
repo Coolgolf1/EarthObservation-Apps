@@ -67,18 +67,15 @@ export function drawTimelineChart() {
   }
 
   const checked = getCheckedDatasets();
-  const pad = 3;
-  const iW = w - pad * 2;
-  const iH = h - pad * 2;
-  const barW = Math.max(1, iW / state.timeline.length);
-  const bandH = Math.max(3, Math.floor(iH / Math.max(checked.length, 1)));
+  const barW = Math.max(1, w / state.timeline.length);
+  const bandH = Math.max(3, Math.floor(h / Math.max(checked.length, 1)));
 
   checked.forEach((ds, bandIdx) => {
     const data = state.datasetResults[ds];
     if (!data) return;
     const frames = data.frames || [];
     const isStatic = frames.length > 0 && frames.every(f => f.acq_date === "static");
-    const y0 = pad + bandIdx * bandH;
+    const y0 = bandIdx * bandH;
 
     if (isStatic) {
       const allHexes = frames.flatMap(f => f.hexagons || []);
@@ -88,7 +85,7 @@ export function drawTimelineChart() {
       for (let i = 0; i < state.timeline.length; i++) {
         ctx.fillStyle = totalHex > 0 ? color : "#e0e0e0";
         ctx.globalAlpha = totalHex > 0 ? intensity : 0.08;
-        ctx.fillRect(Math.round(pad + i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
+        ctx.fillRect(Math.round(i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
       }
       ctx.globalAlpha = 1;
       return;
@@ -123,7 +120,7 @@ export function drawTimelineChart() {
         ctx.fillStyle = "#e0e0e0";
         ctx.globalAlpha = 0.08;
       }
-      ctx.fillRect(Math.round(pad + i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
+      ctx.fillRect(Math.round(i * barW), y0, Math.max(1, Math.floor(barW - 0.5)), bandH - 1);
     }
     ctx.globalAlpha = 1;
   });
@@ -131,8 +128,8 @@ export function drawTimelineChart() {
   if (state.viewMode === "timeline" && state.timeline.length > 0) {
     ctx.fillStyle = "#333";
     ctx.globalAlpha = 0.8;
-    const x = Math.round(pad + (state.currentFrameIdx / Math.max(state.timeline.length - 1, 1)) * iW);
-    ctx.fillRect(x, pad, 2, iH);
+    const x = Math.round((state.currentFrameIdx / Math.max(state.timeline.length - 1, 1)) * w);
+    ctx.fillRect(x, 0, 2, h);
     ctx.globalAlpha = 1;
   }
 }

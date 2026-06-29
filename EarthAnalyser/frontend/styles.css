@@ -164,7 +164,41 @@ button[type="submit"]:hover {
 #resolution-slider {
   width: 100%;
   margin: 4px 0 2px;
-  accent-color: var(--accent);
+  padding: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+#resolution-slider::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 4px;
+  background: var(--panel-border);
+  border-radius: 2px;
+}
+
+#resolution-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: -6px;
+}
+
+#resolution-slider::-moz-range-track {
+  width: 100%;
+  height: 4px;
+  background: var(--panel-border);
+  border-radius: 2px;
+}
+
+#resolution-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
 }
 
 .resolution-hint {
@@ -472,14 +506,50 @@ button[type="submit"]:hover {
   margin: 4px 0;
   accent-color: var(--accent);
   height: 6px;
+  padding: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+
+#timeline-slider::-webkit-slider-runnable-track {
+  width: 100%;
+  height: 4px;
+  background: var(--panel-border);
+  border-radius: 2px;
+}
+
+#timeline-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: -6px;
+}
+
+#timeline-slider::-moz-range-track {
+  width: 100%;
+  height: 4px;
+  background: var(--panel-border);
+  border-radius: 2px;
+}
+
+#timeline-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
 }
 
 #timeline-chart {
   width: 100%;
   height: 40px;
-  border-radius: 8px;
+  border-radius: 0;
   background: rgba(22, 64, 96, 0.04);
   border: 1px solid rgba(22, 64, 96, 0.08);
+  display: block;
 }
 
 /* ─── Right Panel: Chat ─── */
