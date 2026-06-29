@@ -1320,6 +1320,15 @@ async def _geocode_nominatim(query: str) -> dict[str, Any] | None:
     if raw_bbox and len(raw_bbox) == 4:
         s, n, w, e = [float(v) for v in raw_bbox]
         bbox = [w, s, e, n]
+        # If bbox is excessively wide due to remote territories/islands,
+        # shrink it to a reasonable area around the centroid
+        lon_span = e - w
+        lat_span = n - s
+        max_reasonable_span = 12.0  # ~1200 km — enough for most countries' mainland
+        if lon_span > max_reasonable_span or lat_span > max_reasonable_span:
+            half_lon = min(lon_span, max_reasonable_span) / 2
+            half_lat = min(lat_span, max_reasonable_span) / 2
+            bbox = [lon - half_lon, lat - half_lat, lon + half_lon, lat + half_lat]
     else:
         bbox = [lon - 0.3, lat - 0.3, lon + 0.3, lat + 0.3]
 

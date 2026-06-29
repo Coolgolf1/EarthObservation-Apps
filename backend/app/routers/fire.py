@@ -760,7 +760,14 @@ def _raster_to_h3_cells(href: str, bbox: list[float], h3_res: int) -> list[dict[
                     hex_data[cell]["low"] += 1
                 hex_data[cell]["max_confidence"] = max(hex_data[cell]["max_confidence"], val)
 
-            return list(hex_data.values())
+            # Filter out hexagons whose center falls outside the query bbox
+            west, south, east, north = bbox
+            result = []
+            for cell_data in hex_data.values():
+                center = h3.cell_to_latlng(cell_data["h3"])
+                if south <= center[0] <= north and west <= center[1] <= east:
+                    result.append(cell_data)
+            return result
 
     except Exception as exc:
         print(f"H3 raster read error: {exc}")
