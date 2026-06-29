@@ -1,7 +1,6 @@
 """
 Multi-dataset H3 endpoint — supports fire, flood, vegetation, weather, land use.
 Reads rasters from Planetary Computer STAC, converts pixels to H3 hexagons.
-Weather uses ERA5 Zarr; vegetation uses ImageCubes API when available.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-from ..core.era5 import era5_to_h3
 from ..core.config import DATASET_CONFIG
 
 # ─── Memory Safety Constants ─────────────────────────────────
