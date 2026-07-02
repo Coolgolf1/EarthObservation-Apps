@@ -78,7 +78,7 @@ export function getCheckedDatasets() {
   for (const cb of $$("#dataset-grid input[type='checkbox']")) {
     if (cb.checked) checked.push(cb.value);
   }
-  return checked.length ? checked : ["fire"];
+  return checked;
 }
 
 export function makeFetchKey(bbox, res, dateRange, datasets) {
@@ -94,6 +94,31 @@ export function makeDatasetCacheKey(bbox, res, dateRange, dsName) {
 export function getEffectiveResolution(bbox, map) {
   if (state.userResolutionOverride > 0) return Math.min(state.userResolutionOverride, 7);
   return Math.min(bboxToH3Res(bbox || activeBbox(map)), 7);
+}
+
+/**
+ * If the area is large but resolution is manually set to 6+, reset to auto
+ * and show a warning popup. Returns true if resolution was downgraded.
+ */
+export function guardResolutionForArea(bbox) {
+  if (state.userResolutionOverride < 6) return false;
+  const autoRes = bboxToH3Res(bbox);
+  if (autoRes <= 4) {
+    // Area is big (auto would be res 4 or less) but user set 6/7 — too many hexagons
+    state.userResolutionOverride = 0;
+    state.currentH3Res = autoRes;
+    if (resolutionSlider) resolutionSlider.value = "0";
+    updateResolutionLabel();
+    // Show popup
+    const msg = document.createElement("div");
+    msg.className = "resolution-warning";
+    msg.textContent = "Resolution reset to Auto — high detail on large areas causes memory issues.";
+    msg.style.cssText = "position:fixed;top:1rem;left:50%;transform:translateX(-50%);background:#1a1a2e;color:#f0ad4e;padding:0.75rem 1.5rem;border-radius:8px;z-index:9999;font-size:0.85rem;box-shadow:0 4px 12px rgba(0,0,0,0.4);border:1px solid #f0ad4e;";
+    document.body.appendChild(msg);
+    setTimeout(() => msg.remove(), 4000);
+    return true;
+  }
+  return false;
 }
 
 export function updateResolutionLabel() {
@@ -179,10 +204,11 @@ export function extractPlaceName(question) {
     return null;
   }
 
-  const inMatch = q.match(/\b(?:in|at|near|around|over|of)\s+(.+?)(?:\s+(?:last|next|past|from|between|for|during)\b|[?!.]|$)/i);
+  const inMatch = q.match(/\b(?:in|at|near|around|over|of)\s+(.+?)(?:\s+(?:last|next|past|from|between|for|during|in|at|on|since|over)\b|[?!.]|$)/i);
   if (inMatch && inMatch[1].trim().length >= 2) {
     const place = inMatch[1].trim()
       .replace(/\b(fire|flood|vegetation|weather|temperature|heat|data|activity|risk)\b/gi, "")
+      .replace(/\b(in|at|on|the|a|an|for|to|of)\s*$/gi, "")
       .replace(/\s+/g, " ").trim();
     if (place.length >= 2) return place;
   }

@@ -79,9 +79,17 @@ export function renderDatasetHexagons(dataset, hexagons) {
   layer.clearLayers();
   if (!hexagons || !hexagons.length) return;
 
-  const filtered = state.activePolygon
-    ? hexagons.filter((h) => h.center && pointInPolygon(h.center[0], h.center[1], state.activePolygon))
-    : hexagons;
+  // Only filter by polygon if it's large enough (countries/regions).
+  // Small polygons (cities, parks, landmarks) would incorrectly clip hexagons
+  // whose centers fall just outside the tight boundary.
+  let filtered = hexagons;
+  if (state.activePolygon) {
+    const bbox = state.resolvedBbox;
+    const bboxArea = bbox ? (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) : 0;
+    if (bboxArea > 4) {  // Only clip for areas > ~2° x 2° (large regions/countries)
+      filtered = hexagons.filter((h) => h.center && pointInPolygon(h.center[0], h.center[1], state.activePolygon));
+    }
+  }
   if (!filtered.length) return;
 
   const maxCount = Math.max(...filtered.map((h) => h.pixel_count));

@@ -66,6 +66,17 @@ export function drawTimelineChart() {
     return;
   }
 
+  if (allDatasetsStatic()) {
+    ctx.fillStyle = "#3a4a5c";
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = "#8fa4b8";
+    ctx.font = "500 12px Manrope";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Static — no temporal animation", w / 2, h / 2);
+    return;
+  }
+
   const checked = getCheckedDatasets();
   const barW = Math.max(1, w / state.timeline.length);
   const bandH = Math.max(3, Math.floor(h / Math.max(checked.length, 1)));
@@ -137,16 +148,28 @@ export function drawTimelineChart() {
 export function updateTimelineUI() {
   const totalDays = state.timeline.length;
   if (!totalDays) {
-    if (timelineSlider) { timelineSlider.max = "0"; timelineSlider.value = "0"; }
+    if (timelineSlider) { timelineSlider.max = "0"; timelineSlider.value = "0"; timelineSlider.disabled = false; }
     if (currentTimeLabel) currentTimeLabel.textContent = "—";
     if (timelineSummary) timelineSummary.textContent = "Select area & dates, then run analysis";
     drawTimelineChart();
     return;
   }
 
+  const isStatic = allDatasetsStatic();
+
   if (timelineSlider) {
     timelineSlider.max = String(Math.max(0, totalDays - 1));
     timelineSlider.value = String(state.currentFrameIdx);
+    timelineSlider.disabled = isStatic;
+  }
+
+  if (isStatic) {
+    const checked = getCheckedDatasets();
+    const totalHexes = checked.reduce((s, ds) => s + ((state.datasetResults[ds]?.hexagons || []).length), 0);
+    if (currentTimeLabel) currentTimeLabel.textContent = "Static dataset";
+    if (timelineSummary) timelineSummary.textContent = `${totalHexes} hexagons · ${checked.join(", ")} · H3 res ${state.currentH3Res}`;
+    drawTimelineChart();
+    return;
   }
 
   const checked = getCheckedDatasets();
@@ -171,9 +194,16 @@ function computeAnimationDelay() {
   return 700; // default: Normal
 }
 
+export function allDatasetsStatic() {
+  const results = Object.values(state.datasetResults).filter(d => d && d.frames && d.frames.length > 0);
+  if (results.length === 0) return true;
+  return results.every(d => d.frames.every(f => f.acq_date === "static"));
+}
+
 export function startPlayback() {
   stopPlayback();
   if (!state.timeline.length) return;
+  if (allDatasetsStatic()) return;
   state.viewMode = "timeline";
   const speed = computeAnimationDelay();
   state.playbackTimer = setInterval(() => {

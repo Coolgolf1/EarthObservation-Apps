@@ -106,7 +106,7 @@ export async function getAIResponse(question, dataReport) {
     _llmChecked = true;
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 2000);
+      const timeout = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(`${API_BASE}/datasets/analyse`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -127,7 +127,7 @@ export async function getAIResponse(question, dataReport) {
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
+    const timeout = setTimeout(() => controller.abort(), 12000);
     const res = await fetch(`${API_BASE}/datasets/analyse`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -143,7 +143,7 @@ export async function getAIResponse(question, dataReport) {
     }
   } catch (e) {
     _llmFailCount++;
-    if (_llmFailCount >= 2) {
+    if (_llmFailCount >= 3) {
       _llmAvailable = false;
       setTimeout(() => { _llmAvailable = true; _llmFailCount = 0; }, 60000);
     }

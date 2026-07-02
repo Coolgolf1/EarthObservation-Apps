@@ -5,7 +5,7 @@ import { state } from "./state.js";
 import {
   $, $$, autoExpand, updateStatus, setFetching, showLoading, hideLoading, setProgress,
   parseDateRange, activeBbox, getCheckedDatasets, makeFetchKey, getEffectiveResolution,
-  updateResolutionLabel,
+  updateResolutionLabel, guardResolutionForArea,
   extractDateRange, extractPlaceName, startDate, endDate, frequency, playSpeed,
   drawToggle, drawClear, layerSatellite, timelinePlay, timelinePause, timelineSlider,
   exportCsv, askHint, chatForm, chatInput, queryForm, resolutionSlider, resolutionValue,
@@ -15,7 +15,7 @@ import {
   clearDrawing, showDrawConfirm, redrawDrawing, confirmDrawing,
 } from "./map.js";
 import { renderAllDatasets, renderDatasetHexagons } from "./rendering.js";
-import { applyFrequencyStep, stopPlayback, startPlayback, updateTimelineUI, drawTimelineChart } from "./timeline.js";
+import { applyFrequencyStep, stopPlayback, startPlayback, updateTimelineUI, drawTimelineChart, allDatasetsStatic } from "./timeline.js";
 import { fetchDatasetsH3Stream, cancelActiveRequest } from "./api.js";
 import { cacheStoreDatasets, cacheLookupDatasets } from "./cache.js";
 import {
@@ -66,6 +66,7 @@ async function refetchForCurrentView() {
   const bbox = activeBbox(map);
   const newRes = getEffectiveResolution(bbox, map);
   const datasets = getCheckedDatasets();
+  if (datasets.length === 0) return;
   const key = makeFetchKey(bbox, newRes, state.queryDateRange, datasets);
   if (key === state.lastFetchKey) return;
 
@@ -164,10 +165,12 @@ async function runQuery() {
   if (!range) { hideLoading(); updateStatus("Invalid date range"); return; }
 
   const datasets = getCheckedDatasets();
+  if (datasets.length === 0) { updateStatus("Select at least one dataset"); return; }
   state.queryDateRange = range;
   state.currentQuery = "";
 
   const bbox = activeBbox(map);
+  guardResolutionForArea(bbox);
   state.currentH3Res = getEffectiveResolution(bbox, map);
 
   const cacheKey = makeFetchKey(bbox, state.currentH3Res, range, datasets);
@@ -281,10 +284,15 @@ function classifyIntent(question) {
   const usesDrawnArea = /\b(drawn|selected|current|this|my)\s+(bbox|area|polygon|region|selection|box|zone)\b/i.test(question)
       || /\b(bbox|drawn area|drawn polygon|selected area)\b/i.test(question);
 
-  const looksLikeGeoQuery = hasEarthKeywords || hasActionKeywords || hasDateRef || usesDrawnArea;
+  // Geographic feature keywords (deserts, lakes, mountains, etc.)
+  const hasGeoFeature = /\b(desert|lake|river|mountain|valley|ocean|sea|island|peninsula|gulf|bay|canyon|plateau|glacier|volcano|basin|coast|cape|reef|jungle|rainforest|savanna|tundra|wetland|marsh|delta|strait|fjord|crater|national\s*park|reserve)\b/i.test(q);
+
+  const looksLikeGeoQuery = hasEarthKeywords || hasActionKeywords || hasDateRef || usesDrawnArea || hasGeoFeature;
 
   // Check for place-like patterns (e.g. "in Portugal", "near Madrid")
-  const hasPlacePattern = /\b(in|at|near|around|over|of)\s+[A-Z]/i.test(question);
+  const hasPlacePattern = /\b(in|at|near|around|over|of)\s+[A-Z]/.test(question)
+      || hasGeoFeature
+      || /[A-Z][a-z]+\s+[A-Z][a-z]+/.test(question);  // Capitalized multi-word names
 
   // Has loaded data and no geo signals → follow-up
   const hasData = Object.values(state.datasetResults).some(d => d?.total_hexagons > 0);
@@ -384,7 +392,7 @@ async function handleAgentQuestion(question) {
     new Promise(r => setTimeout(() => r(null), 8000)),
   ]);
 
-  // Apply date range: prefer LLM result, then client-side extraction, then existing
+  // Apply date range: prefer LLM result, then client-side extraction, then smart default
   if (classifyResult?.date_start && classifyResult?.date_end) {
     state.queryDateRange = { start: classifyResult.date_start, end: classifyResult.date_end };
     if (startDate) startDate.value = classifyResult.date_start;
@@ -393,14 +401,25 @@ async function handleAgentQuestion(question) {
     state.queryDateRange = extractedRange;
     if (startDate) startDate.value = extractedRange.start;
     if (endDate) endDate.value = extractedRange.end;
-  } else if (!state.queryDateRange) {
-    const range = parseDateRange();
-    if (range) state.queryDateRange = range;
+  } else {
+    // Agent infers a default: last 3 months
+    const now = new Date();
+    const end = now.toISOString().slice(0, 10);
+    const startD = new Date(now);
+    startD.setMonth(startD.getMonth() - 3);
+    const start = startD.toISOString().slice(0, 10);
+    state.queryDateRange = { start, end };
+    if (startDate) startDate.value = start;
+    if (endDate) endDate.value = end;
   }
 
-  // Geocode: use extracted place name, or the full question as fallback if it has a place pattern
+  // Geocode: use extracted place name, or the full question as fallback if it looks like a place
   let bbox = null;
-  const geocodeQuery = placeQuery || ((/\b(in|at|near|around)\s+\w/i.test(question)) ? question : null);
+  const hasGeoFeatureWord = /\b(desert|lake|river|mountain|valley|ocean|sea|island|peninsula|gulf|bay|canyon|plateau|glacier|volcano|basin|coast|cape|reef|jungle|rainforest|savanna|tundra|wetland|marsh|delta|strait|fjord|crater|national\s*park|reserve)\b/i.test(question);
+  const geocodeQuery = placeQuery
+      || ((/\b(in|at|near|around)\s+\w/i.test(question)) ? question : null)
+      || (hasGeoFeatureWord ? question : null)
+      || ((/[A-Z][a-z]+\s+[A-Z][a-z]+/.test(question)) ? question : null);
 
   if (usesDrawnArea && state.resolvedBbox) {
     bbox = [...state.resolvedBbox];
@@ -424,10 +443,24 @@ async function handleAgentQuestion(question) {
             const latExpand = (n - s) * 0.25;
             bbox = [w - lngExpand, s - latExpand, e + lngExpand, n + latExpand];
           }
+          // If bbox is too small (< ~0.1° span), expand to a minimum usable size
+          const lngSpan = bbox[2] - bbox[0];
+          const latSpan = bbox[3] - bbox[1];
+          const MIN_SPAN = 0.15;  // ~15km minimum
+          if (lngSpan < MIN_SPAN || latSpan < MIN_SPAN) {
+            const cLng = (bbox[0] + bbox[2]) / 2;
+            const cLat = (bbox[1] + bbox[3]) / 2;
+            const halfSpan = MIN_SPAN / 2;
+            bbox = [cLng - halfSpan, cLat - halfSpan, cLng + halfSpan, cLat + halfSpan];
+          }
           state.resolvedBbox = [...bbox];
           if (geo.polygon) { state.activePolygon = geo.polygon; drawBoundary(geo.polygon); } else { clearBoundary(); }
           map.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [40, 40], animate: true });
           state.currentH3Res = getEffectiveResolution(bbox, map);
+          // For small areas, ensure resolution is at least 6
+          if (lngSpan < 0.5 && latSpan < 0.5 && state.currentH3Res < 6) {
+            state.currentH3Res = 6;
+          }
           updateStatus(`Centered on ${geo.name?.split(",")[0] || placeQuery || geocodeQuery}`);
           await new Promise(r => setTimeout(r, 300));
         }
@@ -448,18 +481,13 @@ async function handleAgentQuestion(question) {
 
   for (const cb of $$("#dataset-grid input[type='checkbox']")) cb.checked = plotCategories.includes(cb.value);
 
-  if (!state.queryDateRange) {
-    removeTyping();
-    await streamText("I need a date range. Set the 'From' and 'To' dates, then ask me again.");
-    state._agentActive = false;
-    return;
-  }
-
+  guardResolutionForArea(bbox);
   const res = state.currentH3Res || getEffectiveResolution(bbox, map);
   state.currentH3Res = res;
   for (const layer of Object.values(datasetLayers)) layer.clearLayers();
   state.datasetResults = {};
   state.timeline = [];
+  state.currentFrameIdx = 0;
 
   cancelActiveRequest();
   state.activeAbortController = new AbortController();
@@ -541,9 +569,14 @@ async function handleAgentQuestion(question) {
 
   removeTyping();
   state._agentActive = false;
-  const agentReport = generateInsight(question, state._cachedPlaceName);
-  const response = await getAIResponse(question, agentReport);
-  await streamText(response);
+  try {
+    const agentReport = generateInsight(question, state._cachedPlaceName);
+    const response = await getAIResponse(question, agentReport);
+    await streamText(response);
+  } catch (e) {
+    const fallback = `Found ${totalFound} hexagons for ${plotCategories.join(", ")}. Ask me follow-up questions about this data.`;
+    await streamText(fallback);
+  }
   updatePlaceNameCache(map, activeBbox);
 }
 
@@ -599,8 +632,37 @@ if (drawClear) drawClear.addEventListener("click", () => {
   if (drawToggle) { drawToggle.classList.remove("active"); drawToggle.textContent = "Draw polygon"; }
 });
 
+// Clear map
+const clearMapBtn = $("#clear-map");
+if (clearMapBtn) clearMapBtn.addEventListener("click", () => {
+  stopPlayback();
+  cancelActiveRequest();
+  for (const layer of Object.values(datasetLayers)) layer.clearLayers();
+  clearDrawing();
+  clearBoundary();
+  state.drawMode = false;
+  state.drawPoints = [];
+  state.resolvedBbox = null;
+  state.activePolygon = null;
+  state.datasetResults = {};
+  state.timeline = [];
+  state.fullTimeline = [];
+  state.currentFrameIdx = 0;
+  state.queryDateRange = null;
+  state.lastFetchKey = "";
+  state.lastFetchBbox = null;
+  state.lastFetchRes = null;
+  state.isFetching = false;
+  state.viewMode = "aggregate";
+  state._cachedPlaceName = "";
+  if (drawToggle) { drawToggle.classList.remove("active"); drawToggle.textContent = "Draw polygon"; }
+  updateTimelineUI();
+  updateStatus("Map cleared. Ready for a new search.");
+});
+
 // Timeline
 if (timelineSlider) timelineSlider.addEventListener("input", () => {
+  if (allDatasetsStatic()) return;
   stopPlayback(); state.viewMode = "timeline";
   state.currentFrameIdx = Number(timelineSlider.value) || 0;
   renderAllDatasets(); updateTimelineUI();

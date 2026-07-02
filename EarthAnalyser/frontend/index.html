@@ -41,7 +41,7 @@
           <div class="two-col">
             <div>
               <label for="frequency">Step (days)</label>
-              <input id="frequency" type="number" min="1" max="365" value="8" step="1" />
+              <input id="frequency" type="number" min="1" max="365" value="1" step="1" />
             </div>
             <div>
               <label for="play-speed">Playback</label>
@@ -73,6 +73,7 @@
           </div>
 
           <button type="submit" id="ask-run">Run analysis</button>
+          <button type="button" id="clear-map" class="mode-toggle" style="width:100%;margin-top:0.5rem;">Clear map</button>
         </form>
 
         <div class="stats" id="status-box">Ready. Set area & dates, then ask in the chat panel →</div>

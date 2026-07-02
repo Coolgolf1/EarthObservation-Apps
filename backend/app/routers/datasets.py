@@ -479,7 +479,7 @@ async def query_datasets_h3(payload: DatasetH3Request):
             config = DATASET_CONFIG[dataset_key]
             collection = config["collection"]
             asset_name = config["asset"]
-            is_static = dataset_key in ("landuse",)  # No temporal dimension
+            is_static = dataset_key in ("landuse", "flood")  # No temporal dimension
 
             # Cap resolution to what the source data can support
             ds_h3_res = min(h3_res, config.get("max_h3_res", h3_res))
@@ -703,7 +703,7 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
                 config = DATASET_CONFIG[dataset_key]
                 collection = config["collection"]
                 asset_name = config["asset"]
-                is_static = dataset_key in ("landuse",)
+                is_static = dataset_key in ("landuse", "flood")
                 ds_h3_res = min(h3_res, config.get("max_h3_res", h3_res))
 
                 frames_count = 0
@@ -1312,18 +1312,45 @@ async def _geocode_nominatim(query: str) -> dict[str, Any] | None:
     lat = float(row["lat"])
     lon = float(row["lon"])
     name = row.get("display_name", query)
+    category = row.get("category", "")
+    feat_type = row.get("type", "")
+    osm_type = row.get("osm_type", "")
 
     # Nominatim bbox: [south, north, west, east]
     raw_bbox = row.get("boundingbox")
     if raw_bbox and len(raw_bbox) == 4:
         s, n, w, e = [float(v) for v in raw_bbox]
         bbox = [w, s, e, n]
-        # If bbox is excessively wide due to remote territories/islands,
-        # shrink it to a reasonable area around the centroid
         lon_span = e - w
         lat_span = n - s
-        max_reasonable_span = 12.0  # ~1200 km — enough for most countries' mainland
-        if lon_span > max_reasonable_span or lat_span > max_reasonable_span:
+
+        # Detect point-like results for geographic features (node with tiny bbox)
+        is_point_like = lon_span < 0.01 and lat_span < 0.01
+        is_geo_feature = category in ("natural", "water", "waterway", "geological") or feat_type in (
+            "desert", "lake", "river", "mountain", "mountain_range", "volcano",
+            "glacier", "valley", "canyon", "plateau", "island", "peninsula",
+            "bay", "gulf", "sea", "ocean", "reef", "wetland", "marsh", "basin",
+            "cape", "strait", "fjord", "crater", "national_park", "nature_reserve",
+        )
+
+        if is_point_like and is_geo_feature:
+            # Expand based on feature type — larger features get bigger bbox
+            _FEATURE_EXPANSION = {
+                "desert": 8.0, "ocean": 10.0, "sea": 6.0,
+                "mountain_range": 4.0, "plateau": 4.0, "basin": 4.0,
+                "lake": 2.0, "river": 3.0, "glacier": 2.0,
+                "island": 2.0, "peninsula": 3.0, "gulf": 4.0, "bay": 2.0,
+                "valley": 2.0, "canyon": 1.5, "volcano": 0.5, "mountain": 0.5,
+                "wetland": 2.0, "marsh": 1.5, "reef": 2.0,
+                "cape": 1.0, "strait": 2.0, "fjord": 1.0, "crater": 0.5,
+                "national_park": 1.5, "nature_reserve": 1.5,
+            }
+            expansion = _FEATURE_EXPANSION.get(feat_type, 3.0)
+            bbox = [lon - expansion, lat - expansion * 0.7, lon + expansion, lat + expansion * 0.7]
+        elif lon_span > 12.0 or lat_span > 12.0:
+            # If bbox is excessively wide due to remote territories/islands,
+            # shrink it to a reasonable area around the centroid
+            max_reasonable_span = 12.0
             half_lon = min(lon_span, max_reasonable_span) / 2
             half_lat = min(lat_span, max_reasonable_span) / 2
             bbox = [lon - half_lon, lat - half_lat, lon + half_lon, lat + half_lat]
