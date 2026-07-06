@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -29,6 +30,8 @@ class GeometryDict(TypedDict):
 
 PropertyValue = str | int | float | bool | None
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/features", tags=["features"])
 
@@ -726,7 +729,8 @@ def _geocode_place(place_query: str, country_hint: str | None = None) -> dict[st
         with urlopen(req, timeout=8) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Geocoding provider failed: {exc}") from exc
+        logger.exception("Geocoding provider request failed")
+        raise HTTPException(status_code=502, detail="Geocoding provider unavailable") from exc
 
     if not isinstance(payload, list) or not payload:
         return None

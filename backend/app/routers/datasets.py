@@ -643,7 +643,8 @@ async def query_datasets_h3(payload: DatasetH3Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Dataset query failed: {exc}") from exc
+        logger.exception("Dataset query failed")
+        raise HTTPException(status_code=502, detail="Dataset query failed") from exc
 
 
 # ─── Streaming Endpoint (NDJSON — one line per dataset) ───────
@@ -915,8 +916,9 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
 
         except asyncio.CancelledError:
             yield json.dumps({"type": "done"}) + "\n"
-        except Exception as exc:
-            yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
+        except Exception:
+            logger.exception("Streaming dataset query failed")
+            yield json.dumps({"type": "error", "detail": "Dataset query failed"}) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
