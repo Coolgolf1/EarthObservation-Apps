@@ -1277,15 +1277,8 @@ def _iter_feature_rows_concurrently(
                 worker.join(timeout=0.5)
 
 
-@router.get("", response_model=list[Feature])
-async def get_features(
-    bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
-    category: str = Query(default="places"),
-    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
-    zoom: int | None = Query(default=None, ge=0, le=22),
-):
-    bbox_obj = _parse_bbox_param(bbox)
-
+def _query_features(bbox_obj: BBox, category: str, limit: int, zoom: int | None) -> list[Feature]:
+    """Blocking single-category feature query (run off the event loop)."""
     params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit, zoom=zoom)
 
     with get_db_connection() as conn:
@@ -1300,6 +1293,17 @@ async def get_features(
             features.append(feature)
 
     return features
+
+
+@router.get("", response_model=list[Feature])
+async def get_features(
+    bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
+    category: str = Query(default="places"),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    zoom: int | None = Query(default=None, ge=0, le=22),
+):
+    bbox_obj = _parse_bbox_param(bbox)
+    return await asyncio.to_thread(_query_features, bbox_obj, category, limit, zoom)
 
 
 @router.post("/admin/clear-streams")
@@ -1323,7 +1327,7 @@ async def search_mode_features(
     country_hint: str | None = Query(default=None),
 ):
     normalized_vehicle = _normalize_vehicle(vehicle)
-    geocoded = _geocode_place(place_query=place_query, country_hint=country_hint)
+    geocoded = await asyncio.to_thread(_geocode_place, place_query, country_hint)
     if geocoded is None:
         raise HTTPException(status_code=404, detail="Place not found")
 
@@ -1345,7 +1349,8 @@ async def search_mode_features(
 
     features: list[Feature] = []
     if not metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
@@ -1547,7 +1552,7 @@ async def agentic_search(payload: AgenticSearchRequest):
     search_id = _sanitize_token(payload.search_id)
     _register_active_search(client_id, search_id)
 
-    parsed_intent, parser_mode = _resolve_agentic_plan(payload)
+    parsed_intent, parser_mode = await asyncio.to_thread(_resolve_agentic_plan, payload)
 
     place_query_raw = str(parsed_intent.get("place_query") or payload.prompt).strip()
     if len(place_query_raw) < 2:
@@ -1601,7 +1606,9 @@ async def agentic_search(payload: AgenticSearchRequest):
     else:
         mode = "time"
 
-    geocoded = _geocode_place(place_query=place_query_raw, country_hint=payload.country_hint)
+    geocoded = await asyncio.to_thread(
+        _geocode_place, place_query_raw, payload.country_hint
+    )
     if geocoded is None:
         raise HTTPException(status_code=404, detail="Place not found")
 
@@ -1636,7 +1643,8 @@ async def agentic_search(payload: AgenticSearchRequest):
     )
     features: list[Feature] = []
     if not payload.metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
@@ -1730,7 +1738,8 @@ async def point_search(payload: PointSearchRequest):
     )
     features: list[Feature] = []
     if not payload.metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
@@ -1810,7 +1819,8 @@ async def bbox_search(payload: BBoxSearchRequest):
     )
     features: list[Feature] = []
     if not payload.metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
