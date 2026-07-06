@@ -6,7 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Semaphore, Thread, current_thread
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from collections.abc import Iterator
@@ -66,13 +66,15 @@ _ACTIVE_SEARCH_BY_CLIENT: dict[str, tuple[str, Event]] = {}
 LLM_API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
 OPENROUTER_API_URL_DEFAULT = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-235b-a22b:free")
+# Providers the backend is allowed to send its server-side key to. Prevents a
+# misconfigured LLM_API_URL from relaying credentials to an arbitrary host.
+_ALLOWED_LLM_HOSTS = frozenset({"api.openai.com", "openrouter.ai"})
 
 
 class AgenticSearchRequest(BaseModel):
     prompt: str = Field(min_length=2)
     client_id: str | None = None
     search_id: str | None = None
-    llm_api_key: str | None = Field(default=None)
     llm_model: str = Field(default=LLM_MODEL_DEFAULT)
     vehicle: str = Field(default="driving")
     area_mode: str = Field(default="time")
@@ -855,14 +857,15 @@ def _extract_first_json_object(raw_text: str) -> dict[str, object] | None:
 
 def _parse_agent_prompt_with_llm(
     prompt: str,
-    llm_api_key: str | None,
     llm_model: str,
     selected_vehicle: str,
     selected_minutes: int,
 ) -> dict[str, object]:
-    api_key = (llm_api_key or os.getenv("LLM_API_KEY", "")).strip()
+    # Only ever use the server-side key. Never accept a key from the client:
+    # it would let a caller relay their own bearer token through our backend.
+    api_key = os.getenv("LLM_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("Missing LLM API key. Set LLM_API_KEY in backend .env or provide llm_api_key.")
+        raise ValueError("Missing LLM API key. Set LLM_API_KEY in backend .env.")
 
     env_api_url = (os.getenv("LLM_API_URL", "") or "").strip()
     if env_api_url:
@@ -871,6 +874,11 @@ def _parse_agent_prompt_with_llm(
         api_url = OPENROUTER_API_URL_DEFAULT
     else:
         api_url = LLM_API_URL_DEFAULT
+
+    # Pin the outbound host to a known allowlist (defends against a bad LLM_API_URL).
+    host = (urlparse(api_url).hostname or "").lower()
+    if host not in _ALLOWED_LLM_HOSTS:
+        raise ValueError(f"LLM provider host not allowed: {host or api_url!r}")
 
     referer = (os.getenv("OPENROUTER_HTTP_REFERER", "") or "").strip()
     app_title = (os.getenv("OPENROUTER_APP_TITLE", "EarthSearch") or "EarthSearch").strip()
@@ -1034,7 +1042,6 @@ def _resolve_agentic_plan(req: AgenticSearchRequest) -> tuple[dict[str, object],
     try:
         parsed = _parse_agent_prompt_with_llm(
             prompt=req.prompt,
-            llm_api_key=req.llm_api_key,
             llm_model=req.llm_model,
             selected_vehicle=req.vehicle,
             selected_minutes=req.minutes,
