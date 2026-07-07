@@ -56,6 +56,9 @@ outputs/
 *.log
 logs/
 
+# Generated test-run reports (ad-hoc benchmark scripts write these)
+*_TEST_REPORT.md
+
 # OS
 .DS_Store
 Thumbs.db
