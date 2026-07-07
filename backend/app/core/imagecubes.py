@@ -147,20 +147,48 @@ async def imagecubes_ndvi_to_h3(
         xr.open_zarr, artifact_url, consolidated=True, chunks={}
     )
 
-    # ─── Memory guard: check band sizes before loading ───
-    b04_da = ds["B04"]
-    b08_da = ds["B08"]
-    total_bytes = b04_da.nbytes + b08_da.nbytes
-    if total_bytes > MAX_IMAGECUBES_BYTES:
-        raise MemoryError(
-            f"ImageCubes request too large: {total_bytes / 1e9:.2f} GB estimated "
-            f"(limit {MAX_IMAGECUBES_BYTES / 1e9:.1f} GB). "
-            f"Reduce bbox or date range."
-        )
+    try:
+        # ─── Memory guard: check band sizes before loading ───
+        total_bytes = ds["B04"].nbytes + ds["B08"].nbytes
+        if total_bytes > MAX_IMAGECUBES_BYTES:
+            raise MemoryError(
+                f"ImageCubes request too large: {total_bytes / 1e9:.2f} GB estimated "
+                f"(limit {MAX_IMAGECUBES_BYTES / 1e9:.1f} GB). "
+                f"Reduce bbox or date range."
+            )
 
+        # The band .compute() and per-pixel H3 aggregation are CPU/IO-bound and
+        # would block the event loop, so run them off the loop in a worker thread.
+        frames, aggregate_values = await asyncio.to_thread(
+            _compute_ndvi_frames, ds, h3_res, date_start
+        )
+    finally:
+        ds.close()
+
+    return {
+        "dataset": "vegetation",
+        "collection": "sentinel-2-imagecubes",
+        "description": "Sentinel-2 NDVI (ImageCubes Zarr)",
+        "frames": frames,
+        "hexagons": aggregate_values,
+        "total_hexagons": len(aggregate_values),
+        "frames_with_data": len(frames),
+    }
+
+
+def _compute_ndvi_frames(
+    ds: "xr.Dataset",
+    h3_res: int,
+    date_start: date,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Compute NDVI and aggregate pixels into H3 hexagons (CPU-bound, sync).
+
+    Returns ``(frames, aggregate_hexagons)``. Runs in a worker thread so the
+    per-pixel H3 loops never block the async event loop.
+    """
     # Read B04 (Red) and B08 (NIR) bands
-    b04 = b04_da.compute()
-    b08 = b08_da.compute()
+    b04 = ds["B04"].compute()
+    b08 = ds["B08"].compute()
 
     # Compute NDVI = (B08 - B04) / (B08 + B04)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -277,12 +305,4 @@ async def imagecubes_ndvi_to_h3(
         agg.pop("_value_sum", None)
         agg.pop("_value_count", None)
 
-    return {
-        "dataset": "vegetation",
-        "collection": "sentinel-2-imagecubes",
-        "description": "Sentinel-2 NDVI (ImageCubes Zarr)",
-        "frames": frames,
-        "hexagons": list(aggregate_hex.values()),
-        "total_hexagons": len(aggregate_hex),
-        "frames_with_data": len(frames),
-    }
+    return frames, list(aggregate_hex.values())

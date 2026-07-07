@@ -1,12 +1,13 @@
 import asyncio
 import json
+import logging
 import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Semaphore, Thread, current_thread
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 from collections.abc import Iterator
@@ -29,6 +30,8 @@ class GeometryDict(TypedDict):
 
 PropertyValue = str | int | float | bool | None
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/features", tags=["features"])
 
@@ -66,13 +69,15 @@ _ACTIVE_SEARCH_BY_CLIENT: dict[str, tuple[str, Event]] = {}
 LLM_API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
 OPENROUTER_API_URL_DEFAULT = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-235b-a22b:free")
+# Providers the backend is allowed to send its server-side key to. Prevents a
+# misconfigured LLM_API_URL from relaying credentials to an arbitrary host.
+_ALLOWED_LLM_HOSTS = frozenset({"api.openai.com", "openrouter.ai"})
 
 
 class AgenticSearchRequest(BaseModel):
     prompt: str = Field(min_length=2)
     client_id: str | None = None
     search_id: str | None = None
-    llm_api_key: str | None = Field(default=None)
     llm_model: str = Field(default=LLM_MODEL_DEFAULT)
     vehicle: str = Field(default="driving")
     area_mode: str = Field(default="time")
@@ -724,7 +729,8 @@ def _geocode_place(place_query: str, country_hint: str | None = None) -> dict[st
         with urlopen(req, timeout=8) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Geocoding provider failed: {exc}") from exc
+        logger.exception("Geocoding provider request failed")
+        raise HTTPException(status_code=502, detail="Geocoding provider unavailable") from exc
 
     if not isinstance(payload, list) or not payload:
         return None
@@ -855,14 +861,15 @@ def _extract_first_json_object(raw_text: str) -> dict[str, object] | None:
 
 def _parse_agent_prompt_with_llm(
     prompt: str,
-    llm_api_key: str | None,
     llm_model: str,
     selected_vehicle: str,
     selected_minutes: int,
 ) -> dict[str, object]:
-    api_key = (llm_api_key or os.getenv("LLM_API_KEY", "")).strip()
+    # Only ever use the server-side key. Never accept a key from the client:
+    # it would let a caller relay their own bearer token through our backend.
+    api_key = os.getenv("LLM_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("Missing LLM API key. Set LLM_API_KEY in backend .env or provide llm_api_key.")
+        raise ValueError("Missing LLM API key. Set LLM_API_KEY in backend .env.")
 
     env_api_url = (os.getenv("LLM_API_URL", "") or "").strip()
     if env_api_url:
@@ -871,6 +878,11 @@ def _parse_agent_prompt_with_llm(
         api_url = OPENROUTER_API_URL_DEFAULT
     else:
         api_url = LLM_API_URL_DEFAULT
+
+    # Pin the outbound host to a known allowlist (defends against a bad LLM_API_URL).
+    host = (urlparse(api_url).hostname or "").lower()
+    if host not in _ALLOWED_LLM_HOSTS:
+        raise ValueError(f"LLM provider host not allowed: {host or api_url!r}")
 
     referer = (os.getenv("OPENROUTER_HTTP_REFERER", "") or "").strip()
     app_title = (os.getenv("OPENROUTER_APP_TITLE", "EarthSearch") or "EarthSearch").strip()
@@ -1034,7 +1046,6 @@ def _resolve_agentic_plan(req: AgenticSearchRequest) -> tuple[dict[str, object],
     try:
         parsed = _parse_agent_prompt_with_llm(
             prompt=req.prompt,
-            llm_api_key=req.llm_api_key,
             llm_model=req.llm_model,
             selected_vehicle=req.vehicle,
             selected_minutes=req.minutes,
@@ -1270,15 +1281,8 @@ def _iter_feature_rows_concurrently(
                 worker.join(timeout=0.5)
 
 
-@router.get("", response_model=list[Feature])
-async def get_features(
-    bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
-    category: str = Query(default="places"),
-    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
-    zoom: int | None = Query(default=None, ge=0, le=22),
-):
-    bbox_obj = _parse_bbox_param(bbox)
-
+def _query_features(bbox_obj: BBox, category: str, limit: int, zoom: int | None) -> list[Feature]:
+    """Blocking single-category feature query (run off the event loop)."""
     params = _build_query_params(bbox_obj=bbox_obj, category=category, limit=limit, zoom=zoom)
 
     with get_db_connection() as conn:
@@ -1293,6 +1297,17 @@ async def get_features(
             features.append(feature)
 
     return features
+
+
+@router.get("", response_model=list[Feature])
+async def get_features(
+    bbox: str = Query(..., description="min_lon,min_lat,max_lon,max_lat"),
+    category: str = Query(default="places"),
+    limit: int = Query(default=SEARCH_MODE_DEFAULT_LIMIT, ge=1),
+    zoom: int | None = Query(default=None, ge=0, le=22),
+):
+    bbox_obj = _parse_bbox_param(bbox)
+    return await asyncio.to_thread(_query_features, bbox_obj, category, limit, zoom)
 
 
 @router.post("/admin/clear-streams")
@@ -1316,7 +1331,7 @@ async def search_mode_features(
     country_hint: str | None = Query(default=None),
 ):
     normalized_vehicle = _normalize_vehicle(vehicle)
-    geocoded = _geocode_place(place_query=place_query, country_hint=country_hint)
+    geocoded = await asyncio.to_thread(_geocode_place, place_query, country_hint)
     if geocoded is None:
         raise HTTPException(status_code=404, detail="Place not found")
 
@@ -1338,7 +1353,8 @@ async def search_mode_features(
 
     features: list[Feature] = []
     if not metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
@@ -1540,7 +1556,7 @@ async def agentic_search(payload: AgenticSearchRequest):
     search_id = _sanitize_token(payload.search_id)
     _register_active_search(client_id, search_id)
 
-    parsed_intent, parser_mode = _resolve_agentic_plan(payload)
+    parsed_intent, parser_mode = await asyncio.to_thread(_resolve_agentic_plan, payload)
 
     place_query_raw = str(parsed_intent.get("place_query") or payload.prompt).strip()
     if len(place_query_raw) < 2:
@@ -1594,7 +1610,9 @@ async def agentic_search(payload: AgenticSearchRequest):
     else:
         mode = "time"
 
-    geocoded = _geocode_place(place_query=place_query_raw, country_hint=payload.country_hint)
+    geocoded = await asyncio.to_thread(
+        _geocode_place, place_query_raw, payload.country_hint
+    )
     if geocoded is None:
         raise HTTPException(status_code=404, detail="Place not found")
 
@@ -1629,7 +1647,8 @@ async def agentic_search(payload: AgenticSearchRequest):
     )
     features: list[Feature] = []
     if not payload.metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
@@ -1723,7 +1742,8 @@ async def point_search(payload: PointSearchRequest):
     )
     features: list[Feature] = []
     if not payload.metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,
@@ -1803,7 +1823,8 @@ async def bbox_search(payload: BBoxSearchRequest):
     )
     features: list[Feature] = []
     if not payload.metadata_only:
-        features = _fetch_features_for_categories(
+        features = await asyncio.to_thread(
+            _fetch_features_for_categories,
             bbox_obj=bbox_obj,
             categories=requested_categories,
             total_limit=effective_limit,

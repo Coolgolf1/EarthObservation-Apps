@@ -543,7 +543,7 @@ def raster_to_h3(
 
                 if len(positions) > MAX_H3_INPUT_PIXELS:
                     rng = np.random.default_rng(42)
-                    idx = rng.choice(len(positions), pixel_cap, replace=False)
+                    idx = rng.choice(len(positions), MAX_H3_INPUT_PIXELS, replace=False)
                     idx.sort()
                     positions = positions[idx]
 

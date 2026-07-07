@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -30,6 +31,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from ..core.config import DATASET_CONFIG
+
+logger = logging.getLogger(__name__)
 
 # ─── Memory Safety Constants ─────────────────────────────────
 # Machine has ~7.5 GB total RAM (~5 GB usable). Budget conservatively.
@@ -640,7 +643,8 @@ async def query_datasets_h3(payload: DatasetH3Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Dataset query failed: {exc}") from exc
+        logger.exception("Dataset query failed")
+        raise HTTPException(status_code=502, detail="Dataset query failed") from exc
 
 
 # ─── Streaming Endpoint (NDJSON — one line per dataset) ───────
@@ -912,8 +916,9 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
 
         except asyncio.CancelledError:
             yield json.dumps({"type": "done"}) + "\n"
-        except Exception as exc:
-            yield json.dumps({"type": "error", "detail": str(exc)}) + "\n"
+        except Exception:
+            logger.exception("Streaming dataset query failed")
+            yield json.dumps({"type": "error", "detail": "Dataset query failed"}) + "\n"
 
     return StreamingResponse(generate(), media_type="application/x-ndjson")
 
@@ -1593,33 +1598,21 @@ async def analyse_with_llm(payload: AnalyseRequest):
         raw = await asyncio.to_thread(_fetch_url_post, req)
         result = json.loads(raw)
     except Exception as exc:
-        # Fallback: return a basic analysis from the data report
-        return {
-            "analysis": _fallback_analysis(payload.question, payload.data_report),
-            "model": "fallback",
-        }
+        logger.exception("LLM analysis provider request failed")
+        raise HTTPException(
+            status_code=502, detail="LLM analysis provider unavailable"
+        ) from exc
 
     choices = result.get("choices", [])
-    if not choices:
-        return {
-            "analysis": _fallback_analysis(payload.question, payload.data_report),
-            "model": "fallback",
-        }
-
-    msg = choices[0].get("message", {})
+    msg = choices[0].get("message", {}) if choices else {}
     content = (msg.get("content") or "").strip()
     # Only return the final content, never the raw chain-of-thought reasoning
     if not content:
-        return {
-            "analysis": _fallback_analysis(payload.question, payload.data_report),
-            "model": "fallback",
-        }
+        logger.warning("LLM analysis returned no usable content")
+        raise HTTPException(
+            status_code=502, detail="LLM analysis returned no content"
+        )
     return {"analysis": content, "model": payload.model}
-
-
-def _fallback_analysis(question: str, data_report: str) -> str:
-    """Generate a simple analysis when LLM is unavailable."""
-    return data_report
 
 
 def _fetch_url_post(req: urlrequest.Request) -> str:

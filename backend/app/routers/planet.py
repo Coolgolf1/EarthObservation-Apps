@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from pydantic import BaseModel, Field
 
 env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
 load_dotenv(env_path)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/planet", tags=["planet"])
 
@@ -115,7 +118,8 @@ def _post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Planet API request failed: {exc}") from exc
+        logger.exception("Planet API request failed")
+        raise HTTPException(status_code=502, detail="Planet API request failed") from exc
 
 
 @router.get("/health")
