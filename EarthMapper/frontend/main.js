@@ -1,7 +1,12 @@
-const API_BASE = "http://127.0.0.1:8080";
+const API_BASE = (() => {
+  const isLocal =
+    (location.hostname === "127.0.0.1" || location.hostname === "localhost") &&
+    location.port !== "8000";
+  return location.protocol === "file:" || isLocal ? "http://127.0.0.1:8000" : location.origin;
+})();
 let MAPBOX_TOKEN = "";
 try {
-  const cfgRes = await fetch("http://127.0.0.1:8000/health/config");
+  const cfgRes = await fetch(`${API_BASE}/health/config`);
   if (cfgRes.ok) { const cfg = await cfgRes.json(); MAPBOX_TOKEN = cfg.mapbox_token || ""; }
 } catch (e) { console.warn("Could not fetch config:", e); }
 
