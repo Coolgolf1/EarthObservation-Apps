@@ -1,7 +1,7 @@
 [project]
 name = "earthsearch"
 version = "0.1.0"
-description = "Add your description here"
+description = "Geospatial vector search with isochrone and agentic search (service + frontend)."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
     "pandas>=3.0.3",
     "psycopg>=3.3.4",
     "psycopg-binary>=3.3.4",
-    "psycopg2-binary>=2.9.12",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.1",
     "requests>=2.34.2",

@@ -1,7 +1,7 @@
 [project]
 name = "earthmapper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Viewport vector-feature browser (GADM/Natural Earth) with a Leaflet frontend."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
