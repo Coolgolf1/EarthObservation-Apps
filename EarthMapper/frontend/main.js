@@ -4,9 +4,16 @@ const API_BASE = (() => {
     location.port !== "8000";
   return location.protocol === "file:" || isLocal ? "http://127.0.0.1:8000" : location.origin;
 })();
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
 let MAPBOX_TOKEN = "";
 try {
-  const cfgRes = await fetch(`${API_BASE}/health/config`);
+  // Bounded so a hung backend doesn't block module load (blank page) forever.
+  const cfgRes = await fetch(`${API_BASE}/health/config`, { signal: AbortSignal.timeout(5000) });
   if (cfgRes.ok) { const cfg = await cfgRes.json(); MAPBOX_TOKEN = cfg.mapbox_token || ""; }
 } catch (e) { console.warn("Could not fetch config:", e); }
 
@@ -220,10 +227,10 @@ const geoJsonLayer = L.geoJSON([], {
       );
       const details = [...preferred, ...fallback]
         .slice(0, 10)
-        .map(([k, v]) => `<strong>${k}</strong>: ${String(v)}`)
+        .map(([k, v]) => `<strong>${escapeHtml(k)}</strong>: ${escapeHtml(String(v))}`)
         .join("<br>");
       featureLayer.bindPopup(
-        `<div><h4>${title}</h4><div>${details}</div></div>`,
+        `<div><h4>${escapeHtml(title)}</h4><div>${details}</div></div>`,
       );
     });
   },

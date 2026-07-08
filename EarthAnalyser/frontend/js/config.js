@@ -10,7 +10,8 @@ export const API_BASE = (() => {
 // Fetched from backend at startup
 export let MAPBOX_TOKEN = "";
 try {
-  const res = await fetch(`${API_BASE}/health/config`);
+  // Bounded so a hung backend doesn't block module load (blank page) forever.
+  const res = await fetch(`${API_BASE}/health/config`, { signal: AbortSignal.timeout(5000) });
   if (res.ok) { const cfg = await res.json(); MAPBOX_TOKEN = cfg.mapbox_token || ""; }
 } catch (e) { console.warn("Could not fetch mapbox token:", e); }
 

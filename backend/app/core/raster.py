@@ -62,6 +62,136 @@ def fire_metadata_from_href(href: str) -> dict[str, Any] | None:
         return None
 
 
+def _read_h3_source(
+    ds: rasterio.DatasetReader,
+    window: Window,
+    h3_res: int,
+    band: int = 1,
+) -> tuple[np.ndarray, "rasterio.Affine"]:
+    """Read ``band`` over the full window, downsampling via ``out_shape``.
+
+    Downsampling respects both the H3 cell size (skip reading finer than the
+    target hexagon) and the ``MAX_WINDOW_PIXELS`` memory cap, while preserving
+    full geographic coverage (the window is never shrunk). Returns the masked
+    array as float32 with NaN for nodata, plus the matching affine transform.
+    """
+    out_h, out_w = int(window.height), int(window.width)
+
+    shape = target_read_shape(window, ds, h3_res)
+    if shape:
+        out_h, out_w = shape
+
+    total = out_h * out_w
+    if total > MAX_WINDOW_PIXELS:
+        scale = math.sqrt(MAX_WINDOW_PIXELS / total)
+        out_h = max(1, int(out_h * scale))
+        out_w = max(1, int(out_w * scale))
+
+    if out_h < window.height or out_w < window.width:
+        band_arr = ds.read(
+            band, window=window, out_shape=(out_h, out_w),
+            masked=True, resampling=rasterio.enums.Resampling.nearest,
+        ).astype("float32")
+        win_transform = rasterio.windows.transform(window, ds.transform)
+        win_transform = rasterio.Affine(
+            win_transform.a * (window.width / out_w),
+            win_transform.b, win_transform.c,
+            win_transform.d,
+            win_transform.e * (window.height / out_h),
+            win_transform.f,
+        )
+    else:
+        band_arr = ds.read(band, window=window, masked=True).astype("float32")
+        win_transform = rasterio.windows.transform(window, ds.transform)
+
+    arr = np.where(band_arr.mask, np.nan, band_arr.data)
+    return arr, win_transform
+
+
+def _aggregate_pixels_to_h3(
+    arr: np.ndarray,
+    win_transform: "rasterio.Affine",
+    ds: rasterio.DatasetReader,
+    bbox: list[float],
+    h3_res: int,
+    filter_fn,
+    classify_fn,
+) -> list[dict[str, Any]]:
+    """Filter pixels, project to WGS84, and aggregate into H3 hexagons.
+
+    Shared by ``raster_to_h3`` and ``raster_to_h3_band``.
+    """
+    valid_mask = ~np.isnan(arr)
+    data_mask = np.zeros_like(arr, dtype=bool)
+    data_mask[valid_mask] = filter_fn(arr[valid_mask])
+
+    positions = np.argwhere(data_mask)
+    if positions.size == 0:
+        return []
+
+    if len(positions) > MAX_H3_INPUT_PIXELS:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(positions), MAX_H3_INPUT_PIXELS, replace=False)
+        idx.sort()
+        positions = positions[idx]
+
+    rows, cols = positions[:, 0], positions[:, 1]
+    xs = cols * win_transform.a + rows * win_transform.b + win_transform.c
+    ys = cols * win_transform.d + rows * win_transform.e + win_transform.f
+
+    if str(ds.crs).upper() not in ("EPSG:4326", "WGS84", "OGC:CRS84"):
+        from rasterio.warp import transform as warp_transform
+        xs_list, ys_list = warp_transform(ds.crs, "EPSG:4326", xs.tolist(), ys.tolist())
+        xs, ys = np.array(xs_list), np.array(ys_list)
+
+    values = arr[rows, cols]
+    valid = (ys >= -90) & (ys <= 90) & (xs >= -180) & (xs <= 180) & ~np.isnan(values)
+    xs, ys, values = xs[valid], ys[valid], values[valid]
+    if len(values) == 0:
+        return []
+
+    cells = [h3.latlng_to_cell(float(ys[i]), float(xs[i]), h3_res) for i in range(len(values))]
+
+    hex_data: dict[str, dict[str, Any]] = {}
+    for i, cell in enumerate(cells):
+        val = float(values[i])
+        cls = classify_fn(val)
+        if cell not in hex_data:
+            hex_data[cell] = {
+                "h3": cell, "pixel_count": 0,
+                "value_sum": 0.0, "value_max": -1e9, "value_min": 1e9,
+                "classes": defaultdict(int),
+            }
+        hd = hex_data[cell]
+        hd["pixel_count"] += 1
+        hd["value_sum"] += val
+        hd["value_max"] = max(hd["value_max"], val)
+        hd["value_min"] = min(hd["value_min"], val)
+        hd["classes"][cls] += 1
+
+    west, south, east, north = bbox
+    result = []
+    for cell_id, data in hex_data.items():
+        n = data["pixel_count"]
+        boundary = h3.cell_to_boundary(cell_id)
+        center = h3.cell_to_latlng(cell_id)
+        # Skip hexagons whose center falls outside the query bbox
+        if not (south <= center[0] <= north and west <= center[1] <= east):
+            continue
+        classes = dict(data["classes"])
+        dominant = max(classes, key=classes.get) if classes else "unknown"
+        result.append({
+            "h3": cell_id, "pixel_count": n,
+            "value_mean": round(data["value_sum"] / max(n, 1), 2),
+            "value_max": round(data["value_max"], 2),
+            "value_min": round(data["value_min"], 2),
+            "dominant_class": dominant, "classes": classes,
+            "boundary": [[lat, lng] for lat, lng in boundary],
+            "center": [center[0], center[1]],
+        })
+    return result
+
+
 def raster_to_h3_band(
     href: str,
     bbox: list[float],
@@ -74,89 +204,17 @@ def raster_to_h3_band(
     Used for fire tiles where metadata tells us exactly which band has fire.
     """
     config = DATASET_CONFIG[dataset_key]
-    filter_fn = config["filter"]
-    classify_fn = config["classify"]
-
     try:
         with rasterio.Env(**GDAL_ENV):
             with rasterio.open(href) as ds:
                 window = window_for_bbox(ds, bbox)
                 if window is None:
                     return []
-
-                arr_raw = ds.read(band, window=window, masked=True).astype("float32")
-                win_transform = rasterio.windows.transform(window, ds.transform)
-                arr = np.where(arr_raw.mask, np.nan, arr_raw.data)
-
-                valid_mask = ~np.isnan(arr)
-                data_mask = np.zeros_like(arr, dtype=bool)
-                data_mask[valid_mask] = filter_fn(arr[valid_mask])
-
-                positions = np.argwhere(data_mask)
-                if positions.size == 0:
-                    return []
-
-                if len(positions) > MAX_H3_INPUT_PIXELS:
-                    rng = np.random.default_rng(42)
-                    idx = rng.choice(len(positions), MAX_H3_INPUT_PIXELS, replace=False)
-                    idx.sort()
-                    positions = positions[idx]
-
-                rows, cols = positions[:, 0], positions[:, 1]
-                xs = cols * win_transform.a + rows * win_transform.b + win_transform.c
-                ys = cols * win_transform.d + rows * win_transform.e + win_transform.f
-
-                if str(ds.crs).upper() not in ("EPSG:4326", "WGS84", "OGC:CRS84"):
-                    from rasterio.warp import transform as warp_transform
-                    xs_list, ys_list = warp_transform(ds.crs, "EPSG:4326", xs.tolist(), ys.tolist())
-                    xs, ys = np.array(xs_list), np.array(ys_list)
-
-                values = arr[rows, cols]
-                valid = (ys >= -90) & (ys <= 90) & (xs >= -180) & (xs <= 180) & ~np.isnan(values)
-                xs, ys, values = xs[valid], ys[valid], values[valid]
-                if len(values) == 0:
-                    return []
-
-                cells = [h3.latlng_to_cell(float(ys[i]), float(xs[i]), h3_res) for i in range(len(values))]
-
-                hex_data: dict[str, dict[str, Any]] = {}
-                for i, cell in enumerate(cells):
-                    val = float(values[i])
-                    cls = classify_fn(val)
-                    if cell not in hex_data:
-                        hex_data[cell] = {
-                            "h3": cell, "pixel_count": 0,
-                            "value_sum": 0.0, "value_max": -1e9, "value_min": 1e9,
-                            "classes": defaultdict(int),
-                        }
-                    hd = hex_data[cell]
-                    hd["pixel_count"] += 1
-                    hd["value_sum"] += val
-                    hd["value_max"] = max(hd["value_max"], val)
-                    hd["value_min"] = min(hd["value_min"], val)
-                    hd["classes"][cls] += 1
-
-                west, south, east, north = bbox
-                result = []
-                for cell_id, data in hex_data.items():
-                    n = data["pixel_count"]
-                    boundary = h3.cell_to_boundary(cell_id)
-                    center = h3.cell_to_latlng(cell_id)
-                    # Skip hexagons whose center falls outside the query bbox
-                    if not (south <= center[0] <= north and west <= center[1] <= east):
-                        continue
-                    classes = dict(data["classes"])
-                    dominant = max(classes, key=classes.get) if classes else "unknown"
-                    result.append({
-                        "h3": cell_id, "pixel_count": n,
-                        "value_mean": round(data["value_sum"] / max(n, 1), 2),
-                        "value_max": round(data["value_max"], 2),
-                        "value_min": round(data["value_min"], 2),
-                        "dominant_class": dominant, "classes": classes,
-                        "boundary": [[lat, lng] for lat, lng in boundary],
-                        "center": [center[0], center[1]],
-                    })
-                return result
+                arr, win_transform = _read_h3_source(ds, window, h3_res, band=band)
+                return _aggregate_pixels_to_h3(
+                    arr, win_transform, ds, bbox, h3_res,
+                    config["filter"], config["classify"],
+                )
     except Exception as exc:
         print(f"raster_to_h3_band error ({dataset_key}, band {band}): {exc}")
         return []
@@ -331,9 +389,14 @@ def metadata_to_h3(
 def window_for_bbox(
     ds: rasterio.DatasetReader,
     bbox_wgs84: list[float],
-    max_pixels: int = MAX_WINDOW_PIXELS,
 ) -> Window | None:
-    """Compute a rasterio Window for a WGS84 bbox, capping pixel count."""
+    """Compute the full rasterio Window covering a WGS84 bbox intersection.
+
+    The window is NOT shrunk to cap pixels — shrinking would change the
+    geographic coverage (reading only the top-left corner). The memory cap is
+    enforced at read time via ``out_shape`` downsampling in ``_read_h3_source``,
+    which keeps full coverage while bounding the array size.
+    """
     west, south, east, north = bbox_wgs84
     minx, miny, maxx, maxy = transform_bounds(
         "EPSG:4326", ds.crs, west, south, east, north, densify_pts=21
@@ -349,15 +412,6 @@ def window_for_bbox(
     bounded = bounded.round_offsets().round_lengths()
     if bounded.width <= 0 or bounded.height <= 0:
         return None
-    total_px = bounded.width * bounded.height
-    if total_px > max_pixels:
-        scale = math.sqrt(max_pixels / total_px)
-        bounded = Window(
-            col_off=bounded.col_off,
-            row_off=bounded.row_off,
-            width=max(1, int(bounded.width * scale)),
-            height=max(1, int(bounded.height * scale)),
-        )
     return bounded
 
 
@@ -501,121 +555,17 @@ def raster_to_h3(
         return metadata_to_h3(href, bbox, h3_res, dataset_key)
 
     config = DATASET_CONFIG[dataset_key]
-    filter_fn = config["filter"]
-    classify_fn = config["classify"]
-
     try:
         with rasterio.Env(**GDAL_ENV):
             with rasterio.open(href) as ds:
                 window = window_for_bbox(ds, bbox)
                 if window is None:
                     return []
-
-                shape = target_read_shape(window, ds, h3_res)
-                if shape:
-                    out_h, out_w = shape
-                    band = ds.read(
-                        1, window=window, out_shape=(out_h, out_w),
-                        masked=True,
-                        resampling=rasterio.enums.Resampling.nearest,
-                    ).astype("float32")
-                    win_transform = rasterio.windows.transform(window, ds.transform)
-                    win_transform = rasterio.Affine(
-                        win_transform.a * (window.width / out_w),
-                        win_transform.b, win_transform.c,
-                        win_transform.d,
-                        win_transform.e * (window.height / out_h),
-                        win_transform.f,
-                    )
-                else:
-                    band = ds.read(1, window=window, masked=True).astype("float32")
-                    win_transform = rasterio.windows.transform(window, ds.transform)
-
-                arr = np.where(band.mask, np.nan, band.data)
-
-                valid_mask = ~np.isnan(arr)
-                data_mask = np.zeros_like(arr, dtype=bool)
-                data_mask[valid_mask] = filter_fn(arr[valid_mask])
-
-                positions = np.argwhere(data_mask)
-                if positions.size == 0:
-                    return []
-
-                if len(positions) > MAX_H3_INPUT_PIXELS:
-                    rng = np.random.default_rng(42)
-                    idx = rng.choice(len(positions), MAX_H3_INPUT_PIXELS, replace=False)
-                    idx.sort()
-                    positions = positions[idx]
-
-                rows, cols = positions[:, 0], positions[:, 1]
-                xs = cols * win_transform.a + rows * win_transform.b + win_transform.c
-                ys = cols * win_transform.d + rows * win_transform.e + win_transform.f
-
-                if str(ds.crs).upper() not in ("EPSG:4326", "WGS84", "OGC:CRS84"):
-                    from rasterio.warp import transform as warp_transform
-                    xs_list, ys_list = warp_transform(
-                        ds.crs, "EPSG:4326", xs.tolist(), ys.tolist()
-                    )
-                    xs, ys = np.array(xs_list), np.array(ys_list)
-
-                values = arr[rows, cols]
-                valid = (
-                    (ys >= -90) & (ys <= 90)
-                    & (xs >= -180) & (xs <= 180)
-                    & ~np.isnan(values)
+                arr, win_transform = _read_h3_source(ds, window, h3_res, band=1)
+                return _aggregate_pixels_to_h3(
+                    arr, win_transform, ds, bbox, h3_res,
+                    config["filter"], config["classify"],
                 )
-                xs, ys, values = xs[valid], ys[valid], values[valid]
-                if len(values) == 0:
-                    return []
-
-                cells = [
-                    h3.latlng_to_cell(float(ys[i]), float(xs[i]), h3_res)
-                    for i in range(len(values))
-                ]
-
-                hex_data: dict[str, dict[str, Any]] = {}
-                for i, cell in enumerate(cells):
-                    val = float(values[i])
-                    cls = classify_fn(val)
-                    if cell not in hex_data:
-                        hex_data[cell] = {
-                            "h3": cell,
-                            "pixel_count": 0,
-                            "value_sum": 0.0,
-                            "value_max": -1e9,
-                            "value_min": 1e9,
-                            "classes": defaultdict(int),
-                        }
-                    hd = hex_data[cell]
-                    hd["pixel_count"] += 1
-                    hd["value_sum"] += val
-                    hd["value_max"] = max(hd["value_max"], val)
-                    hd["value_min"] = min(hd["value_min"], val)
-                    hd["classes"][cls] += 1
-
-                west, south, east, north = bbox
-                result = []
-                for cell_id, data in hex_data.items():
-                    n = data["pixel_count"]
-                    boundary = h3.cell_to_boundary(cell_id)
-                    center = h3.cell_to_latlng(cell_id)
-                    # Skip hexagons whose center falls outside the query bbox
-                    if not (south <= center[0] <= north and west <= center[1] <= east):
-                        continue
-                    classes = dict(data["classes"])
-                    dominant = max(classes, key=classes.get) if classes else "unknown"
-                    result.append({
-                        "h3": cell_id,
-                        "pixel_count": n,
-                        "value_mean": round(data["value_sum"] / max(n, 1), 2),
-                        "value_max": round(data["value_max"], 2),
-                        "value_min": round(data["value_min"], 2),
-                        "dominant_class": dominant,
-                        "classes": classes,
-                        "boundary": [[lat, lng] for lat, lng in boundary],
-                        "center": [center[0], center[1]],
-                    })
-                return result
     except Exception as exc:
         print(f"Raster H3 error ({dataset_key}): {exc}")
         return []
