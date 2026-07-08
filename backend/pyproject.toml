@@ -21,3 +21,14 @@ dependencies = [
     "xarray>=2024.6.0",
     "zarr>=2.18.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
