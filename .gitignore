@@ -31,7 +31,6 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-uv.lock
 
 # IDEs
 .vscode/

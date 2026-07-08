@@ -2,7 +2,7 @@ working_dir: .
 command:
   - sh
   - -lc
-  - uv lock --project backend && uv sync --project backend --frozen && uv run --project backend uvicorn backend.app.main:app --host 0.0.0.0 --port "$DATABRICKS_APP_PORT"
+  - uv sync --project backend --frozen && uv run --project backend uvicorn backend.app.main:app --host 0.0.0.0 --port "$DATABRICKS_APP_PORT"
 env:
   - name: LLM_API_KEY
   - name: LLM_API_URL
