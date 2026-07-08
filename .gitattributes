@@ -1,0 +1,14 @@
+# Normalize line endings: store everything with LF in the repo.
+# Fixes CRLF churn introduced by earlier manual merges on develop.
+* text=auto eol=lf
+
+# Shell scripts must stay LF (run on Linux/Databricks).
+*.sh text eol=lf
+
+# Binary assets — never normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.parquet binary
