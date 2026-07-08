@@ -1,7 +1,7 @@
 [project]
 name = "earthanalyser"
 version = "0.1.0"
-description = "Add your description here"
+description = "Temporal H3 raster analysis with AI-assisted insights and a map frontend."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

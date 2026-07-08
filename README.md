@@ -53,13 +53,16 @@ eps-alvaro-perez/
 
 ### Backend Setup
 
+The project uses [`uv`](https://docs.astral.sh/uv/) for dependency management.
+
 ```bash
 cd backend
-pip install -e ../EarthMapper ../EarthSearch  # Install dependencies from pyproject.toml
-uvicorn app.main:app --reload
+uv sync                              # install dependencies from pyproject.toml
+uv run uvicorn app.main:app --reload
 ```
 
-The backend API will be available at `http://localhost:8000`
+The backend API is available at `http://localhost:8000`. It also serves the
+EarthAnalyser UI at `/` and the EarthSearch UI at `/search`.
 
 ### Services
 
@@ -75,12 +78,26 @@ The backend API will be available at `http://localhost:8000`
 
 ## API Endpoints
 
-### Health Check
+Interactive OpenAPI docs are available at `http://localhost:8000/docs`.
+
+### Health (`/health`)
 - `GET /health/` - Service status
 - `GET /health/db` - Database connection status
+- `GET /health/config` - Public frontend config (Mapbox token)
 
-### Features
-- `GET /features/search` - Search geographic features
+### Features (`/features`)
+- `GET /features` - Query features in a bbox
+- `GET /features/search-mode` - Place + reach-area feature search
+- `POST /features/agent-search` - Natural-language (agentic) search
+- `GET /features/stream` - Streaming (NDJSON) feature results
+
+### Datasets (`/datasets`)
+- `POST /datasets/h3` and `POST /datasets/h3/stream` - H3 raster datasets (fire, flood, vegetation, weather, land use)
+- `POST /datasets/reach-area`, `POST /datasets/geocode`, `POST /datasets/classify` - search helpers
+- `POST /datasets/analyse` - LLM analysis of a data report
+
+### Planet (`/planet`)
+- `GET /planet/health`, `POST /planet/quick-search` - Planet Data API proxy
 
 ## Environment Variables
 
@@ -104,8 +121,8 @@ All services use a shared `.env` file at the repository root:
 ### Backend Development
 ```bash
 cd backend
-pip install -r requirements.txt  # or use pyproject.toml
-python -m uvicorn app.main:app --reload
+uv sync
+uv run uvicorn app.main:app --reload
 ```
 
 ### Data Analysis

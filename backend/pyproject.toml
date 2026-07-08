@@ -1,12 +1,12 @@
 [project]
 name = "backend"
 version = "0.1.0"
-description = "Add your description here"
+description = "FastAPI backend serving geospatial H3/raster and vector-feature APIs."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "adlfs>=2024.7.0",
-    "dotenv>=0.9.9",
+    "python-dotenv>=1.2.2",
     "fastapi>=0.137.0",
     "fsspec>=2024.6.0",
     "h3>=4.5.0",
