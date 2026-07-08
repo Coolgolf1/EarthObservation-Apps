@@ -168,6 +168,14 @@ export function extractDateRange(question) {
     return { start: startD.toISOString().slice(0, 10), end };
   }
 
+  const singleMonth = q.match(/(?:last|past)\s+month\b/i);
+  if (singleMonth) {
+    const end = now.toISOString().slice(0, 10);
+    const startD = new Date(now);
+    startD.setMonth(startD.getMonth() - 1);
+    return { start: startD.toISOString().slice(0, 10), end };
+  }
+
   const yearsAgo = q.match(/(?:last|past)\s+(\d*)\s*years?/i);
   if (yearsAgo) {
     const y = parseInt(yearsAgo[1]) || 1;
