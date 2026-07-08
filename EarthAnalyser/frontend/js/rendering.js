@@ -2,7 +2,7 @@
 
 import { DATASET_COLORS, LANDUSE_COLORS } from "./config.js";
 import { state } from "./state.js";
-import { getCheckedDatasets } from "./utils.js";
+import { getCheckedDatasets, escapeHtml } from "./utils.js";
 import { datasetLayers, pointInPolygon } from "./map.js";
 
 // ─── Tooltip ─────────────────────────────────────────────────
@@ -21,16 +21,16 @@ function hexTooltip(hex, dataset) {
   } else if (dataset === "vegetation") {
     const ndvi = hex.value_mean / 10000;
     lines.push(`NDVI: ${ndvi.toFixed(3)}`);
-    lines.push(`Class: ${hex.dominant_class}`);
+    lines.push(`Class: ${escapeHtml(hex.dominant_class)}`);
   } else if (dataset === "weather") {
     const tempC = (hex.value_mean * 0.02 - 273.15).toFixed(1);
     lines.push(`LST: ${tempC}°C`);
-    lines.push(`Class: ${hex.dominant_class}`);
+    lines.push(`Class: ${escapeHtml(hex.dominant_class)}`);
   } else if (dataset === "landuse") {
-    lines.push(`Class: ${hex.dominant_class}`);
+    lines.push(`Class: ${escapeHtml(hex.dominant_class)}`);
     const c = hex.classes || {};
     const entries = Object.entries(c).sort(([, a], [, b]) => b - a).slice(0, 3);
-    lines.push(entries.map(([k, v]) => `${k}: ${v}`).join(" · "));
+    lines.push(entries.map(([k, v]) => `${escapeHtml(k)}: ${v}`).join(" · "));
   }
   return lines.join("<br>");
 }

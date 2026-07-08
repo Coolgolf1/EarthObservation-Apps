@@ -6,6 +6,13 @@ import { bboxToH3Res } from "./config.js";
 export const $ = (s) => document.querySelector(s);
 export const $$ = (s) => document.querySelectorAll(s);
 
+/** Escape a value for safe interpolation into HTML strings. */
+export function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
 // ─── DOM references ──────────────────────────────────────────
 export const statusBox = $("#status-box");
 export const queryForm = $("#query-form");

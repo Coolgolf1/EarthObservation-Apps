@@ -7,9 +7,16 @@ const API_BASE =
   window.location.protocol === "file:" || isLocalStaticFrontend
     ? "http://127.0.0.1:8000"
     : window.location.origin;
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
 let MAPBOX_TOKEN = "";
 try {
-  const cfgRes = await fetch(`${API_BASE}/health/config`);
+  // Bounded so a hung backend doesn't block module load (blank page) forever.
+  const cfgRes = await fetch(`${API_BASE}/health/config`, { signal: AbortSignal.timeout(5000) });
   if (cfgRes.ok) { const cfg = await cfgRes.json(); MAPBOX_TOKEN = cfg.mapbox_token || ""; }
 } catch (e) { console.warn("Could not fetch config:", e); }
 
@@ -45,10 +52,10 @@ function isLandmarkFeatureAllowed(feature) {
 
 function formatFeatureHoverText(feature) {
   const props = feature?.properties || {};
-  const name = String(props.name || "Unnamed feature");
-  const category = String(props.category || "unknown");
-  const subcategory = String(props.subcategory || "");
-  const source = String(props.source || "");
+  const name = escapeHtml(props.name || "Unnamed feature");
+  const category = escapeHtml(props.category || "unknown");
+  const subcategory = escapeHtml(props.subcategory || "");
+  const source = escapeHtml(props.source || "");
 
   const lines = [name, `Category: ${category}`];
   if (subcategory) {
