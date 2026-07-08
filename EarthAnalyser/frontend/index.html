@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EarthAnalyser</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <!-- LEFT PANEL -->
+      <aside class="panel left-panel">
+        <h1>EarthAnalyser</h1>
+        <p class="subtitle">Ask &rarr; See &rarr; Understand</p>
+
+        <form id="query-form" class="filters" autocomplete="off">
+          <div class="two-col">
+            <div>
+              <label for="start-date">From</label>
+              <input id="start-date" type="date" value="2024-06-01" />
+            </div>
+            <div>
+              <label for="end-date">To</label>
+              <input id="end-date" type="date" value="2024-08-31" />
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div>
+              <label for="frequency">Step (days)</label>
+              <input id="frequency" type="number" min="1" max="365" value="1" step="1" />
+            </div>
+            <div>
+              <label for="play-speed">Playback</label>
+              <select id="play-speed">
+                <option value="1200">Slow</option>
+                <option value="700" selected>Normal</option>
+                <option value="350">Fast</option>
+              </select>
+            </div>
+          </div>
+
+          <label>Area selection</label>
+          <div class="bbox-controls">
+            <button type="button" id="draw-toggle" class="mode-toggle">Draw polygon</button>
+            <button type="button" id="draw-clear" class="mode-toggle">Clear</button>
+          </div>
+
+          <label for="resolution-slider">Resolution level: <span id="resolution-value">Auto</span></label>
+          <input id="resolution-slider" type="range" min="0" max="7" value="0" step="1" />
+          <div class="resolution-hint">0 = Auto (from area size) · Max 7</div>
+
+          <label>Datasets</label>
+          <div class="dataset-grid" id="dataset-grid">
+            <label class="dataset-chip fire"><input type="checkbox" value="fire" checked /><span>🔥 Fire</span></label>
+            <label class="dataset-chip flood"><input type="checkbox" value="flood" /><span>🌊 Flood</span></label>
+            <label class="dataset-chip vegetation"><input type="checkbox" value="vegetation" /><span>🌱 Vegetation</span></label>
+            <label class="dataset-chip weather"><input type="checkbox" value="weather" /><span>🌪️ Weather</span></label>
+            <label class="dataset-chip landuse"><input type="checkbox" value="landuse" /><span>🏙️ Land Use</span></label>
+          </div>
+
+          <button type="submit" id="ask-run">Run analysis</button>
+          <button type="button" id="clear-map" class="mode-toggle" style="width:100%;margin-top:0.5rem;">Clear map</button>
+        </form>
+
+        <div class="stats" id="status-box">Ready. Set area & dates, then ask in the chat panel →</div>
+      </aside>
+
+      <!-- CENTER: Map + Timeline -->
+      <main class="center-panel">
+        <div class="map-wrap">
+          <div id="map"></div>
+
+          <div id="ask-hint" class="ask-hint">Ask something to explore Earth data</div>
+
+          <div id="loading-warning" class="loading-warning hidden">
+            ⚠️ Large area or long time range — this may take a while to load
+          </div>
+
+          <div id="loading-overlay" class="loading-bar-container hidden">
+            <div class="loading-bar-track">
+              <div class="loading-bar-fill" id="progress-bar"></div>
+            </div>
+            <span class="loading-bar-text" id="loading-text">Loading...</span>
+          </div>
+
+          <div id="hover-data" class="hover-tooltip hidden"></div>
+
+          <div id="draw-confirm-bar" class="draw-confirm-bar hidden">
+            <span id="draw-confirm-text">3 points</span>
+            <button type="button" id="draw-confirm-btn">✓ Confirm area</button>
+            <button type="button" id="draw-cancel-btn">✕ Cancel</button>
+          </div>
+
+          <div class="map-controls">
+            <button type="button" id="layer-satellite" class="map-btn active">Satellite</button>
+            <button type="button" id="timeline-play" class="map-btn">▶ Play</button>
+            <button type="button" id="timeline-pause" class="map-btn">⏸ Pause</button>
+            <button type="button" id="export-csv" class="map-btn">CSV</button>
+          </div>
+        </div>
+
+        <div class="timeline-panel">
+          <div class="timeline-header">
+            <strong id="current-time-label">No timeline</strong>
+            <span id="timeline-summary">Run a query to load data</span>
+          </div>
+          <input id="timeline-slider" type="range" min="0" max="0" value="0" step="1" />
+          <canvas id="timeline-chart" height="40"></canvas>
+        </div>
+      </main>
+
+      <!-- RIGHT PANEL: AI Agent -->
+      <aside class="panel right-panel">
+        <h2>Earth Analyst</h2>
+        <p class="subtitle">AI-powered geospatial reasoning</p>
+
+        <div id="chat-log" class="chat-log"></div>
+
+        <form id="chat-form" class="chat-form" autocomplete="off">
+          <textarea id="chat-input" rows="1" placeholder="e.g. Show fire activity in Portugal last 3 months"></textarea>
+          <button type="submit">Ask</button>
+        </form>
+      </aside>
+    </div>
+
+    <script src="js/main.js" type="module"></script>
+  </body>
+</html>

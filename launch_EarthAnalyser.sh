@@ -1,0 +1,1 @@
+cd EarthAnalyser; source .venv/bin/activate; python3 -m http.server 5700

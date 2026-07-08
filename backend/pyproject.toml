@@ -1,0 +1,23 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "FastAPI backend serving geospatial H3/raster and vector-feature APIs."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "adlfs>=2024.7.0",
+    "python-dotenv>=1.2.2",
+    "fastapi>=0.137.0",
+    "fsspec>=2024.6.0",
+    "h3>=4.5.0",
+    "httpx>=0.28.1",
+    "numpy>=2.3.0",
+    "planetary-computer>=1.0.0",
+    "psycopg>=3.3.4",
+    "psycopg-binary>=3.3.4",
+    "pystac-client>=0.9.0",
+    "rasterio>=1.4.0",
+    "uvicorn>=0.49.0",
+    "xarray>=2024.6.0",
+    "zarr>=2.18.0",
+]
