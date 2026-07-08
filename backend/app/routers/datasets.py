@@ -1616,5 +1616,10 @@ async def analyse_with_llm(payload: AnalyseRequest):
 
 
 def _fetch_url_post(req: urlrequest.Request) -> str:
-    with urlrequest.urlopen(req, timeout=15) as resp:
-        return resp.read().decode("utf-8")
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            return resp.read().decode("utf-8")
+    except urlerror.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        logger.error("OpenRouter HTTP %s: %s", e.code, body)
+        raise RuntimeError(f"OpenRouter returned HTTP {e.code}: {body}") from e

@@ -65,7 +65,7 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # ─── LLM ──────────────────────────────────────────────────────
 LLM_API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
 OPENROUTER_API_URL_DEFAULT = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-235b-a22b:free")
+LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "meta-llama/llama-4-maverick:free")
 
 # ─── Dataset Configurations ──────────────────────────────────
 
