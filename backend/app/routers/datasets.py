@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import math
 import os
 import re
@@ -31,8 +30,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from ..core.config import DATASET_CONFIG
-
-logger = logging.getLogger(__name__)
+from ..core.log import logger
 
 # ─── Memory Safety Constants ─────────────────────────────────
 # Machine has ~7.5 GB total RAM (~5 GB usable). Budget conservatively.
@@ -437,8 +435,8 @@ def _raster_to_h3(
 
             return result
 
-    except Exception as exc:
-        print(f"Raster H3 error ({dataset_key}): {exc}")
+    except Exception:
+        logger.exception("raster_to_h3 failed (%s)", dataset_key)
         return []
 
 
