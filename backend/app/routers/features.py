@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import math
 import os
 import re
@@ -16,8 +15,9 @@ from typing import TypedDict, cast
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from ..core import config as _config  # noqa: F401 – ensures .env is loaded
+from ..core import config as _config  # noqa: F401
 from ..core.db import get_db_connection
+from ..core.log import logger
 from ..models.bbox import BBox
 from ..models.features import Feature, Geometry
 from psycopg.abc import Query as PsycopgQuery
@@ -31,8 +31,6 @@ class GeometryDict(TypedDict):
 
 PropertyValue = str | int | float | bool | None
 
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/features", tags=["features"])
 
