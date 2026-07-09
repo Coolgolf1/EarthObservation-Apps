@@ -1,6 +1,5 @@
 import base64
 import json
-import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -11,11 +10,10 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from ..core.log import logger
 
 env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
 load_dotenv(env_path)
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/planet", tags=["planet"])
 

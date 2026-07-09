@@ -12,6 +12,7 @@ from rasterio.warp import transform_bounds
 from rasterio.windows import Window, from_bounds
 
 from .config import DATASET_CONFIG, GDAL_ENV, MAX_H3_INPUT_PIXELS, MAX_WINDOW_PIXELS
+from .log import logger
 
 
 # ─── Metadata-only fire pixel counts (no raster data read) ───
@@ -57,8 +58,8 @@ def fire_metadata_from_href(href: str) -> dict[str, Any] | None:
                     "total_fire": sum(fire_pixels),
                     "band_count": ds.count,
                 }
-    except Exception as exc:
-        print(f"fire_metadata_from_href error: {exc}")
+    except Exception:
+        logger.exception("fire_metadata_from_href failed")
         return None
 
 
@@ -215,8 +216,8 @@ def raster_to_h3_band(
                     arr, win_transform, ds, bbox, h3_res,
                     config["filter"], config["classify"],
                 )
-    except Exception as exc:
-        print(f"raster_to_h3_band error ({dataset_key}, band {band}): {exc}")
+    except Exception:
+        logger.exception("raster_to_h3_band failed (%s, band %s)", dataset_key, band)
         return []
 
 
@@ -381,8 +382,8 @@ def metadata_to_h3(
                     })
                 return result
 
-    except Exception as exc:
-        print(f"metadata_to_h3 error ({dataset_key}): {exc}")
+    except Exception:
+        logger.exception("metadata_to_h3 failed (%s)", dataset_key)
         return []
 
 
@@ -531,8 +532,8 @@ def _raster_preview_h3(
                     })
 
                 return result
-    except Exception as exc:
-        print(f"Raster preview error ({dataset_key}): {exc}")
+    except Exception:
+        logger.exception("raster preview failed (%s)", dataset_key)
         return []
 
 
@@ -566,6 +567,6 @@ def raster_to_h3(
                     arr, win_transform, ds, bbox, h3_res,
                     config["filter"], config["classify"],
                 )
-    except Exception as exc:
-        print(f"Raster H3 error ({dataset_key}): {exc}")
+    except Exception:
+        logger.exception("raster_to_h3 failed (%s)", dataset_key)
         return []
