@@ -8,7 +8,7 @@ env:
   - name: LLM_API_URL
     value: "https://openrouter.ai/api/v1/chat/completions"
   - name: LLM_MODEL
-    value: "qwen/qwen3-235b-a22b:free"
+    value: "google/gemma-4-26b-a4b-it:free"
   - name: ESRI_API_KEY
   - name: OSM_ORS_API_KEY
   - name: PLANET_API_KEY
