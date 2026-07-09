@@ -16,6 +16,7 @@ from typing import TypedDict, cast
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from ..core import config as _config  # noqa: F401 – ensures .env is loaded
 from ..core.db import get_db_connection
 from ..models.bbox import BBox
 from ..models.features import Feature, Geometry
@@ -68,7 +69,7 @@ _SEARCH_STATE_LOCK = Lock()
 _ACTIVE_SEARCH_BY_CLIENT: dict[str, tuple[str, Event]] = {}
 LLM_API_URL_DEFAULT = "https://api.openai.com/v1/chat/completions"
 OPENROUTER_API_URL_DEFAULT = "https://openrouter.ai/api/v1/chat/completions"
-LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "qwen/qwen3-235b-a22b:free")
+LLM_MODEL_DEFAULT = os.getenv("LLM_MODEL", "google/gemma-4-26b-a4b-it:free")
 # Providers the backend is allowed to send its server-side key to. Prevents a
 # misconfigured LLM_API_URL from relaying credentials to an arbitrary host.
 _ALLOWED_LLM_HOSTS = frozenset({"api.openai.com", "openrouter.ai"})

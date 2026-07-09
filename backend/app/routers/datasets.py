@@ -1379,8 +1379,8 @@ def _fetch_url(req: urlrequest.Request) -> str:
 # ─── LLM Classification ──────────────────────────────────────
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_ANALYSIS_MODEL = "qwen/qwen3-235b-a22b:free"
-TYPO_FIX_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+DEFAULT_ANALYSIS_MODEL = "google/gemma-4-26b-a4b-it:free"
+TYPO_FIX_MODEL = os.getenv("LLM_CLASSIFY_MODEL", "google/gemma-3-4b-it:free")
 
 VALID_CATEGORIES = {"fire", "flood", "vegetation", "weather", "landuse"}
 
@@ -1402,6 +1402,30 @@ def _infer_categories(question: str) -> list[str]:
     if not cats and re.search(r"what.*(happen|going|see)|analyz|summar|overview|everything|all", q):
         cats = ["fire", "flood", "weather", "vegetation", "landuse"]
     return cats or ["fire"]  # if nothing matches, default to fire
+
+
+class ReverseGeocodeRequest(BaseModel):
+    lat: float = Field(ge=-90.0, le=90.0)
+    lon: float = Field(ge=-180.0, le=180.0)
+
+
+@router.post("/reverse-geocode")
+async def reverse_geocode(payload: ReverseGeocodeRequest):
+    """Reverse geocode a lat/lon to a place name using Nominatim."""
+    url = (
+        f"https://nominatim.openstreetmap.org/reverse?"
+        f"lat={payload.lat}&lon={payload.lon}&format=json&zoom=10"
+    )
+    req = urlrequest.Request(url, headers={"User-Agent": "EarthAnalyser/1.0"})
+    try:
+        raw = await asyncio.to_thread(_fetch_url, req)
+        data = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=502, detail="Reverse geocode failed")
+    name = data.get("display_name", "").split(",")[0].strip()
+    if not name:
+        name = data.get("name", "")
+    return {"name": name, "display_name": data.get("display_name", "")}
 
 
 class ClassifyRequest(BaseModel):
