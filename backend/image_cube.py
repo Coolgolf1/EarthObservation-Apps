@@ -14,7 +14,10 @@ from pathlib import Path
 
 import requests
 
-API_BASE = "https://imagecube-toucan-api.jollyground-fbd4d1eb.eastus.azurecontainerapps.io".rstrip("/")
+API_BASE = os.environ.get(
+    "IMAGECUBES_API_URL",
+    "https://imagecube-toucan-api.jollyground-fbd4d1eb.eastus.azurecontainerapps.io",
+).rstrip("/")
 REDIRECT_URI = "http://localhost:8001/docs/oauth2-redirect"
 
 p = urllib.parse.urlparse(REDIRECT_URI)
@@ -25,7 +28,8 @@ got = {}
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        got.update(urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query))
+        got.update(urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query))
         self.send_response(200)
         self.end_headers()
         self.wfile.write("You can close this tab.".encode())
@@ -38,18 +42,22 @@ def main():
     # --- client_id, scope and endpoints from the API itself ---
     flow = next(iter(requests.get(f"{API_BASE}/openapi.json").json()
                      ["components"]["securitySchemes"].values()))["flows"]["authorizationCode"]
-    client_id = re.search(r'"clientId":\s*"([0-9a-f-]+)"', requests.get(f"{API_BASE}/docs").text).group(1)
+    client_id = re.search(
+        r'"clientId":\s*"([0-9a-f-]+)"', requests.get(f"{API_BASE}/docs").text).group(1)
     scope = next(iter(flow["scopes"]))
 
     # --- PKCE ---
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    verifier = base64.urlsafe_b64encode(
+        secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(
+        verifier.encode()).digest()).rstrip(b"=").decode()
     state = secrets.token_urlsafe(16)
 
     try:
         server = http.server.HTTPServer(("localhost", p.port), Handler)
     except OSError as e:
-        sys.exit(f"Port {p.port} is busy ({e}). Use another registered redirect URI with a free port.")
+        sys.exit(
+            f"Port {p.port} is busy ({e}). Use another registered redirect URI with a free port.")
     threading.Thread(target=server.handle_request, daemon=True).start()
 
     url = flow["authorizationUrl"] + "?" + urllib.parse.urlencode({
@@ -91,7 +99,8 @@ def main():
         content = env_path.read_text()
         if "IMAGECUBES_TOKEN=" in content:
             # Replace existing token
-            content = re.sub(r"IMAGECUBES_TOKEN=.*", f"IMAGECUBES_TOKEN={token}", content)
+            content = re.sub(r"IMAGECUBES_TOKEN=.*",
+                             f"IMAGECUBES_TOKEN={token}", content)
         else:
             # Append new token
             if not content.endswith("\n"):

@@ -21,7 +21,10 @@ import httpx
 import numpy as np
 import xarray as xr
 
-IMAGECUBES_API = "https://imagecube-toucan-api.jollyground-fbd4d1eb.eastus.azurecontainerapps.io"
+IMAGECUBES_API = os.getenv(
+    "IMAGECUBES_API_URL",
+    "https://imagecube-toucan-api.jollyground-fbd4d1eb.eastus.azurecontainerapps.io",
+)
 
 # ─── Memory Safety ────────────────────────────────────────────
 # Machine has ~6.6 GB total RAM (~5.9 GB usable). Cap per-request loads.
@@ -102,13 +105,15 @@ async def _wait_for_cube(cube_id: str, token: str, max_wait: int = 300) -> dict:
             if status == "completed":
                 return cube
             elif status in ("failed", "error"):
-                raise RuntimeError(f"ImageCube job {cube_id} failed: {cube.get('error', 'unknown')}")
+                raise RuntimeError(
+                    f"ImageCube job {cube_id} failed: {cube.get('error', 'unknown')}")
 
             await asyncio.sleep(interval)
             elapsed += interval
             interval = min(interval * 1.5, 30)
 
-    raise TimeoutError(f"ImageCube job {cube_id} not completed after {max_wait}s")
+    raise TimeoutError(
+        f"ImageCube job {cube_id} not completed after {max_wait}s")
 
 
 async def _get_artifact_url(cube_id: str, token: str) -> str:
@@ -225,7 +230,8 @@ def _compute_ndvi_frames(
                 if np.isnan(val) or val < -1 or val > 1:
                     continue
 
-                cell = h3.latlng_to_cell(float(lat_val), float(lon_val), h3_res)
+                cell = h3.latlng_to_cell(
+                    float(lat_val), float(lon_val), h3_res)
 
                 if cell not in day_hex:
                     day_hex[cell] = {
@@ -239,8 +245,10 @@ def _compute_ndvi_frames(
 
                 day_hex[cell]["pixel_count"] += 1
                 day_hex[cell]["value_sum"] += val
-                day_hex[cell]["value_max"] = max(day_hex[cell]["value_max"], val)
-                day_hex[cell]["value_min"] = min(day_hex[cell]["value_min"], val)
+                day_hex[cell]["value_max"] = max(
+                    day_hex[cell]["value_max"], val)
+                day_hex[cell]["value_min"] = min(
+                    day_hex[cell]["value_min"], val)
 
                 # Classify NDVI
                 if val > 0.6:
@@ -285,7 +293,8 @@ def _compute_ndvi_frames(
                 }
             agg = aggregate_hex[cell_id]
             agg["days_active"] = agg.get("days_active", 0) + 1
-            agg["_value_sum"] = agg.get("_value_sum", 0.0) + hex_entry["value_mean"] * n
+            agg["_value_sum"] = agg.get(
+                "_value_sum", 0.0) + hex_entry["value_mean"] * n
             agg["_value_count"] = agg.get("_value_count", 0) + n
             if hex_entry["value_max"] > agg["value_max"]:
                 agg["value_max"] = hex_entry["value_max"]
@@ -301,7 +310,8 @@ def _compute_ndvi_frames(
     # Finalize aggregate means
     for cell_id, agg in aggregate_hex.items():
         if agg.get("_value_count", 0) > 0:
-            agg["value_mean"] = round(agg["_value_sum"] / agg["_value_count"], 4)
+            agg["value_mean"] = round(
+                agg["_value_sum"] / agg["_value_count"], 4)
         agg.pop("_value_sum", None)
         agg.pop("_value_count", None)
 
