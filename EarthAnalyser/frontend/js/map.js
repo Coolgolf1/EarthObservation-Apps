@@ -8,15 +8,28 @@ import { $, updateStatus } from "./utils.js";
 
 export const map = L.map("map", { zoomControl: true, worldCopyJump: true, preferCanvas: true }).setView([39.5, -5.5], 5);
 
-export const baseSatellite = L.tileLayer(
-  "https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}",
-  { id: "mapbox/satellite-streets-v12", accessToken: MAPBOX_TOKEN, tileSize: 512, zoomOffset: -1, maxZoom: 20 },
-).addTo(map);
+export const hasMapboxToken = Boolean(MAPBOX_TOKEN);
+const osmLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+});
+const mapboxAttribution =
+  '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
 
-export const baseLight = L.tileLayer(
-  "https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}",
-  { id: "mapbox/light-v11", accessToken: MAPBOX_TOKEN, tileSize: 512, zoomOffset: -1, maxZoom: 20 },
-);
+export const baseSatellite = hasMapboxToken
+  ? L.tileLayer("https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}", {
+    id: "mapbox/satellite-streets-v12", accessToken: MAPBOX_TOKEN,
+    tileSize: 512, zoomOffset: -1, maxZoom: 20, attribution: mapboxAttribution,
+  })
+  : osmLayer;
+baseSatellite.addTo(map);
+
+export const baseLight = hasMapboxToken
+  ? L.tileLayer("https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}", {
+    id: "mapbox/light-v11", accessToken: MAPBOX_TOKEN,
+    tileSize: 512, zoomOffset: -1, maxZoom: 20, attribution: mapboxAttribution,
+  })
+  : osmLayer;
 
 export const drawingLayer = L.layerGroup().addTo(map);
 export const boundaryLayer = L.layerGroup().addTo(map);

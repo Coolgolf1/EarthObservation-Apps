@@ -14,7 +14,6 @@ from rasterio.windows import Window, from_bounds
 from .config import DATASET_CONFIG, GDAL_ENV, MAX_H3_INPUT_PIXELS, MAX_WINDOW_PIXELS
 from .log import logger
 
-
 # ─── Metadata-only fire pixel counts (no raster data read) ───
 
 def fire_metadata_from_href(href: str) -> dict[str, Any] | None:
@@ -68,7 +67,7 @@ def _read_h3_source(
     window: Window,
     h3_res: int,
     band: int = 1,
-) -> tuple[np.ndarray, "rasterio.Affine"]:
+) -> tuple[np.ndarray, rasterio.Affine]:
     """Read ``band`` over the full window, downsampling via ``out_shape``.
 
     Downsampling respects both the H3 cell size (skip reading finer than the
@@ -111,7 +110,7 @@ def _read_h3_source(
 
 def _aggregate_pixels_to_h3(
     arr: np.ndarray,
-    win_transform: "rasterio.Affine",
+    win_transform: rasterio.Affine,
     ds: rasterio.DatasetReader,
     bbox: list[float],
     h3_res: int,
@@ -503,11 +502,11 @@ def _raster_preview_h3(
                     xs, ys = lons, lats
 
                 # Sample raster at each point (returns generator of arrays)
-                coords = list(zip(xs, ys))
+                coords = list(zip(xs, ys, strict=True))
                 samples = list(ds.sample(coords, indexes=1))
 
                 result = []
-                for i, (cell_id, (lat, lon)) in enumerate(zip(cells, centers)):
+                for i, (cell_id, (lat, lon)) in enumerate(zip(cells, centers, strict=True)):
                     val = float(samples[i][0]) if len(samples[i]) > 0 else float("nan")
                     if np.isnan(val):
                         continue

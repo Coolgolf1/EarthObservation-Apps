@@ -22,12 +22,12 @@ import numpy as np
 import planetary_computer
 import pystac_client
 import rasterio
-from rasterio.warp import transform_bounds
-from rasterio.windows import Window, from_bounds
+from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from rasterio.warp import transform_bounds
+from rasterio.windows import Window, from_bounds
 
 from ..core.config import DATASET_CONFIG
 from ..core.log import logger
@@ -518,13 +518,13 @@ async def query_datasets_h3(payload: DatasetH3Request):
                         seen_items.add(item.id)
                         unique_items.append(item)
 
-                async def _process_static_item(item):
+                async def _process_static_item(item, ds_res=ds_h3_res, ds_key=dataset_key):
                     asset = _get_asset(item)
                     if not asset or not asset.href:
                         return []
                     async with _RASTER_SEMAPHORE:
                         return await asyncio.to_thread(
-                            _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
+                            _raster_to_h3, asset.href, bbox, ds_res, ds_key
                         )
 
                 results_list = await asyncio.gather(
@@ -556,7 +556,9 @@ async def query_datasets_h3(payload: DatasetH3Request):
                         break
 
                 # Process dates in batches to limit concurrent memory usage
-                async def process_item(item, acq_date: str) -> dict[str, Any] | None:
+                async def process_item(
+                    item, acq_date: str, ds_res=ds_h3_res, ds_key=dataset_key
+                ) -> dict[str, Any] | None:
                     if _check_memory_pressure():
                         return None
                     asset = _get_asset(item)
@@ -564,7 +566,7 @@ async def query_datasets_h3(payload: DatasetH3Request):
                         return None
                     async with _RASTER_SEMAPHORE:
                         hexes = await asyncio.to_thread(
-                            _raster_to_h3, asset.href, bbox, ds_h3_res, dataset_key
+                            _raster_to_h3, asset.href, bbox, ds_res, ds_key
                         )
                     if hexes:
                         return {"acq_date": acq_date, "hexagons": hexes}
@@ -613,7 +615,7 @@ async def query_datasets_h3(payload: DatasetH3Request):
                                 agg["dominant_class"] = max(agg["classes"], key=agg["classes"].get)
 
             # Finalize aggregate value_mean
-            for cell_id, agg in aggregate_hex.items():
+            for agg in aggregate_hex.values():
                 if agg.get("_value_count", 0) > 0:
                     agg["value_mean"] = round(agg["_value_sum"] / agg["_value_count"], 2)
                 agg.pop("_value_sum", None)
@@ -855,7 +857,7 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
                             _accumulate_aggregate(merged_hexes)
 
                 # Finalize aggregate value_mean
-                for cell_id, agg in aggregate_hex.items():
+                for agg in aggregate_hex.values():
                     if agg.get("_value_count", 0) > 0:
                         agg["value_mean"] = round(agg["_value_sum"] / agg["_value_count"], 2)
                     agg.pop("_value_sum", None)
@@ -896,7 +898,7 @@ async def query_datasets_h3_stream(payload: DatasetH3Request, request: Request):
                     break
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
                 if item is None:
                     break
@@ -1317,7 +1319,6 @@ async def _geocode_nominatim(query: str) -> dict[str, Any] | None:
     name = row.get("display_name", query)
     category = row.get("category", "")
     feat_type = row.get("type", "")
-    osm_type = row.get("osm_type", "")
 
     # Nominatim bbox: [south, north, west, east]
     raw_bbox = row.get("boundingbox")
@@ -1418,8 +1419,8 @@ async def reverse_geocode(payload: ReverseGeocodeRequest):
     try:
         raw = await asyncio.to_thread(_fetch_url, req)
         data = json.loads(raw)
-    except Exception:
-        raise HTTPException(status_code=502, detail="Reverse geocode failed")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Reverse geocode failed") from exc
     name = data.get("display_name", "").split(",")[0].strip()
     if not name:
         name = data.get("name", "")

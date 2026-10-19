@@ -140,7 +140,7 @@ async def imagecubes_ndvi_to_h3(
 
     # Find or create the cube, then wait for completion
     cube_id = await _find_or_create_cube(bbox, date_start, date_end, token)
-    cube = await _wait_for_cube(cube_id, token)
+    await _wait_for_cube(cube_id, token)
 
     # Get the Zarr artifact URL
     artifact_url = await _get_artifact_url(cube_id, token)
@@ -182,7 +182,7 @@ async def imagecubes_ndvi_to_h3(
 
 
 def _compute_ndvi_frames(
-    ds: "xr.Dataset",
+    ds: xr.Dataset,
     h3_res: int,
     date_start: date,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -308,7 +308,7 @@ def _compute_ndvi_frames(
             frames.append({"acq_date": acq_date, "hexagons": day_hexagons})
 
     # Finalize aggregate means
-    for cell_id, agg in aggregate_hex.items():
+    for agg in aggregate_hex.values():
         if agg.get("_value_count", 0) > 0:
             agg["value_mean"] = round(
                 agg["_value_sum"] / agg["_value_count"], 4)

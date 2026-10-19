@@ -1,11 +1,13 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-from .routers.health import router as health_router
-from .routers.features import router as features_router
-from .routers.planet import router as planet_router
+
 from .routers.datasets import router as datasets_router
+from .routers.features import router as features_router
+from .routers.health import router as health_router
+from .routers.planet import router as planet_router
 
 app = FastAPI()
 
@@ -38,9 +40,13 @@ app.include_router(datasets_router)
 repo_root = Path(__file__).resolve().parents[2]
 earthsearch_frontend_dir = repo_root / "EarthSearch" / "frontend"
 earthanalyser_frontend_dir = repo_root / "EarthAnalyser" / "frontend"
+earthmapper_frontend_dir = repo_root / "EarthMapper" / "frontend"
 
 if earthsearch_frontend_dir.exists():
 	app.mount("/search", StaticFiles(directory=earthsearch_frontend_dir, html=True), name="earthsearch_frontend")
+
+if earthmapper_frontend_dir.exists():
+	app.mount("/mapper", StaticFiles(directory=earthmapper_frontend_dir, html=True), name="earthmapper_frontend")
 
 if earthanalyser_frontend_dir.exists():
 	# Serve EarthAnalyser as the root UI.

@@ -78,7 +78,7 @@ def _bbox_to_polygon(bbox: list[float]) -> dict[str, object]:
 
 def _planet_auth_header() -> str:
     key = _get_planet_api_key()
-    token = base64.b64encode(f"{key}:".encode("utf-8")).decode("ascii")
+    token = base64.b64encode(f"{key}:".encode()).decode("ascii")
     return f"Basic {token}"
 
 

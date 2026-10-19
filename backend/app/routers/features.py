@@ -3,25 +3,26 @@ import json
 import math
 import os
 import re
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Semaphore, Thread, current_thread
+from typing import TypedDict, cast
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
-from collections.abc import Iterator
-from typing import TypedDict, cast
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from psycopg.abc import Query as PsycopgQuery
+from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
+
 from ..core import config as _config  # noqa: F401
 from ..core.db import get_db_connection
 from ..core.log import logger
 from ..models.bbox import BBox
 from ..models.features import Feature, Geometry
-from psycopg.abc import Query as PsycopgQuery
-from psycopg.rows import dict_row
 
 
 class GeometryDict(TypedDict):
@@ -1147,8 +1148,7 @@ def _iter_feature_rows(
                 rows = cur.fetchmany(chunk_size)
                 if not rows:
                     break
-                for row in rows:
-                    yield row
+                yield from rows
 
 
 def _iter_source_feature_rows(

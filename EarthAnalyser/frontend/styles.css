@@ -67,6 +67,28 @@ h2 {
   font-size: 0.85rem;
 }
 
+.app-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.app-nav a {
+  border: 1px solid var(--panel-border);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 6px 10px;
+  text-decoration: none;
+}
+
+.app-nav a:hover, .app-nav a:focus-visible, .app-nav a[aria-current="page"] {
+  background: var(--accent);
+  color: #fff;
+}
+
 /* ─── Forms ─── */
 
 .filters {

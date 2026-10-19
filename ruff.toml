@@ -1,5 +1,5 @@
 # Ruff configuration for the repo (backend + scripts).
-# Linting only for now — no CI or pre-commit wired up yet.
+# CI runs Ruff linting; formatting is not yet enforced.
 target-version = "py314"
 line-length = 100
 

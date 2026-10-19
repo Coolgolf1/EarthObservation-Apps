@@ -1,7 +1,5 @@
 # EarthMapper
 
-Software that queries using FastAPI from different datasets in Lakebase DB:
-- GADM
-- Natural Earth
+Viewport-driven Leaflet browser for Natural Earth and GADM vector features. It asks the FastAPI backend for features in the current map bounds and filters them by category.
 
-And plots the requested information in a leaflet map.
+Run the [backend](../README.md#run-locally) from the repository root and open <http://127.0.0.1:8000/mapper/>. The map loads without a Mapbox token, but feature queries require the prepared PostGIS tables described in the main README.

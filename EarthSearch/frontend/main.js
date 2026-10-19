@@ -178,18 +178,20 @@ function getCategoryPane(category) {
   return "overlayPane";
 }
 
-L.tileLayer(
-  "https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}",
-  {
+const basemap = MAPBOX_TOKEN
+  ? L.tileLayer("https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}", {
     id: "mapbox/satellite-streets-v12",
     accessToken: MAPBOX_TOKEN,
     tileSize: 512,
     zoomOffset: -1,
     maxZoom: 20,
-    attribution:
-      '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-  },
-).addTo(map);
+    attribution: '&copy; <a href="https://www.mapbox.com/about/maps/">Mapbox</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+  })
+  : L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  });
+basemap.addTo(map);
 
 const statsEl = document.getElementById("stats");
 const formEl = document.getElementById("search-form");

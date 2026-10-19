@@ -11,7 +11,7 @@ import {
   exportCsv, askHint, chatForm, chatInput, queryForm, resolutionSlider, resolutionValue,
 } from "./utils.js";
 import {
-  map, baseSatellite, baseLight, datasetLayers, drawBoundary, clearBoundary,
+  map, baseSatellite, baseLight, hasMapboxToken, datasetLayers, drawBoundary, clearBoundary,
   clearDrawing, showDrawConfirm, redrawDrawing, confirmDrawing,
 } from "./map.js";
 import { renderAllDatasets, renderDatasetHexagons } from "./rendering.js";
@@ -679,6 +679,11 @@ if (frequency) frequency.addEventListener("change", () => {
 });
 
 // Layer toggle
+if (layerSatellite && !hasMapboxToken) {
+  layerSatellite.textContent = "OpenStreetMap";
+  layerSatellite.disabled = true;
+  layerSatellite.title = "Add MAPBOX_TOKEN to enable satellite and light basemaps";
+}
 if (layerSatellite) layerSatellite.addEventListener("click", () => {
   state.usingSatellite = !state.usingSatellite;
   layerSatellite.classList.toggle("active", state.usingSatellite);
