@@ -2,6 +2,12 @@
 
 Three interactive maps for exploring satellite rasters and geographic features. A FastAPI backend serves the browser UIs, queries Microsoft Planetary Computer STAC imagery, aggregates raster pixels into H3 hexagons, and reads vector features from PostGIS. Optional integrations add natural-language search, travel-time areas, and Planet imagery search.
 
+## Preview
+
+| EarthAnalyser | EarthSearch | EarthMapper |
+| --- | --- | --- |
+| [<img src="docs/images/earthanalyser-screenshot.png" alt="EarthAnalyser map and analysis controls" width="280">](EarthAnalyser/README.md) | [<img src="docs/images/earthsearch-screenshot.png" alt="EarthSearch travel area results" width="280">](EarthSearch/README.md) | [<img src="docs/images/earthmapper-screenshot.png" alt="EarthMapper feature map" width="280">](EarthMapper/README.md) |
+
 ## Explore the apps
 
 | App | Local URL | What it shows |
